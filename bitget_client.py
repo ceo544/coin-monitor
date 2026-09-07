@@ -93,6 +93,17 @@ def fetch_fills(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
     return data or []
 
 
+def fetch_current_positions(symbol: Optional[str] = None, pos_side: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Live currently-open positions - the real thing (entry price, mark
+    price, leverage, margin, liquidation price, unrealized PnL), not a
+    derived estimate. posSide can be 'long' or 'short' to filter one side."""
+    params = {"category": BITGET_CATEGORY, "symbol": symbol or BITGET_SYMBOL, "posSide": pos_side}
+    data = _get("/api/v3/position/current-position", params)
+    if isinstance(data, dict):
+        return data.get("list") or data.get("positionList") or []
+    return data or []
+
+
 def fetch_history_orders(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
     """Historical futures orders (filled/cancelled/etc.) - order-level detail,
     coarser than fills."""
@@ -142,19 +153,96 @@ def _realized_pnl_of_fill(fill: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+def _fill_time(fill: Dict[str, Any]) -> int:
+    try:
+        return int(fill.get("createdTime") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def compute_open_positions(fills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Estimate currently-open positions by netting 'open' fills against
+    'close' fills per symbol, oldest fill first. Bitget's V3 Unified Trading
+    Account API has no live "current positions" endpoint, so this is the
+    closest available substitute - accurate as long as ALL of a position's
+    opening fills are within the fetched fill history. If an older opening
+    fill falls outside that window, the estimated size will be too small.
+    Deliberately does not fabricate an unrealized-PnL figure here, since
+    that would need a live mark price this client doesn't fetch per symbol."""
+    ordered = sorted(fills, key=_fill_time)
+    book: Dict[str, Dict[str, float]] = {}
+    for f in ordered:
+        symbol = f.get("symbol")
+        if not symbol:
+            continue
+        side = (f.get("side") or "").lower()
+        trade_side = (f.get("tradeSide") or "").lower()
+        try:
+            qty = float(f.get("execQty") or 0)
+            price = float(f.get("execPrice") or 0)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0:
+            continue
+        b = book.setdefault(symbol, {"long_qty": 0.0, "long_cost": 0.0, "short_qty": 0.0, "short_cost": 0.0})
+        if trade_side == "open":
+            if side == "buy":
+                b["long_cost"] += qty * price
+                b["long_qty"] += qty
+            elif side == "sell":
+                b["short_cost"] += qty * price
+                b["short_qty"] += qty
+        elif trade_side == "close":
+            if side == "sell" and b["long_qty"] > 0:  # closing a long
+                reduce = min(qty, b["long_qty"])
+                b["long_cost"] *= (b["long_qty"] - reduce) / b["long_qty"]
+                b["long_qty"] -= reduce
+            elif side == "buy" and b["short_qty"] > 0:  # closing a short
+                reduce = min(qty, b["short_qty"])
+                b["short_cost"] *= (b["short_qty"] - reduce) / b["short_qty"]
+                b["short_qty"] -= reduce
+
+    positions: List[Dict[str, Any]] = []
+    for symbol, b in book.items():
+        if b["long_qty"] > 1e-9:
+            positions.append({
+                "symbol": symbol, "side": "long", "qty": round(b["long_qty"], 8),
+                "avgEntryPrice": round(b["long_cost"] / b["long_qty"], 6),
+            })
+        if b["short_qty"] > 1e-9:
+            positions.append({
+                "symbol": symbol, "side": "short", "qty": round(b["short_qty"], 8),
+                "avgEntryPrice": round(b["short_cost"] / b["short_qty"], 6),
+            })
+    return positions
+
+
+def _position_unrealized_pnl(position: Dict[str, Any]) -> float:
+    try:
+        return float(position.get("unrealisedPnl") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def fetch_summary() -> Dict[str, Any]:
     """One combined snapshot for the dashboard's Bitget card: account
-    balance/equity, recent fills, recent order history, and a win-rate/PnL
-    readout built from closing fills' execPnl. Each piece is fetched
-    independently so one failing call doesn't blank out the others."""
+    balance/equity, live currently-open positions, recent fills, recent
+    order history, and a win-rate/PnL readout built from closing fills'
+    execPnl. Each piece is fetched independently so one failing call
+    doesn't blank out the others."""
     errors: Dict[str, str] = {}
     assets: List[Dict[str, Any]] = []
+    positions: List[Dict[str, Any]] = []
     fills: List[Dict[str, Any]] = []
     orders: List[Dict[str, Any]] = []
     try:
         assets = fetch_account_assets()
     except Exception as exc:
         errors["assets"] = f"{type(exc).__name__}: {exc}"
+    try:
+        positions = fetch_current_positions()
+    except Exception as exc:
+        errors["positions"] = f"{type(exc).__name__}: {exc}"
     try:
         fills = fetch_fills()
     except Exception as exc:
@@ -172,13 +260,23 @@ def fetch_summary() -> Dict[str, Any]:
     decided = wins + losses  # exact-break-even closes don't count either way
     win_rate_pct = round(wins / decided * 100, 1) if decided else None
     realized_pnl_total = sum(close_pnls)
+    # Direct real-time sum of each currently-open position's own unrealisedPnl
+    # field (plus AND minus positions all summed together, hence "통합").
+    # Deliberately None (not 0) when there are no open positions, so the
+    # dashboard can show this metric as empty/blank rather than a stale
+    # zero - i.e. it "disappears" the moment every position is closed,
+    # exactly mirroring live position state rather than the account's
+    # broader (and possibly slightly lagged) aggregate figure.
+    live_open_positions_pnl = sum(_position_unrealized_pnl(p) for p in positions) if positions else None
 
     return {
+        "positions": positions,
         "fills": fills,
         "orders": orders,
         "account": acct,
         "total_equity": acct["usdt_equity"] if acct["usdt_equity"] is not None else acct["account_equity"],
         "total_unrealized_pnl": unrealized_pnl,
+        "live_open_positions_pnl": live_open_positions_pnl,
         "win_rate_pct": win_rate_pct,
         "win_count": wins,
         "loss_count": losses,
