@@ -84,10 +84,10 @@ class EntryProximityAlertTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 2)
 
     def test_short_side_tracked_independently_from_long(self):
-        main._maybe_notify_entry_proximity(_sample_parsed(), "100050")  # near LONG entry only
+        main._maybe_notify_entry_proximity(_sample_parsed(long_active=True, short_active=True), "100050")  # near LONG entry only
         self.assertEqual(len(self.sent), 1)
         self.assertIn("LONG", self.sent[0])
-        main._maybe_notify_entry_proximity(_sample_parsed(), "104050")  # now also near SHORT entry
+        main._maybe_notify_entry_proximity(_sample_parsed(long_active=True, short_active=True), "104050")  # now also near SHORT entry
         self.assertEqual(len(self.sent), 2)
         self.assertIn("SHORT", self.sent[1])
 
@@ -95,6 +95,25 @@ class EntryProximityAlertTests(unittest.TestCase):
         main.TELEGRAM_BOT_TOKEN = ""
         main._maybe_notify_entry_proximity(_sample_parsed(), "100050")
         self.assertEqual(len(self.sent), 0)
+
+    def test_signal_off_never_triggers_even_when_price_is_near(self):
+        # The key requirement: proximity alerts only fire while E-RANG's
+        # own ON/OFF signal for that side is actually ON - price being
+        # close to the entry level is not enough by itself.
+        main._maybe_notify_entry_proximity(_sample_parsed(long_active=False, short_active=False), "100050")
+        self.assertEqual(len(self.sent), 0)
+
+    def test_short_signal_off_does_not_trigger_even_near_short_entry(self):
+        main._maybe_notify_entry_proximity(_sample_parsed(long_active=False, short_active=False), "104050")
+        self.assertEqual(len(self.sent), 0)
+
+    def test_turning_on_near_price_triggers_fresh(self):
+        # Price already near while OFF -> no alert; once it turns ON while
+        # still near, it should fire (state must not have gotten "stuck").
+        main._maybe_notify_entry_proximity(_sample_parsed(long_active=False), "100050")
+        self.assertEqual(len(self.sent), 0)
+        main._maybe_notify_entry_proximity(_sample_parsed(long_active=True), "100050")
+        self.assertEqual(len(self.sent), 1)
 
 
 if __name__ == "__main__":

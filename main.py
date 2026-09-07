@@ -721,23 +721,29 @@ def _maybe_notify_telegram(
 
 def _maybe_notify_entry_proximity(parsed: Dict[str, Any], current_price_raw: Optional[str]) -> None:
     """Sends a '진입 임박' (entry imminent) alert when the current price gets
-    within ENTRY_PROXIMITY_USD of the 1st-stage (25%) LONG or SHORT entry
-    price - independent of whether the E-RANG ON/OFF signal itself is
-    active, since the entry price levels are published regardless of that.
-    Edge-triggered (state kept in telegram_state) so it fires once when
-    price first comes within range, not every 30s while it lingers there;
-    it re-arms once price moves back out of range."""
+    within ENTRY_PROXIMITY_USD of the 1st-stage (25%) entry price for a side
+    whose E-RANG signal is currently ON. If that side isn't ON, its
+    proximity state resets so a later approach (once it turns ON) still
+    fires fresh. Edge-triggered (state kept in telegram_state) so it fires
+    once when price first comes within range, not every 30s while it
+    lingers there; it re-arms once price moves back out of range."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     current_price = _to_float_loose(current_price_raw)
     if current_price is None:
         return
     rows = _row_map_from_parsed(parsed)
+    signals = parsed.get("signals") or {}
     now_kst = datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S")
     for side, entries_key, state_key, label, emoji in (
         ("long", "long", "long_near_entry", "롱(LONG)", "🟦"),
         ("short", "short", "short_near_entry", "숏(SHORT)", "🟥"),
     ):
+        active = bool((signals.get(side) or {}).get("active"))
+        if not active:
+            with _state_lock:
+                telegram_state[state_key] = False
+            continue
         entries = rows.get(entries_key) or []
         entry1 = _to_float_loose(entries[0]) if entries else None
         if entry1 is None:
