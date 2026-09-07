@@ -342,6 +342,83 @@ def _narrative_for(ind: Dict[str, Any]) -> list[str]:
     return bullets
 
 
+def _to_float_loose(value: Any) -> Optional[float]:
+    """Parse numbers that may still have thousands separators (e.g. from
+    parsed entry/TP/SL strings like '68,450.5')."""
+    if value is None:
+        return None
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _rr_opinion(risk_reward: Optional[float]) -> Optional[str]:
+    if risk_reward is None:
+        return None
+    if risk_reward < 1:
+        return f"손익비 {risk_reward:.2f}:1로 낮은 편 — SL까지 거리가 TP까지 거리보다 멀어, TP 도달 전에 SL에 먼저 닿을 위험이 상대적으로 큽니다"
+    if risk_reward <= 3:
+        return f"손익비 {risk_reward:.2f}:1로 무난한 편입니다"
+    return f"손익비 {risk_reward:.2f}:1로 매우 높은 편 — TP가 SL 대비 멀리 잡혀 있어 도달 확률은 낮아질 수 있습니다"
+
+
+def _atr_distance_opinion(tp_distance: Optional[float], atr: Optional[float]) -> Optional[str]:
+    if tp_distance is None or atr is None or atr <= 0:
+        return None
+    ratio = tp_distance / atr
+    if ratio < 0.5:
+        return f"15분봉 ATR 대비 TP 거리가 {ratio:.2f}배로 타이트함 — 단기 변동성만으로도 비교적 빠르게 도달할 수 있는 거리입니다"
+    if ratio <= 2:
+        return f"15분봉 ATR 대비 TP 거리가 {ratio:.2f}배로 무난한 거리입니다"
+    return f"15분봉 ATR 대비 TP 거리가 {ratio:.2f}배로 먼 편 — 추세가 이어져야 도달 가능한 거리입니다"
+
+
+def _momentum_caution(side: str, rsi: Optional[float], funding_rate: Optional[float]) -> list[str]:
+    msgs: list[str] = []
+    if rsi is not None:
+        if side == "long" and rsi >= 70:
+            msgs.append(f"15분봉 RSI {rsi:.1f}로 이미 과매수권 — 진입 직후 눌림(되돌림) 리스크에 유의하세요")
+        elif side == "short" and rsi <= 30:
+            msgs.append(f"15분봉 RSI {rsi:.1f}로 이미 과매도권 — 진입 직후 반등 리스크에 유의하세요")
+    if funding_rate is not None:
+        if side == "long" and funding_rate >= 0.0005:
+            msgs.append(f"펀딩비 {funding_rate * 100:.4f}%로 롱 포지션이 몰려 과열된 편 — 숏 스퀴즈성 되돌림 리스크에 유의하세요")
+        elif side == "short" and funding_rate <= -0.0005:
+            msgs.append(f"펀딩비 {funding_rate * 100:.4f}%로 숏 포지션이 몰려 과열된 편 — 숏 커버링 반등 리스크에 유의하세요")
+    return msgs
+
+
+def _ai_tp_opinion(
+    side: str,
+    entry: Any,
+    tp: Any,
+    sl: Any,
+    atr15: Optional[float],
+    rsi15: Optional[float],
+    funding_rate: Optional[float],
+) -> list[str]:
+    """Rule-based (non-LLM) read on whether the 1st-stage TP looks reasonable
+    given the SL distance (risk/reward) and current 15m volatility (ATR).
+    This is a deterministic heuristic, not a real trading recommendation -
+    it never claims to predict what the market will actually do."""
+    entry_f, tp_f, sl_f = _to_float_loose(entry), _to_float_loose(tp), _to_float_loose(sl)
+    if entry_f is None or tp_f is None:
+        return []
+    tp_distance = abs(tp_f - entry_f)
+    sl_distance = abs(entry_f - sl_f) if sl_f is not None else None
+    risk_reward = (tp_distance / sl_distance) if sl_distance else None
+    bullets: list[str] = []
+    rr_txt = _rr_opinion(risk_reward)
+    if rr_txt:
+        bullets.append(rr_txt)
+    atr_txt = _atr_distance_opinion(tp_distance, atr15)
+    if atr_txt:
+        bullets.append(atr_txt)
+    bullets.extend(_momentum_caution(side, rsi15, funding_rate))
+    return bullets
+
+
 def _format_duration(started_iso: Optional[str], now_dt: datetime) -> Optional[str]:
     if not started_iso:
         return None
@@ -436,6 +513,38 @@ def _build_signal_message(
         lines.append("")
         lines.append(f"📊 <b>Binance 지표 참고 ({header}, 참고용·확정 원인 아님)</b>")
         lines.extend(tf_bullets)
+    # Rule-based (non-LLM) read on whether the 1st-stage TP looks reasonable,
+    # shown for LONG and SHORT both, regardless of which side triggered this
+    # message - mirrors how the entry tables above always show both sides.
+    ind15 = indicators.get("15m") or {}
+    atr15 = _to_float_loose(ind15.get("atr14"))
+    rsi15 = _to_float_loose(ind15.get("rsi14"))
+    funding_rate = _to_float_loose((binance_snapshot or {}).get("premium_index", {}).get("lastFundingRate"))
+    long_entries, long_tps, long_sls = rows.get("long") or [], rows.get("tpLong") or [], rows.get("slLong") or []
+    short_entries, short_tps, short_sls = rows.get("short") or [], rows.get("tpShort") or [], rows.get("slShort") or []
+    long_opinion = _ai_tp_opinion(
+        "long",
+        long_entries[0] if long_entries else None,
+        long_tps[0] if long_tps else None,
+        long_sls[0] if long_sls else None,
+        atr15, rsi15, funding_rate,
+    )
+    short_opinion = _ai_tp_opinion(
+        "short",
+        short_entries[0] if short_entries else None,
+        short_tps[0] if short_tps else None,
+        short_sls[0] if short_sls else None,
+        atr15, rsi15, funding_rate,
+    )
+    if long_opinion or short_opinion:
+        lines.append("")
+        lines.append("🤖 <b>AI 의견 (1차 진입 TP 적정성 · 규칙 기반 자동분석, 투자 조언 아님)</b>")
+        if long_opinion:
+            lines.append("<b>LONG</b>")
+            lines.extend(f"· {html.escape(b)}" for b in long_opinion)
+        if short_opinion:
+            lines.append("<b>SHORT</b>")
+            lines.extend(f"· {html.escape(b)}" for b in short_opinion)
     lines.append(now_kst + " (KST)")
     if DASHBOARD_URL:
         lines.append(f'<a href="{html.escape(DASHBOARD_URL, quote=True)}">대시보드 열기</a>')
@@ -962,7 +1071,7 @@ DASHBOARD_HTML = r"""
 :root{--bg:#07101f;--panel:#0e1b31;--panel2:#101f38;--line:#243b5f;--text:#f4f7ff;--muted:#8fa7c9;--blue:#38a5ff;--red:#ff5364;--green:#35e29a;--yellow:#ffc83d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,#102442 0,#07101f 45%);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1540px;margin:auto;padding:24px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.top h1{margin:0;font-size:30px}.sub,.muted{color:var(--muted)}.sub{margin-top:5px}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.btn{border:1px solid var(--line);background:#152540;color:#fff;padding:11px 15px;border-radius:11px;text-decoration:none;font-weight:800;cursor:pointer}.live{color:var(--green);font-weight:900}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{background:linear-gradient(145deg,rgba(16,31,56,.98),rgba(10,24,44,.98));border:1px solid var(--line);border-radius:17px;padding:18px;box-shadow:0 14px 32px #0004;min-width:0}.s2{grid-column:span 2}.s3{grid-column:span 3}.s4{grid-column:span 4}.s6{grid-column:span 6}.s8{grid-column:span 8}.s12{grid-column:span 12}.label{font-size:13px;color:#a9bfdf;font-weight:800}.big{font-size:29px;font-weight:950;margin-top:7px}.hero{display:flex;align-items:center;gap:22px;min-height:110px}.heroSignal{font-size:42px;font-weight:1000}.short{color:var(--red)}.long{color:var(--blue)}.wait{color:var(--yellow)}.ok{color:var(--green)}h2{font-size:18px;margin:0 0 14px}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:680px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}th{background:#132947;color:#c7dcfa;font-size:12px}.rowlong.on td:first-child{font-weight:950;color:var(--blue)}.rowshort.on td:first-child{background:#ef3340;color:#fff;font-weight:950}.entryrow{display:grid;grid-template-columns:82px repeat(5,1fr);gap:8px;align-items:stretch;margin-bottom:10px}.sideLabel{display:flex;align-items:center;font-size:20px;font-weight:950}.entry{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:10px;min-width:0}.entry b{font-size:12px;color:#9fb8db;display:block}.entry strong{font-size:17px;display:block;margin-top:5px;white-space:nowrap}.dist{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.dist .entry strong{font-size:20px}.tabs{display:flex;gap:7px;margin:12px 0}.tab{flex:1;border:1px solid var(--line);background:#102746;color:#c8daf4;padding:9px;border-radius:9px;font-weight:850;cursor:pointer}.tab.active{background:#168cff;color:white}.metricTop{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:12px}.metric b{display:block;color:#9fb8db;font-size:12px}.metric strong{display:block;font-size:19px;margin-top:6px}.indtable{min-width:0}.indtable td:nth-child(2){font-weight:800}.statusUp{color:var(--green)}.statusDown{color:var(--red)}.statusNeutral{color:#dbe7f8}.evidence{line-height:1.7}.evidence strong{font-size:18px}.foot{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:13px;gap:12px}.nowrap{white-space:nowrap}.clickrow{cursor:pointer}.clickrow:hover{background:#132947}.analysisGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.analysisBox{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:14px}.analysisBox h3{margin:0 0 10px;font-size:17px}.chips{display:flex;gap:7px;flex-wrap:wrap}.chip{background:#102746;border:1px solid var(--line);border-radius:999px;padding:6px 9px;font-size:12px}.detailHead{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}.hint{font-size:12px;color:var(--muted)}.reasonCell{text-align:left;white-space:normal;min-width:220px;max-width:320px}.reasonMini{font-size:11px;line-height:1.45;margin-bottom:5px;padding:5px 7px;border-radius:7px;background:#0a172b;border:1px solid var(--line)}.reasonMini:last-child{margin-bottom:0}.reasonMini.long{color:#bcdcff;border-color:#2563eb55}.reasonMini.short{color:#ffd0d6;border-color:#ef334055}.reasonMini b{font-weight:900}.reasonList{margin:9px 0 0;padding-left:18px;font-size:12px;color:#c7dcfa;line-height:1.6}.reasonList li{margin-bottom:3px}.reasonSummary{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:6px}.reasonSummary b{display:block;margin-bottom:6px;font-size:13px;color:#dbe7f8}
 @media(max-width:1050px){.s2,.s3,.s4,.s6,.s8{grid-column:span 12}.metricTop{grid-template-columns:1fr 1fr}.two{grid-template-columns:1fr}.entryrow{grid-template-columns:70px repeat(5,130px);overflow-x:auto}.dist{grid-template-columns:repeat(5,140px);overflow-x:auto}}@media(max-width:600px){.wrap{padding:12px}.top{flex-direction:column}.metricTop{grid-template-columns:1fr 1fr}.heroSignal{font-size:34px}}
 </style></head><body><div class="wrap">
-<div class="top"><div><h1>Coin Monitor</h1><div class="sub">e-rang coin.php 1분 수집 + LONG/SHORT 색상 신호 + Binance 보조 데이터</div></div><div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collect" class="btn">강제 수집</button><span id="live" class="live">● 정상 수집 중</span><span id="lastSync" class="muted"></span><span id="lastTop" class="muted"></span></div></div>
+<div class="top"><div><h1>Coin Monitor</h1><div class="sub">e-rang coin.php 1분 수집 + LONG/SHORT 색상 신호 + Binance 보조 데이터</div></div><div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collect" class="btn">강제 수집</button><button id="telegramTest" class="btn">텔레그램 현재상태 발송</button><span id="live" class="live">● 정상 수집 중</span><span id="lastSync" class="muted"></span><span id="lastTop" class="muted"></span></div></div>
 <div class="grid">
 <div class="card s6 hero"><div><div class="label">현재 E-RANG 판정</div><div id="heroSignal" class="heroSignal wait">WAIT</div></div><div><div id="signalBits" class="big" style="font-size:15px">LONG OFF / SHORT OFF</div><div class="muted">E-RANG 화면의 색상 신호를 기준으로 판정합니다.</div></div></div>
 <div class="card s2"><div class="label">BTCUSDT 현재가</div><div id="price" class="big">-</div><div id="priceDelta" class="muted">Binance 실시간</div></div>
@@ -1030,6 +1139,7 @@ function renderEventDetail(r){if(!r)return;let sig=r.short_signal&&!r.long_signa
 function renderAnalysis(a){let sm=a?.summary||{};$('analysisSummary').innerHTML=['LONG','SHORT'].map(side=>{let g=sm[side]||{},t=g.timeframes?.['15m']||{};return `<div class="analysisBox"><h3 class="${side==='LONG'?'long':'short'}">${side} ON · ${g.count||0}건</h3><div class="chips"><span class="chip">15m 평균 RSI ${n(t.avg_rsi14)}</span><span class="chip">15m 평균 MACD Hist ${n(t.avg_macd_histogram)}</span><span class="chip">MACD Hist 양수 ${t.macd_hist_positive_pct??'-'}%</span><span class="chip">현재가 &gt; EMA20 ${t.price_above_ema20_pct??'-'}%</span><span class="chip">평균 ATR ${n(t.avg_atr14)}</span><span class="chip">평균 Funding ${n(g.avg_funding_rate)}</span></div><div class="hint" style="margin-top:10px">1m/5m/15m/1h 상세는 ON 발생 행을 클릭해서 확인</div></div>`}).join('')}
 async function refresh(){try{let [sr,hr,ar]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/history?limit=80',{cache:'no-store'}),fetch('/api/signal-analysis?limit=200',{cache:'no-store'})]),s=await sr.json(),h=await hr.json(),a=await ar.json(),db=s.db||{};renderAnalysis(a);latest=db.latest||{};let sig=latest.short_signal&&!latest.long_signal?'SHORT':latest.long_signal&&!latest.short_signal?'LONG':latest.short_signal&&latest.long_signal?'BOTH':'WAIT';$('heroSignal').textContent=sig;$('heroSignal').className='heroSignal '+(sig==='SHORT'?'short':sig==='LONG'?'long':'wait');$('signalBits').textContent=`LONG ${latest.long_signal?'ON':'OFF'} / SHORT ${latest.short_signal?'ON':'OFF'}`;let lp=s.live_price||{},livePriceNum=Number(lp.price);$('price').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?n(livePriceNum):n(latest.current_price||latest.current_price_raw);$('priceDelta').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?('Binance 실시간 · '+kst(lp.updated_at)):'E-RANG (Binance 실시간가 대기중)';$('collectState').textContent=latest.success?'정상':'오류';$('counts').textContent=`성공 ${n(db.successful||0)} / 실패 ${n(db.failed||0)}`;$('db').textContent=db.database_ok?'Postgres OK':'Postgres 오류';$('server').textContent=`collector ${(s.collector||{}).running?'running':'idle'}`;$('lastTop').textContent='마지막 수집: '+kst(latest.observed_at);renderErang(latest.parsed||{},livePriceNum);let lb=s.live_binance?.snapshot||{};liveBinance=Object.keys(lb).length?lb:(latest.binance||{});let b=liveBinance;$('bLast').textContent=n(b.ticker_24h?.lastPrice);$('funding').textContent=b.premium_index?.lastFundingRate??'-';$('oi').textContent=n(b.open_interest?.openInterest);$('vol24').textContent=n(b.ticker_24h?.volume);$('bUpdate').textContent='업데이트: '+kst(s.live_binance?.updated_at||latest.observed_at);renderIndicators();renderEvidence();$('history').innerHTML=(h.items||[]).map((r,idx)=>{let i=eventTF(r,'15m'),mh=i.macd?.histogram,rel=Number(i.close)>Number(i.ema20)?'상회':Number(i.close)<Number(i.ema20)?'하회':'-';return `<tr class="clickrow" data-idx="${idx}"><td>${r.id}</td><td>${kst(r.observed_at)}</td><td>${n(r.current_price||r.current_price_raw)}</td><td class="${r.long_signal?'long':''}">${r.long_signal?'ON':'OFF'}</td><td class="${r.short_signal?'short':''}">${r.short_signal?'ON':'OFF'}</td><td class="reasonCell">${historyReasonCell(r)}</td><td>${n(i.rsi14)}</td><td class="${Number(mh)>=0?'statusUp':'statusDown'}">${n(mh)}</td><td>${rel}</td><td>${r.http_status||'-'}</td></tr>`}).join('');document.querySelectorAll('.clickrow').forEach(tr=>tr.onclick=()=>renderEventDetail((h.items||[])[Number(tr.dataset.idx)]));let firstOn=(h.items||[]).find(r=>r.long_signal||r.short_signal);if(firstOn)renderEventDetail(firstOn);$('live').textContent='● 실시간 동기화 중';$('live').className='live';lastSyncAt=Date.now();$('lastSync').textContent='방금 갱신'}catch(e){$('live').textContent='● UI 오류 (재시도 중)';$('live').className='short'}}
 document.querySelectorAll('.tab').forEach(x=>x.onclick=()=>{document.querySelectorAll('.tab').forEach(y=>y.classList.remove('active'));x.classList.add('active');activeTF=x.dataset.tf;renderIndicators()});$('collect').onclick=async()=>{await fetch('/api/collect-now',{method:'POST',cache:'no-store'});refresh()};
+$('telegramTest').onclick=async()=>{let b=$('telegramTest'),orig=b.textContent;b.disabled=true;b.textContent='발송 중...';try{let r=await fetch('/api/telegram-test',{method:'POST',cache:'no-store'});let j=await r.json();alert(j.ok?('✅ 텔레그램 발송 완료'+(j.previewed_side?` (미리보기: ${j.previewed_side.toUpperCase()})`:' (신호 없음, 안내 메시지)')):('❌ 발송 실패: '+(j.error||'알 수 없는 오류')))}catch(e){alert('❌ 요청 실패: '+e)}finally{b.disabled=false;b.textContent=orig}};
 let lastSyncAt=Date.now();
 setInterval(()=>{let s=Math.max(0,Math.round((Date.now()-lastSyncAt)/1000));$('lastSync').textContent=s<=1?'방금 갱신':s+'초 전 갱신'},1000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()});
