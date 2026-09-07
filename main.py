@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import html
 import io
 import json
 import os
@@ -274,7 +275,77 @@ def _fmt_num(value: Any) -> str:
         return "-"
 
 
-def _build_signal_message(side: str, turned_on: bool, parsed: Dict[str, Any], current_price_raw: Optional[str], color: Optional[str]) -> str:
+def _sig_evidence_text(parsed: Dict[str, Any], side: str) -> str:
+    """Python port of the dashboard's sigReason(): the actual E-RANG
+    evidence (detected background color + matched CSS rule + label text).
+    Escaped for safe inclusion in a Telegram HTML-mode message (raw '<'/'&'
+    from CSS selector text like ':not(...)' or '&nbsp;' would otherwise be
+    parsed as broken HTML and silently drop or fail the whole message)."""
+    sig = ((parsed.get("signals") or {}).get(side)) or {}
+    if not sig.get("active"):
+        return ""
+    color = sig.get("detected_color") or "-"
+    parts = [p for p in (sig.get("visual_evidence") or "").split(" | ") if p]
+    css_rule = next((p for p in parts if p.startswith("css ")), None)
+    text = f"라벨 '{sig['matched_text']}'" if sig.get("matched_text") else ""
+    out = f"감지 배경색 {color}"
+    if css_rule:
+        out += f" · {css_rule}"
+    if text:
+        out += f" · {text}"
+    return html.escape(out)
+
+
+def _narrative_for(ind: Dict[str, Any]) -> list[str]:
+    """Python port of the dashboard's narrativeFor(): a short, honest,
+    correlation-only readout of Binance indicators at this moment - not a
+    claim about what caused the E-RANG label to change color."""
+    if not ind:
+        return []
+    macd = ind.get("macd") or {}
+    boll = ind.get("bollinger20") or {}
+    bullets: list[str] = []
+
+    def to_f(v: Any) -> Optional[float]:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    rsi = to_f(ind.get("rsi14"))
+    if rsi is not None:
+        if rsi <= 30:
+            bullets.append(f"RSI {rsi:,.1f} · 과매도권")
+        elif rsi >= 70:
+            bullets.append(f"RSI {rsi:,.1f} · 과매수권")
+        else:
+            bullets.append(f"RSI {rsi:,.1f} · 중립 구간")
+    hist = to_f(macd.get("histogram"))
+    if hist is not None:
+        bullets.append(f"MACD 히스토그램 {hist:,.1f} · {'상승 모멘텀' if hist >= 0 else '하락 모멘텀'}")
+    close, ema20, ema50 = to_f(ind.get("close")), to_f(ind.get("ema20")), to_f(ind.get("ema50"))
+    if close is not None and ema20 is not None:
+        bullets.append(f"종가가 EMA20({ema20:,.1f}) {'상회' if close >= ema20 else '하회'}")
+    if ema20 is not None and ema50 is not None:
+        bullets.append(f"EMA20 {'≥' if ema20 >= ema50 else '미만'} EMA50 · {'단기 상승 배열' if ema20 >= ema50 else '단기 하락 배열'}")
+    upper, lower = to_f(boll.get("upper")), to_f(boll.get("lower"))
+    if close is not None and upper is not None and lower is not None and (upper - lower) > 0:
+        pos = (close - lower) / (upper - lower)
+        if pos <= 0.15:
+            bullets.append("볼린저밴드 하단 근접 · 되돌림 반등 구간 가능성")
+        elif pos >= 0.85:
+            bullets.append("볼린저밴드 상단 근접 · 과열·되돌림 하락 구간 가능성")
+    return bullets
+
+
+def _build_signal_message(
+    side: str,
+    turned_on: bool,
+    parsed: Dict[str, Any],
+    current_price_raw: Optional[str],
+    color: Optional[str],
+    binance_snapshot: Optional[Dict[str, Any]] = None,
+) -> str:
     rows = _row_map_from_parsed(parsed)
     key = "long" if side == "long" else "short"
     tp_key = "tpLong" if side == "long" else "tpShort"
@@ -302,15 +373,38 @@ def _build_signal_message(side: str, turned_on: bool, parsed: Dict[str, Any], cu
             if sl is not None:
                 piece += f" · SL {_fmt_num(sl)}"
             lines.append(piece)
-    if color:
-        lines.append(f"감지 배경색: {color}")
+    # Actual E-RANG evidence (the real cause: label background color/CSS rule).
+    evidence = _sig_evidence_text(parsed, side)
+    if evidence:
+        lines.append("")
+        lines.append(f"📌 <b>E-RANG 실제 판정 근거</b>\n{evidence}")
+    # Binance indicator context - correlation only, never claimed as cause.
+    indicators = (binance_snapshot or {}).get("indicators") or {}
+    tf_bullets = []
+    for tf in ("15m", "1h"):
+        bullets = _narrative_for(indicators.get(tf) or {})
+        if bullets:
+            safe_bullets = [html.escape(b) for b in bullets]
+            tf_bullets.append(f"<b>{tf}</b>\n" + "\n".join(f"· {b}" for b in safe_bullets))
+    if tf_bullets:
+        lines.append("")
+        lines.append("📊 <b>Binance 지표 참고 (참고용, 확정 원인 아님)</b>")
+        lines.extend(tf_bullets)
     lines.append(now_kst + " (KST)")
     if DASHBOARD_URL:
-        lines.append(f'<a href="{DASHBOARD_URL}">대시보드 열기</a>')
+        lines.append(f'<a href="{html.escape(DASHBOARD_URL, quote=True)}">대시보드 열기</a>')
     return "\n".join(lines)
 
 
-def _maybe_notify_telegram(parsed: Dict[str, Any], long_active: bool, short_active: bool, current_price_raw: Optional[str], long_color: Optional[str], short_color: Optional[str]) -> None:
+def _maybe_notify_telegram(
+    parsed: Dict[str, Any],
+    long_active: bool,
+    short_active: bool,
+    current_price_raw: Optional[str],
+    long_color: Optional[str],
+    short_color: Optional[str],
+    binance_snapshot: Optional[Dict[str, Any]] = None,
+) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     with _state_lock:
@@ -323,10 +417,10 @@ def _maybe_notify_telegram(parsed: Dict[str, Any], long_active: bool, short_acti
     # whatever state happened to already be true.
     if prev_long is not None and long_active != prev_long:
         if long_active or TELEGRAM_NOTIFY_OFF:
-            send_telegram_message(_build_signal_message("long", long_active, parsed, current_price_raw, long_color))
+            send_telegram_message(_build_signal_message("long", long_active, parsed, current_price_raw, long_color, binance_snapshot))
     if prev_short is not None and short_active != prev_short:
         if short_active or TELEGRAM_NOTIFY_OFF:
-            send_telegram_message(_build_signal_message("short", short_active, parsed, current_price_raw, short_color))
+            send_telegram_message(_build_signal_message("short", short_active, parsed, current_price_raw, short_color, binance_snapshot))
 
 
 def collect_once() -> Dict[str, Any]:
@@ -369,9 +463,19 @@ def collect_once() -> Dict[str, Any]:
             f"SHORT={short_sig.get('active')} color={short_sig.get('detected_color')} | entry_message={parsed.get('entry_message')}",
         )
         binance_json: Dict[str, Any] = current_binance_snapshot() if ENABLE_BINANCE else {}
+        if ENABLE_BINANCE and not binance_json and collect_binance_snapshot is not None:
+            # The independent live-snapshot loop may not have completed its
+            # first fetch yet (e.g. right after a fresh deploy/restart).
+            # Fall back to a direct synchronous fetch so this observation -
+            # and any Telegram alert built from it - still gets indicator data
+            # instead of an empty "지표 참고" section.
+            try:
+                binance_json = collect_binance_snapshot()
+            except Exception as exc:
+                binance_json = {"errors": {"snapshot": f"{type(exc).__name__}: {exc}"}}
         if ENABLE_BINANCE:
             b_price = (binance_json.get("ticker_24h") or {}).get("lastPrice")
-            log("BINANCE", f"using live snapshot lastPrice={b_price or '-'} errors={len(binance_json.get('errors') or {})}")
+            log("BINANCE", f"using snapshot lastPrice={b_price or '-'} errors={len(binance_json.get('errors') or {})}")
         sha = hashlib.sha256(html.encode("utf-8", "replace")).hexdigest()
         record.update(
             {
@@ -399,6 +503,7 @@ def collect_once() -> Dict[str, Any]:
                 current_price_raw,
                 long_sig.get("detected_color"),
                 short_sig.get("detected_color"),
+                binance_json,
             )
         except Exception as exc:
             log("TELEGRAM_ERROR", f"notify failed: {type(exc).__name__}: {exc}")
@@ -708,10 +813,24 @@ def api_telegram_test() -> Response:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"ok": False, "error": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set"}), 400
     now_kst = datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S")
-    send_telegram_message(f"✅ Coin Monitor 테스트 메시지\n{now_kst} (KST)\n텔레그램 알림 설정이 정상 동작합니다.")
+    summary = db_summary()
+    latest = summary.get("latest") or {}
+    parsed = latest.get("parsed") or {}
+    side = "long" if latest.get("long_signal") else ("short" if latest.get("short_signal") else None)
+    if side and parsed.get("signals"):
+        binance_snapshot = current_binance_snapshot() or latest.get("binance") or {}
+        color = latest.get("long_color") if side == "long" else latest.get("short_color")
+        preview = _build_signal_message(side, True, parsed, latest.get("current_price_raw"), color, binance_snapshot)
+        msg = f"🧪 <b>[테스트 미리보기 · 실제 알림과 동일한 형식]</b>\n\n{preview}"
+    else:
+        msg = (
+            f"✅ Coin Monitor 테스트 메시지\n{now_kst} (KST)\n텔레그램 알림 설정이 정상 동작합니다.\n"
+            "(지금은 LONG/SHORT가 둘 다 OFF라서 근거 포함 미리보기는 다음 ON 시점에 실제로 보내드릴게요.)"
+        )
+    send_telegram_message(msg)
     with _state_lock:
         err = telegram_state.get("last_error")
-    return jsonify({"ok": err is None, "error": err})
+    return jsonify({"ok": err is None, "error": err, "previewed_side": side})
 
 
 @app.get("/export.csv")
