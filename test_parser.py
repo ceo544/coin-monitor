@@ -27,18 +27,5 @@ class ParserSignalTests(unittest.TestCase):
         self.assertIn("long", parsed["sides"])
         self.assertIn("short", parsed["sides"])
 
-    def test_short_label_cell_active_via_css_class(self):
-        html = """
-        <style>.sigA9 { background-color: #ff3b30; color: white; }</style>
-        <table>
-          <tr><td>Long</td><td>79481.4</td></tr>
-          <tr><td class="sigA9">Short</td><td>80173.7</td></tr>
-        </table>
-        """
-        parsed = parse_page(html)
-        self.assertFalse(parsed["signals"]["long"]["active"])
-        self.assertTrue(parsed["signals"]["short"]["active"])
-
-
 if __name__ == "__main__":
     unittest.main()

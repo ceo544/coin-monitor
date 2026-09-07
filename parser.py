@@ -68,78 +68,48 @@ def _find_side_nodes(soup: BeautifulSoup, side: str) -> List[Tag]:
 
 
 def _visual_context(node: Optional[Tag]) -> str:
-    """Return only the visual scope that can actually belong to this side label.
-
-    Important: do not walk up to <table>/<div> containers or inspect unrelated
-    siblings. e-rang uses a blue table header; the old broad scan could see that
-    header while parsing the Long row and incorrectly report LONG=True.
-    """
     if node is None:
         return ""
     parts: List[str] = []
-    candidates: List[Tag] = [node]
-    td = node.find_parent("td")
-    tr = node.find_parent("tr")
-    for candidate in (td, tr):
-        if isinstance(candidate, Tag) and candidate not in candidates:
-            candidates.append(candidate)
-    for cur in candidates:
+    cur: Optional[Tag] = node
+    depth = 0
+    while isinstance(cur, Tag) and depth < 5:
         cls = cur.get("class", [])
-        cls_text = cls if isinstance(cls, str) else " ".join(str(x) for x in cls)
+        if isinstance(cls, str):
+            cls_text = cls
+        else:
+            cls_text = " ".join(str(x) for x in cls)
         style_text = str(cur.get("style", ""))
         data_text = " ".join(f"{k}={v}" for k, v in cur.attrs.items() if k.startswith("data-"))
-        parts.append(f"<{cur.name}> class='{cls_text}' style='{style_text}' {data_text} text='{_node_text(cur)[:240]}'")
-    return " | ".join(parts)
-
-
-def _css_colors(visual: str) -> List[tuple[int, int, int, str]]:
-    colors: List[tuple[int, int, int, str]] = []
-    for raw in re.findall(r"#[0-9a-fA-F]{3,6}\b", visual):
-        h = raw[1:]
-        if len(h) == 3:
-            h = "".join(ch * 2 for ch in h)
-        if len(h) == 6:
-            colors.append((int(h[0:2],16), int(h[2:4],16), int(h[4:6],16), raw.lower()))
-    for m in re.finditer(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})", visual, re.I):
-        r,g,b = (min(255, int(m.group(i))) for i in (1,2,3))
-        colors.append((r,g,b,f"rgb({r},{g},{b})"))
-    return colors
-
-
-def _stylesheet_context(soup: BeautifulSoup, node: Optional[Tag]) -> str:
-    if node is None:
-        return ""
-    classes = node.get("class", [])
-    if isinstance(classes, str):
-        classes = classes.split()
-    node_id = node.get("id")
-    selectors = [f".{c}" for c in classes if c]
-    if node_id:
-        selectors.append(f"#{node_id}")
-    if not selectors:
-        return ""
-    evidence = []
-    for style in soup.find_all("style"):
-        css = style.get_text(" ", strip=True)
-        for selector in selectors:
-            for m in re.finditer(r"([^{}]*" + re.escape(selector) + r"[^{}]*)\{([^{}]+)\}", css, re.I):
-                evidence.append(f"css {m.group(1).strip()} {{{m.group(2).strip()}}}")
-    return " | ".join(evidence)
+        text = _node_text(cur)[:240]
+        if cls_text or style_text or data_text:
+            parts.append(f"<{cur.name}> class='{cls_text}' style='{style_text}' {data_text} text='{text}'")
+        cur = cur.parent if isinstance(cur.parent, Tag) else None
+        depth += 1
+    # Keep immediate siblings because many pages color an adjacent badge/icon instead of label itself.
+    parent = node.parent if isinstance(node.parent, Tag) else None
+    if parent:
+        for sib in list(parent.children)[:12]:
+            if isinstance(sib, Tag):
+                cls = sib.get("class", [])
+                cls_text = cls if isinstance(cls, str) else " ".join(str(x) for x in cls)
+                style_text = str(sib.get("style", ""))
+                if cls_text or style_text:
+                    parts.append(f"<sibling {sib.name}> class='{cls_text}' style='{style_text}' text='{_node_text(sib)[:160]}'")
+    # Deduplicate while preserving order.
+    seen = set()
+    out = []
+    for item in parts:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return " | ".join(out)
 
 
 def _detect_color(side: str, visual: str) -> Optional[str]:
     low = visual.lower().replace(" ", "")
     hints = LONG_COLOR_HINTS if side == "long" else SHORT_COLOR_HINTS
-    hinted = next((hint for hint in hints if hint.replace(" ", "") in low), None)
-    if hinted:
-        return hinted
-    # Accept close CSS shades too, e.g. e-rang's bright #ff3b30 SHORT badge.
-    for r, g, b, raw in _css_colors(visual):
-        if side == "short" and r >= 180 and r >= g * 1.45 and r >= b * 1.35:
-            return raw
-        if side == "long" and ((g >= 110 and g >= r * 1.20 and g >= b * 1.05) or (b >= 150 and b >= r * 1.25 and b >= g * 1.05)):
-            return raw
-    return None
+    return next((hint for hint in hints if hint.replace(" ", "") in low), None)
 
 
 def _signal_for(soup: BeautifulSoup, side: str) -> Dict[str, Any]:
@@ -151,19 +121,14 @@ def _signal_for(soup: BeautifulSoup, side: str) -> Dict[str, Any]:
         "matched_text": None,
     }
     for node in _find_side_nodes(soup, side):
-        # Prefer the exact Long/Short label element. Include CSS rules that target
-        # that element's class/id, because the rendered background may come from
-        # a stylesheet instead of an inline style.
         visual = _visual_context(node)
-        css_visual = _stylesheet_context(soup, node)
-        combined_visual = " | ".join(x for x in (visual, css_visual) if x)
-        color = _detect_color(side, combined_visual)
+        color = _detect_color(side, visual)
         active = bool(color)
         text = _node_text(node)
         candidate = {
             "active": active,
             "detected_color": color,
-            "visual_evidence": combined_visual,
+            "visual_evidence": visual,
             "label_html": str(node)[:3000],
             "matched_text": text,
         }
@@ -172,6 +137,7 @@ def _signal_for(soup: BeautifulSoup, side: str) -> Dict[str, Any]:
         if not best["label_html"]:
             best = candidate
     return best
+
 
 def _extract_side_blocks_from_text(text: str) -> Dict[str, Dict[str, Any]]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -266,6 +232,6 @@ def parse_page(html: str) -> Dict[str, Any]:
             "short": _signal_for(soup, "short"),
         },
         "entry_message": bool(re.search(r"진입\s*(?:해도\s*)?(?:좋|가능)|진입\s*추천|entry\s*(?:ok|signal|possible)", text, re.I)),
-        "parser_version": "3.0.0",
+        "parser_version": "2.0.0",
     }
     return result
