@@ -34,3 +34,13 @@
 - 신호 판정은 이제 라벨 셀의 `background`/`background-color` 실제 선언 값만 사용하며,
   class 문자열/텍스트 색상/보더 색상은 판정에 전혀 관여하지 않습니다. (`/api/debug-signal`의 evidence 표시용 정보에는 계속 포함됩니다.)
 - 기본(베이지) Long + 기본(베이지) Short = OFF/OFF(WAIT)로 정상 판정되는지 회귀 테스트를 추가했습니다.
+
+## v3.5.2 실서비스 오탐 수정 (조상 클래스 무시 버그)
+- 실제 e-rang.kr는 `.coin-strategy__long.blue .coin-strategy__side { background:#44C27B }` 같은
+  **조상(부모 tr)에 별도 토글 클래스(`blue`)가 붙어야 활성화되는 선택자**를 사용합니다.
+- 기존 코드는 선택자의 맨 마지막 부분(`.coin-strategy__side`)만 라벨 셀과 비교하고 앞쪽 조상 조건(`.coin-strategy__long.blue`)은
+  전혀 검사하지 않아서, 조상에 `blue`가 없어도 규칙이 항상 매치되어 Long/Short가 항상 ON으로 오판정되던 것이 BOTH 고정 버그의 실제 원인이었습니다.
+- 선택자 매칭을 조상 체인까지 실제로 검사하도록 (`_selector_matches_node`) 재작성했습니다: 각 공백 구분 부분이 자기 자신 또는
+  올바른 순서의 조상에 실제로 매치되어야 배경색을 인정합니다.
+- 실제 사이트 마크업 구조를 재현한 회귀 테스트(`test_ancestor_toggle_class_required_for_activation`)를 추가해
+  OFF/OFF, LONG만 ON, SHORT만 ON, BOTH ON 네 가지 경우를 모두 검증했습니다.

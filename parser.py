@@ -120,36 +120,77 @@ def _own_style_background(node: Optional[Tag]) -> str:
     return _background_declarations(str(node.get("style", "")))
 
 
-def _stylesheet_backgrounds(soup: BeautifulSoup, node: Optional[Tag]) -> List[str]:
-    """Same selector-matching as _stylesheet_context but returns only the
-    background declaration values (no selector text), for color detection."""
+def _simple_selector_requirements(simple: str) -> tuple[Optional[str], List[str], set]:
+    """Parse a single compound selector token (e.g. '.a.b#id') into
+    (tag, ids, classes). Pseudo-classes/elements are stripped."""
+    simple = simple.split(":", 1)[0]
+    ids = re.findall(r"#([A-Za-z0-9_-]+)", simple)
+    classes = set(re.findall(r"\.([A-Za-z0-9_-]+)", simple))
+    tag_match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)", simple)
+    tag = tag_match.group(1).lower() if tag_match else None
+    return tag, ids, classes
+
+
+def _compound_matches_tag(tag_el: Tag, tag: Optional[str], ids: List[str], classes: set) -> bool:
+    if not (tag or ids or classes):
+        return False
+    node_classes = tag_el.get("class", [])
+    if isinstance(node_classes, str):
+        node_classes = node_classes.split()
+    class_set = {str(c) for c in node_classes if c}
+    node_id = str(tag_el.get("id") or "")
+    if ids and any(x != node_id for x in ids):
+        return False
+    if not classes.issubset(class_set):
+        return False
+    if tag and tag != (tag_el.name or "").lower():
+        return False
+    return True
+
+
+def _selector_matches_node(selector: str, node: Tag) -> bool:
+    """Approximate CSS descendant-combinator matching.
+
+    Every compound token in a space-separated selector must match the node
+    itself (the last token) AND each earlier token must match some ancestor,
+    in order, from innermost to outermost. This matters because rules like
+    '.row.active .label { background: red }' must only apply when the
+    ANCESTOR actually carries the 'active' class - not merely because the
+    label's own class matches the final compound selector. Checking only the
+    last token (as before) makes such conditional/toggle rules always match,
+    which was the root cause of Long/Short both being permanently reported
+    as ON regardless of the site's real active/inactive state.
+    """
+    tokens = [t for t in selector.strip().split() if t]
+    if not tokens:
+        return False
+    *ancestor_tokens, last_token = tokens
+    tag, ids, classes = _simple_selector_requirements(last_token)
+    if not _compound_matches_tag(node, tag, ids, classes):
+        return False
+    pos: Tag = node
+    for token in reversed(ancestor_tokens):
+        tag, ids, classes = _simple_selector_requirements(token)
+        if not (tag or ids or classes):
+            return False
+        found = None
+        parent = pos.parent
+        while isinstance(parent, Tag):
+            if _compound_matches_tag(parent, tag, ids, classes):
+                found = parent
+                break
+            parent = parent.parent
+        if found is None:
+            return False
+        pos = found
+    return True
+
+
+def _matching_backgrounds(soup: BeautifulSoup, node: Optional[Tag], with_selector: bool) -> List[str]:
     node = _label_node(node)
     if node is None:
         return []
-    classes = node.get("class", [])
-    if isinstance(classes, str):
-        classes = classes.split()
-    class_set = {str(c) for c in classes if c}
-    node_id = str(node.get("id") or "")
-    tag_name = (node.name or "").lower()
-
-    def selector_matches(selector: str) -> bool:
-        simple = selector.strip().split()[-1] if selector.strip() else ""
-        simple = simple.split(":", 1)[0]
-        if not simple:
-            return False
-        ids = re.findall(r"#([A-Za-z0-9_-]+)", simple)
-        if ids and any(x != node_id for x in ids):
-            return False
-        required_classes = set(re.findall(r"\.([A-Za-z0-9_-]+)", simple))
-        if not required_classes.issubset(class_set):
-            return False
-        tag_match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)", simple)
-        if tag_match and tag_match.group(1).lower() != tag_name:
-            return False
-        return bool(ids or required_classes or tag_match)
-
-    backgrounds: List[str] = []
+    results: List[str] = []
     for style in soup.find_all("style"):
         css = style.get_text(" ", strip=True)
         for m in re.finditer(r"([^{}]+)\{([^{}]+)\}", css, re.I):
@@ -158,52 +199,20 @@ def _stylesheet_backgrounds(soup: BeautifulSoup, node: Optional[Tag]) -> List[st
             if not bg:
                 continue
             for selector in selector_group.split(","):
-                if selector_matches(selector):
-                    backgrounds.append(bg)
+                if _selector_matches_node(selector, node):
+                    results.append(f"css {selector.strip()} {{{bg}}}" if with_selector else bg)
                     break
-    return backgrounds
+    return results
+
+
+def _stylesheet_backgrounds(soup: BeautifulSoup, node: Optional[Tag]) -> List[str]:
+    """Background declaration values only (no selector text), for color detection."""
+    return _matching_backgrounds(soup, node, with_selector=False)
 
 
 def _stylesheet_context(soup: BeautifulSoup, node: Optional[Tag]) -> str:
-    node = _label_node(node)
-    if node is None:
-        return ""
-    classes = node.get("class", [])
-    if isinstance(classes, str):
-        classes = classes.split()
-    class_set = {str(c) for c in classes if c}
-    node_id = str(node.get("id") or "")
-    tag_name = (node.name or "").lower()
-
-    def selector_matches(selector: str) -> bool:
-        simple = selector.strip().split()[-1] if selector.strip() else ""
-        simple = simple.split(":", 1)[0]
-        if not simple:
-            return False
-        ids = re.findall(r"#([A-Za-z0-9_-]+)", simple)
-        if ids and any(x != node_id for x in ids):
-            return False
-        required_classes = set(re.findall(r"\.([A-Za-z0-9_-]+)", simple))
-        if not required_classes.issubset(class_set):
-            return False
-        tag_match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)", simple)
-        if tag_match and tag_match.group(1).lower() != tag_name:
-            return False
-        return bool(ids or required_classes or tag_match)
-
-    evidence = []
-    for style in soup.find_all("style"):
-        css = style.get_text(" ", strip=True)
-        for m in re.finditer(r"([^{}]+)\{([^{}]+)\}", css, re.I):
-            selector_group, declarations = m.group(1), m.group(2)
-            bg = _background_declarations(declarations)
-            if not bg:
-                continue
-            for selector in selector_group.split(","):
-                if selector_matches(selector):
-                    evidence.append(f"css {selector.strip()} {{{bg}}}")
-                    break
-    return " | ".join(evidence)
+    """Human-readable evidence text (selector + background), for display only."""
+    return " | ".join(_matching_backgrounds(soup, node, with_selector=True))
 
 
 def _detect_color(side: str, visual: str) -> Optional[str]:
@@ -346,6 +355,6 @@ def parse_page(html: str) -> Dict[str, Any]:
             "short": _signal_for(soup, "short"),
         },
         "entry_message": bool(re.search(r"진입\s*(?:해도\s*)?(?:좋|가능)|진입\s*추천|entry\s*(?:ok|signal|possible)", text, re.I)),
-        "parser_version": "3.5.1",
+        "parser_version": "3.5.2",
     }
     return result

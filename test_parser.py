@@ -118,6 +118,49 @@ class ParserSignalTests(unittest.TestCase):
         self.assertFalse(parsed["signals"]["long"]["active"])
         self.assertFalse(parsed["signals"]["short"]["active"])
 
+    def test_ancestor_toggle_class_required_for_activation(self):
+        # Regression: reproduces the real e-rang.kr markup where the
+        # activation rule is a descendant selector requiring an ANCESTOR
+        # toggle class ("blue") in addition to the row's own side class:
+        #   .coin-strategy__long.blue .coin-strategy__side { background: ... }
+        # A selector matcher that only checks the label's own class (ignoring
+        # the ancestor requirement) makes this rule match unconditionally,
+        # which was the actual cause of Long/Short being permanently
+        # reported ON in production regardless of the page's real state.
+        css = """
+        <style>
+        .coin-strategy .coin-strategy__long td:not(.coin-strategy__coin) { background: #e2e2e2; }
+        .coin-strategy .coin-strategy__short td { background: #e2e2e2; }
+        .coin-strategy .coin-strategy__long.blue .coin-strategy__side { background: #44C27B !important; }
+        .coin-strategy .coin-strategy__short.blue .coin-strategy__side { background: #EA4026 !important; }
+        </style>
+        """
+
+        def page(long_active: bool, short_active: bool) -> str:
+            long_cls = "coin-strategy__long blue" if long_active else "coin-strategy__long"
+            short_cls = "coin-strategy__short blue" if short_active else "coin-strategy__short"
+            return f"""{css}
+            <div class="coin-strategy"><table class="coin-strategy__table"><tbody>
+            <tr class="{long_cls}"><td class="coin-strategy__coin">BTC</td><td class="coin-strategy__side">Long</td><td>79481.4</td></tr>
+            <tr class="{short_cls}"><td class="coin-strategy__coin">BTC</td><td class="coin-strategy__side">Short</td><td>80173.7</td></tr>
+            </tbody></table></div>"""
+
+        both_off = parse_page(page(False, False))
+        self.assertFalse(both_off["signals"]["long"]["active"])
+        self.assertFalse(both_off["signals"]["short"]["active"])
+
+        only_short = parse_page(page(False, True))
+        self.assertFalse(only_short["signals"]["long"]["active"])
+        self.assertTrue(only_short["signals"]["short"]["active"])
+
+        only_long = parse_page(page(True, False))
+        self.assertTrue(only_long["signals"]["long"]["active"])
+        self.assertFalse(only_long["signals"]["short"]["active"])
+
+        both_on = parse_page(page(True, True))
+        self.assertTrue(both_on["signals"]["long"]["active"])
+        self.assertTrue(both_on["signals"]["short"]["active"])
+
 
 if __name__ == "__main__":
     unittest.main()
