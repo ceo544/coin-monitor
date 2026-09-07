@@ -27,5 +27,37 @@ class ParserSignalTests(unittest.TestCase):
         self.assertIn("long", parsed["sides"])
         self.assertIn("short", parsed["sides"])
 
+    def test_short_label_cell_active_via_css_class(self):
+        html = """
+        <style>.sigA9 { background-color: #ff3b30; color: white; }</style>
+        <table>
+          <tr><td>Long</td><td>79481.4</td></tr>
+          <tr><td class="sigA9">Short</td><td>80173.7</td></tr>
+        </table>
+        """
+        parsed = parse_page(html)
+        self.assertFalse(parsed["signals"]["long"]["active"])
+        self.assertTrue(parsed["signals"]["short"]["active"])
+
+
+    def test_inactive_cells_do_not_match_active_css_rules(self):
+        html = """
+        <style>
+          .long-label { background:#e8e3dc; }
+          .long-label.active { background:#2563eb; color:white; }
+          .short-label { background:#e8e3dc; }
+          .short-label.active { background:#ff3b30; color:white; }
+        </style>
+        <table>
+          <tr><td class="long-label">Long</td><td>79481.4</td></tr>
+          <tr><td class="short-label">Short</td><td>80173.7</td></tr>
+        </table>
+        """
+        parsed = parse_page(html)
+        self.assertFalse(parsed["signals"]["long"]["active"])
+        self.assertFalse(parsed["signals"]["short"]["active"])
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ from flask import Flask, Response, jsonify, request
 from psycopg.types.json import Jsonb
 
 from parser import parse_page
+from signal_analysis import signal_snapshot, summarize_signal_records
 
 try:
     from binance_data import collect_binance_snapshot
@@ -350,6 +351,28 @@ def api_history() -> Response:
     return jsonify({"items": rows})
 
 
+@app.get("/api/signal-analysis")
+def api_signal_analysis() -> Response:
+    limit = max(1, min(500, int(request.args.get("limit", "200"))))
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, observed_at, http_status, success, current_price, current_price_raw,
+                   long_signal, short_signal, long_color, short_color, entry_message, error, parsed_json, binance_json
+            FROM observations
+            WHERE (COALESCE(long_signal, false) OR COALESCE(short_signal, false))
+            ORDER BY id DESC LIMIT %s
+            """,
+            (limit,),
+        )
+        records = [row_to_dict(row) for row in cur.fetchall()]
+    return jsonify({
+        "note": "Binance indicators are context captured when E-RANG turned ON; they show correlation, not proven causation.",
+        "summary": summarize_signal_records(records),
+        "events": [signal_snapshot(r) for r in records],
+    })
+
+
 @app.get("/api/signals")
 def api_signals() -> Response:
     limit = max(1, min(500, int(request.args.get("limit", "200"))))
@@ -366,6 +389,28 @@ def api_signals() -> Response:
         )
         rows = [row_to_dict(row) for row in cur.fetchall()]
     return jsonify({"items": rows})
+
+
+@app.get("/api/debug-signal")
+def api_debug_signal() -> Response:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, observed_at, parsed_json, raw_html FROM observations ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "no observations"}), 404
+    parsed = row[2] or {}
+    html = row[3] or ""
+    low = html.lower()
+    snippets = {}
+    for side in ("long", "short"):
+        pos = low.find(side)
+        snippets[side] = html[max(0, pos-500):pos+1200] if pos >= 0 else ""
+    return jsonify({
+        "ok": True, "id": row[0], "observed_at": row[1].isoformat() if row[1] else None,
+        "parser_version": parsed.get("parser_version"),
+        "signals": parsed.get("signals") or {},
+        "html_snippets": snippets,
+    })
 
 
 @app.post("/api/collect-now")
@@ -412,82 +457,40 @@ def dashboard() -> str:
 
 
 DASHBOARD_HTML = r"""
-<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Coin Monitor</title>
-  <style>
-    :root{--bg:#0f1220;--panel:#171b2e;--card:#20263d;--text:#eef2ff;--muted:#9aa4bf;--line:#313852;--long:#22c55e;--short:#ef4444;--accent:#8b5cf6;--warn:#f59e0b}
-    *{box-sizing:border-box} body{margin:0;background:linear-gradient(135deg,#090b14,#14182a);color:var(--text);font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-    .wrap{max-width:1280px;margin:0 auto;padding:24px} .top{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
-    h1{margin:0;font-size:26px;letter-spacing:-.03em}.sub{color:var(--muted);font-size:13px;margin-top:6px}.badge{display:inline-flex;align-items:center;gap:7px;padding:7px 11px;border-radius:999px;background:rgba(34,197,94,.14);color:#86efac;font-weight:700;font-size:13px}.dot{width:8px;height:8px;border-radius:50%;background:currentColor}
-    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{background:rgba(32,38,61,.88);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.22)}
-    .span3{grid-column:span 3}.span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:span 12}
-    .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:700}.value{font-size:28px;font-weight:850;margin-top:8px;letter-spacing:-.03em}.small{font-size:13px;color:var(--muted);margin-top:6px}.signal{display:flex;align-items:center;justify-content:space-between;gap:12px}.signal strong{font-size:24px}.pill{border-radius:999px;padding:8px 12px;font-weight:800;font-size:13px}.on-long{background:rgba(34,197,94,.16);color:#86efac}.on-short{background:rgba(239,68,68,.16);color:#fca5a5}.off{background:rgba(148,163,184,.12);color:#cbd5e1}.actions{display:flex;gap:10px;flex-wrap:wrap}button,a.btn{appearance:none;border:1px solid var(--line);background:#252b45;color:var(--text);border-radius:12px;padding:10px 13px;font-weight:800;text-decoration:none;cursor:pointer}button:hover,a.btn:hover{border-color:var(--accent)}
-    table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--muted);font-size:12px;font-weight:800}.num{text-align:right;font-variant-numeric:tabular-nums}.ok{color:#86efac}.bad{color:#fca5a5}.warn{color:#fbbf24}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.scroll{overflow:auto;max-height:560px}.section-title{font-weight:850;margin:0 0 12px 0;font-size:17px}.sidebox{display:grid;grid-template-columns:1fr 1fr;gap:12px}.entry-list{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.entry{background:#151a2c;border:1px solid var(--line);border-radius:12px;padding:10px}.entry b{display:block;font-size:11px;color:var(--muted);margin-bottom:6px}.entry span{font-variant-numeric:tabular-nums;font-weight:800}.errorbox{white-space:pre-wrap;color:#fca5a5;font-size:13px}.json{white-space:pre-wrap;max-height:260px;overflow:auto;background:#111526;border:1px solid var(--line);border-radius:12px;padding:12px;color:#c4b5fd;font-size:12px}
-    @media(max-width:900px){.span3,.span4,.span6,.span8{grid-column:span 12}.wrap{padding:14px}.entry-list{grid-template-columns:repeat(2,1fr)}.value{font-size:23px}}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="top">
-      <div><h1>Coin Monitor</h1><div class="sub">e-rang coin.php 1분 수집 + LONG/SHORT 색상 신호 + Binance 보조 데이터</div></div>
-      <div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collectBtn" type="button">강제 수집</button><span id="liveBadge" class="badge"><span class="dot"></span>LIVE</span></div>
-    </div>
-    <div class="grid">
-      <div class="card span3"><div class="label">BTCUSDT</div><div id="btc" class="value">-</div><div id="btcSub" class="small">대기 중</div></div>
-      <div class="card span3"><div class="label">LONG SIGNAL</div><div class="signal"><strong id="longText">-</strong><span id="longPill" class="pill off">OFF</span></div><div id="longColor" class="small">color: -</div></div>
-      <div class="card span3"><div class="label">SHORT SIGNAL</div><div class="signal"><strong id="shortText">-</strong><span id="shortPill" class="pill off">OFF</span></div><div id="shortColor" class="small">color: -</div></div>
-      <div class="card span3"><div class="label">수집 상태</div><div id="statusText" class="value">-</div><div id="statusSub" class="small">-</div></div>
-      <div class="card span4"><div class="label">총 수집건수</div><div id="total" class="value">0</div><div id="successCount" class="small">성공 0 / 실패 0</div></div>
-      <div class="card span4"><div class="label">마지막 수집</div><div id="lastTime" class="value" style="font-size:20px">-</div><div id="nextTime" class="small">다음 수집 -</div></div>
-      <div class="card span4"><div class="label">DB / 서버</div><div id="dbText" class="value" style="font-size:22px">-</div><div id="serverSub" class="small">-</div></div>
-      <div class="card span6"><h2 class="section-title">진입가 추정 배열</h2><div id="entryGrid" class="sidebox"></div></div>
-      <div class="card span6"><h2 class="section-title">Binance 보조 지표</h2><div id="binanceBox" class="json">-</div></div>
-      <div class="card span12"><h2 class="section-title">최근 수집 데이터</h2><div class="scroll"><table><thead><tr><th>ID</th><th>시간</th><th class="num">BTC</th><th>LONG</th><th>SHORT</th><th>HTTP</th><th>오류</th></tr></thead><tbody id="history"></tbody></table></div></div>
-      <div class="card span12"><h2 class="section-title">최근 원본 파싱 JSON</h2><div id="latestJson" class="json">-</div></div>
-    </div>
-  </div>
-  <script>
-    const $ = (id)=>document.getElementById(id);
-    const fmt = (v)=> v === null || v === undefined || v === '' ? '-' : String(v);
-    const fmtNum = (v)=>{ const n=Number(v); return Number.isFinite(n)?n.toLocaleString('en-US',{maximumFractionDigits:2}):fmt(v); };
-    function kst(iso){ if(!iso) return '-'; return new Date(iso).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',hour12:false}); }
-    function setPill(el,on,cls){ el.className='pill '+(on?cls:'off'); el.textContent=on?'ON':'OFF'; }
-    function sideEntries(title, obj){
-      const nums = (obj && (obj.entry_prices_guess || obj.numbers_raw)) || [];
-      const cards = [0,1,2,3,4].map(i=>`<div class="entry"><b>${i+1}차</b><span>${fmtNum(nums[i])}</span></div>`).join('');
-      return `<div><div class="label" style="margin-bottom:8px">${title}</div><div class="entry-list">${cards}</div></div>`;
-    }
-    async function refresh(){
-      try{
-        const [statusRes, histRes] = await Promise.all([fetch('/api/status'), fetch('/api/history?limit=80')]);
-        const status = await statusRes.json(); const hist = await histRes.json();
-        const db = status.db || {}; const latest = db.latest || {}; const parsed = latest.parsed || {}; const sides = parsed.sides || {};
-        $('btc').textContent = fmtNum(latest.current_price || latest.current_price_raw);
-        $('btcSub').textContent = latest.success ? '수집 성공' : (latest.error || '아직 데이터 없음');
-        $('longText').textContent = latest.long_signal ? 'ACTIVE' : 'WAIT'; setPill($('longPill'), latest.long_signal, 'on-long'); $('longColor').textContent = 'color: '+fmt(latest.long_color);
-        $('shortText').textContent = latest.short_signal ? 'ACTIVE' : 'WAIT'; setPill($('shortPill'), latest.short_signal, 'on-short'); $('shortColor').textContent = 'color: '+fmt(latest.short_color);
-        $('statusText').textContent = latest.success ? '정상' : (db.database_ok ? '대기/오류' : 'DB 오류'); $('statusText').className='value '+(latest.success?'ok':'bad');
-        $('statusSub').textContent = status.target_url + ' / '+status.interval_seconds+'초';
-        $('total').textContent = fmtNum(db.total || 0); $('successCount').textContent = `성공 ${fmtNum(db.successful||0)} / 실패 ${fmtNum(db.failed||0)}`;
-        $('lastTime').textContent = kst(latest.observed_at); $('nextTime').textContent = '다음 수집: '+kst((status.collector||{}).next_run_at);
-        $('dbText').textContent = db.database_ok ? 'Postgres OK' : 'Postgres 오류'; $('dbText').className='value '+(db.database_ok?'ok':'bad');
-        $('serverSub').textContent = 'collector started='+fmt((status.collector||{}).started)+' / running='+fmt((status.collector||{}).running);
-        $('entryGrid').innerHTML = sideEntries('LONG', sides.long) + sideEntries('SHORT', sides.short);
-        const bj = latest.binance || {}; const compact = { ticker_lastPrice: bj.ticker_24h && bj.ticker_24h.lastPrice, fundingRate: bj.premium_index && bj.premium_index.lastFundingRate, openInterest: bj.open_interest && bj.open_interest.openInterest, indicators: bj.indicators || {}, errors: bj.errors || {} };
-        $('binanceBox').textContent = JSON.stringify(compact,null,2);
-        $('latestJson').textContent = JSON.stringify(parsed,null,2);
-        $('history').innerHTML = (hist.items||[]).map(r=>`<tr><td class="mono">${r.id}</td><td>${kst(r.observed_at)}</td><td class="num">${fmtNum(r.current_price||r.current_price_raw)}</td><td>${r.long_signal?'<span class="pill on-long">ON</span>':'<span class="pill off">OFF</span>'}</td><td>${r.short_signal?'<span class="pill on-short">ON</span>':'<span class="pill off">OFF</span>'}</td><td>${fmt(r.http_status)}</td><td class="errorbox">${fmt(r.error)}</td></tr>`).join('');
-      }catch(err){ $('liveBadge').textContent='UI ERROR'; $('statusText').textContent='UI 오류'; $('statusSub').textContent=err.message; }
-    }
-    $('collectBtn').addEventListener('click', async ()=>{ $('collectBtn').disabled=true; $('collectBtn').textContent='수집 중'; try{ await fetch('/api/collect-now',{method:'POST'}); await refresh(); } finally { $('collectBtn').disabled=false; $('collectBtn').textContent='강제 수집'; }});
-    refresh(); setInterval(refresh, 5000);
-  </script>
-</body>
-</html>
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coin Monitor</title>
+<style>
+:root{--bg:#07101f;--panel:#0e1b31;--panel2:#101f38;--line:#243b5f;--text:#f4f7ff;--muted:#8fa7c9;--blue:#38a5ff;--red:#ff5364;--green:#35e29a;--yellow:#ffc83d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,#102442 0,#07101f 45%);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1540px;margin:auto;padding:24px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.top h1{margin:0;font-size:30px}.sub,.muted{color:var(--muted)}.sub{margin-top:5px}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.btn{border:1px solid var(--line);background:#152540;color:#fff;padding:11px 15px;border-radius:11px;text-decoration:none;font-weight:800;cursor:pointer}.live{color:var(--green);font-weight:900}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{background:linear-gradient(145deg,rgba(16,31,56,.98),rgba(10,24,44,.98));border:1px solid var(--line);border-radius:17px;padding:18px;box-shadow:0 14px 32px #0004;min-width:0}.s2{grid-column:span 2}.s3{grid-column:span 3}.s4{grid-column:span 4}.s6{grid-column:span 6}.s8{grid-column:span 8}.s12{grid-column:span 12}.label{font-size:13px;color:#a9bfdf;font-weight:800}.big{font-size:29px;font-weight:950;margin-top:7px}.hero{display:flex;align-items:center;gap:22px;min-height:110px}.heroSignal{font-size:42px;font-weight:1000}.short{color:var(--red)}.long{color:var(--blue)}.wait{color:var(--yellow)}.ok{color:var(--green)}h2{font-size:18px;margin:0 0 14px}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:680px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}th{background:#132947;color:#c7dcfa;font-size:12px}.rowlong td:first-child{font-weight:900;color:#cfe8ff}.rowshort td:first-child{background:#ef3340;color:#fff;font-weight:950}.entryrow{display:grid;grid-template-columns:82px repeat(5,1fr);gap:8px;align-items:stretch;margin-bottom:10px}.sideLabel{display:flex;align-items:center;font-size:20px;font-weight:950}.entry{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:10px;min-width:0}.entry b{font-size:12px;color:#9fb8db;display:block}.entry strong{font-size:17px;display:block;margin-top:5px;white-space:nowrap}.dist{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.dist .entry strong{font-size:20px}.tabs{display:flex;gap:7px;margin:12px 0}.tab{flex:1;border:1px solid var(--line);background:#102746;color:#c8daf4;padding:9px;border-radius:9px;font-weight:850;cursor:pointer}.tab.active{background:#168cff;color:white}.metricTop{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:12px}.metric b{display:block;color:#9fb8db;font-size:12px}.metric strong{display:block;font-size:19px;margin-top:6px}.indtable{min-width:0}.indtable td:nth-child(2){font-weight:800}.statusUp{color:var(--green)}.statusDown{color:var(--red)}.statusNeutral{color:#dbe7f8}.evidence{line-height:1.7}.evidence strong{font-size:18px}.foot{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:13px;gap:12px}.nowrap{white-space:nowrap}.clickrow{cursor:pointer}.clickrow:hover{background:#132947}.analysisGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.analysisBox{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:14px}.analysisBox h3{margin:0 0 10px;font-size:17px}.chips{display:flex;gap:7px;flex-wrap:wrap}.chip{background:#102746;border:1px solid var(--line);border-radius:999px;padding:6px 9px;font-size:12px}.detailHead{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}.hint{font-size:12px;color:var(--muted)}
+@media(max-width:1050px){.s2,.s3,.s4,.s6,.s8{grid-column:span 12}.metricTop{grid-template-columns:1fr 1fr}.two{grid-template-columns:1fr}.entryrow{grid-template-columns:70px repeat(5,130px);overflow-x:auto}.dist{grid-template-columns:repeat(5,140px);overflow-x:auto}}@media(max-width:600px){.wrap{padding:12px}.top{flex-direction:column}.metricTop{grid-template-columns:1fr 1fr}.heroSignal{font-size:34px}}
+</style></head><body><div class="wrap">
+<div class="top"><div><h1>Coin Monitor</h1><div class="sub">e-rang coin.php 1분 수집 + LONG/SHORT 색상 신호 + Binance 보조 데이터</div></div><div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collect" class="btn">강제 수집</button><span id="live" class="live">● 정상 수집 중</span><span id="lastTop" class="muted"></span></div></div>
+<div class="grid">
+<div class="card s6 hero"><div><div class="label">현재 E-RANG 판정</div><div id="heroSignal" class="heroSignal wait">WAIT</div></div><div><div id="signalBits" class="big" style="font-size:15px">LONG OFF / SHORT OFF</div><div class="muted">E-RANG 화면의 색상 신호를 기준으로 판정합니다.</div></div></div>
+<div class="card s2"><div class="label">BTCUSDT 현재가</div><div id="price" class="big">-</div><div id="priceDelta" class="muted">E-RANG</div></div>
+<div class="card s2"><div class="label">수집 상태</div><div id="collectState" class="big ok">정상</div><div id="counts" class="muted">-</div></div>
+<div class="card s2"><div class="label">DB / 서버</div><div id="db" class="big ok" style="font-size:21px">-</div><div id="server" class="muted">-</div></div>
+<div class="card s6"><h2>E-RANG 진입가 <span class="muted">(현재 화면 기준)</span></h2><div class="tablewrap"><table><thead><tr><th>구분</th><th>진입 1<br>(25%)</th><th>진입 2<br>(40%)</th><th>진입 3<br>(60%)</th><th>진입 4<br>(100%)</th><th>진입 5<br>(예비)</th></tr></thead><tbody id="erangRows"></tbody></table></div></div>
+<div class="card s6"><h2>Binance 보조 지표 (BTCUSDT)</h2><div class="metricTop"><div class="metric"><b>현재가 (Last Price)</b><strong id="bLast">-</strong></div><div class="metric"><b>펀딩비 (Funding Rate)</b><strong id="funding">-</strong></div><div class="metric"><b>미결제약정 (Open Interest)</b><strong id="oi">-</strong></div><div class="metric"><b>24h 거래량</b><strong id="vol24">-</strong></div></div><div class="tabs"><button class="tab" data-tf="1m">1분</button><button class="tab" data-tf="5m">5분</button><button class="tab active" data-tf="15m">15분</button><button class="tab" data-tf="1h">1시간</button></div><div class="tablewrap"><table class="indtable"><thead><tr><th>지표</th><th>현재값</th><th>상태</th></tr></thead><tbody id="indicatorRows"></tbody></table></div><div class="foot"><span>ⓘ 최근 220개 캔들 데이터 기반 계산</span><span id="bUpdate"></span></div></div>
+<div class="card s6"><h2>현재가와 주요 진입가 거리 <span id="distSide" class="muted"></span></h2><div id="distance" class="dist"></div></div>
+<div class="card s6"><h2>신호 판정 근거</h2><div id="evidence" class="evidence muted">-</div></div>
+<div class="card s12"><div class="detailHead"><h2>LONG / SHORT ON 공통 보조지표 패턴</h2><span class="hint">※ E-RANG ON 당시 Binance 지표의 상관 패턴이며 ON의 원인으로 확정한 값은 아닙니다.</span></div><div id="analysisSummary" class="analysisGrid"></div></div>
+<div class="card s12"><div class="detailHead"><h2>선택한 수집 시점 보조지표</h2><span class="hint">아래 최근 수집 데이터 행을 클릭하면 당시 1m·5m·15m·1h 상태를 확인합니다.</span></div><div id="eventDetail" class="muted">수집 데이터 행을 선택하세요.</div></div>
+<div class="card s12"><h2>최근 수집 데이터 <span class="muted" style="font-size:12px">(행 클릭 → 당시 보조지표)</span></h2><div class="tablewrap" style="max-height:360px;overflow:auto"><table><thead><tr><th>ID</th><th>시간</th><th>BTC</th><th>LONG</th><th>SHORT</th><th>15m RSI</th><th>15m MACD Hist</th><th>15m EMA20 관계</th><th>HTTP</th></tr></thead><tbody id="history"></tbody></table></div></div>
+</div></div><script>
+const $=id=>document.getElementById(id); let latest={},activeTF='15m';
+const n=v=>{let x=Number(v);return Number.isFinite(x)?x.toLocaleString('en-US',{maximumFractionDigits:4}):'-'}; const kst=v=>v?new Date(v).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',hour12:false}):'-';
+function rowMap(parsed){let rows=parsed.table_rows||[], out={}; for(const r of rows){let t=(r.text||'').trim(), nums=r.numbers_raw||[]; if(/^Long\b/i.test(t))out.long=nums.slice(0,5); else if(/^Short\b/i.test(t))out.short=nums.slice(0,5); else if(/^TP\b/i.test(t)){if(!out.tpLong)out.tpLong=nums.slice(0,5);else out.tpShort=nums.slice(0,5)} else if(/^SL\b/i.test(t)){if(!out.slLong)out.slLong=nums.slice(0,5);else out.slShort=nums.slice(0,5)}} let sides=parsed.sides||{}; out.long=out.long||(sides.long?.entry_prices_guess||[]);out.short=out.short||(sides.short?.entry_prices_guess||[]);return out}
+function cells(a){return [0,1,2,3,4].map(i=>`<td>${n(a?.[i])}</td>`).join('')}
+function renderErang(parsed){let r=rowMap(parsed); $('erangRows').innerHTML=`<tr class="rowlong"><td>Long</td>${cells(r.long)}</tr><tr><td>TP (Long)</td>${cells(r.tpLong)}</tr><tr><td>SL (Long)</td>${cells(r.slLong)}</tr><tr class="rowshort"><td>Short</td>${cells(r.short)}</tr><tr><td>TP (Short)</td>${cells(r.tpShort)}</tr><tr><td>SL (Short)</td>${cells(r.slShort)}</tr>`; let isShort=latest.short_signal&&!latest.long_signal, arr=isShort?r.short:r.long, side=isShort?'Short 기준':'Long 기준', p=Number(latest.current_price||latest.current_price_raw);$('distSide').textContent='('+side+')';$('distance').innerHTML=[0,1,2,3,4].map(i=>{let x=Number(arr?.[i]),d=x-p,pct=p?d/p*100:0;return `<div class="entry"><b>진입 ${i+1}</b><strong>${Number.isFinite(d)?(d>=0?'+':'')+n(d):'-'}</strong><span class="${d>=0?'short':'long'}">${Number.isFinite(pct)?(pct>=0?'+':'')+pct.toFixed(2)+'%':'-'}</span></div>`}).join('')}
+function statusFor(name,val,ind){if(val==null)return '-';if(name==='RSI 14')return val>=70?'과매수':val<=30?'과매도':'중립';if(name.startsWith('EMA')){let c=Number(ind.close);return c>val?'▲ 현재가 상회':'▼ 현재가 하회'}if(name==='MACD Histogram')return val>0?'▲ 양수 (상승 모멘텀)':val<0?'▼ 음수 (하락 모멘텀)':'중립';if(name==='MACD Line')return val>Number(ind.macd?.signal)?'▲ Signal 상회':'▼ Signal 하회';return '-'}
+function clsStatus(s){return s.includes('▲')?'statusUp':s.includes('▼')?'statusDown':'statusNeutral'}
+function renderIndicators(){let b=latest.binance||{}, ind=b.indicators?.[activeTF]||{}, mac=ind.macd||{}, bol=ind.bollinger20||{};let rows=[['현재가 (Close)',ind.close],['고가 (High)',ind.high],['저가 (Low)',ind.low],['거래량 (Volume)',ind.volume],['EMA 20',ind.ema20],['EMA 50',ind.ema50],['EMA 200',ind.ema200],['RSI 14',ind.rsi14],['MACD Line',mac.macd],['MACD Signal',mac.signal],['MACD Histogram',mac.histogram],['Bollinger 상단',bol.upper],['Bollinger 중단',bol.middle],['Bollinger 하단',bol.lower],['ATR 14',ind.atr14]];$('indicatorRows').innerHTML=rows.map(([name,val])=>{let st=statusFor(name,Number(val),ind);return `<tr><td>${name}</td><td>${n(val)}</td><td class="${clsStatus(st)}">${st}</td></tr>`}).join('');}
+function renderEvidence(){let p=latest.parsed||{},s=p.signals||{},L=s.long||{},S=s.short||{};let active=latest.short_signal?'SHORT':latest.long_signal?'LONG':'WAIT';$('evidence').innerHTML=`<strong class="${active==='SHORT'?'short':active==='LONG'?'long':'wait'}">● ${active==='WAIT'?'활성 신호 없음':active+' 활성화 감지'}</strong><br>• Long 감지색: ${L.detected_color||'-'}<br>• Short 감지색: ${S.detected_color||'-'}<br>• 판정 기준: E-RANG Long/Short 라벨 셀의 활성 스타일/클래스`}
+function eventTF(r,tf){return r?.binance?.indicators?.[tf]||{}}
+function renderEventDetail(r){if(!r)return;let sig=r.short_signal&&!r.long_signal?'SHORT':r.long_signal&&!r.short_signal?'LONG':r.short_signal&&r.long_signal?'BOTH':'WAIT';let cards=['1m','5m','15m','1h'].map(tf=>{let i=eventTF(r,tf),m=i.macd||{},b=i.bollinger20||{};return `<div class="analysisBox"><h3>${tf} <span class="${sig==='SHORT'?'short':sig==='LONG'?'long':'wait'}">${sig}</span></h3><div class="chips"><span class="chip">RSI ${n(i.rsi14)}</span><span class="chip">EMA20 ${n(i.ema20)}</span><span class="chip">EMA50 ${n(i.ema50)}</span><span class="chip">EMA200 ${n(i.ema200)}</span><span class="chip">MACD Hist ${n(m.histogram)}</span><span class="chip">ATR ${n(i.atr14)}</span><span class="chip">BB 상 ${n(b.upper)}</span><span class="chip">BB 중 ${n(b.middle)}</span><span class="chip">BB 하 ${n(b.lower)}</span></div></div>`}).join('');$('eventDetail').innerHTML=`<div style="margin-bottom:12px"><strong>ID ${r.id} · ${kst(r.observed_at)} · BTC ${n(r.current_price||r.current_price_raw)}</strong> · Funding ${r.binance?.premium_index?.lastFundingRate??'-'} · OI ${n(r.binance?.open_interest?.openInterest)}</div><div class="analysisGrid">${cards}</div>`}
+function renderAnalysis(a){let sm=a?.summary||{};$('analysisSummary').innerHTML=['LONG','SHORT'].map(side=>{let g=sm[side]||{},t=g.timeframes?.['15m']||{};return `<div class="analysisBox"><h3 class="${side==='LONG'?'long':'short'}">${side} ON · ${g.count||0}건</h3><div class="chips"><span class="chip">15m 평균 RSI ${n(t.avg_rsi14)}</span><span class="chip">15m 평균 MACD Hist ${n(t.avg_macd_histogram)}</span><span class="chip">MACD Hist 양수 ${t.macd_hist_positive_pct??'-'}%</span><span class="chip">현재가 &gt; EMA20 ${t.price_above_ema20_pct??'-'}%</span><span class="chip">평균 ATR ${n(t.avg_atr14)}</span><span class="chip">평균 Funding ${n(g.avg_funding_rate)}</span></div><div class="hint" style="margin-top:10px">1m/5m/15m/1h 상세는 ON 발생 행을 클릭해서 확인</div></div>`}).join('')}
+async function refresh(){try{let [sr,hr,ar]=await Promise.all([fetch('/api/status'),fetch('/api/history?limit=80'),fetch('/api/signal-analysis?limit=200')]),s=await sr.json(),h=await hr.json(),a=await ar.json(),db=s.db||{};renderAnalysis(a);latest=db.latest||{};let sig=latest.short_signal&&!latest.long_signal?'SHORT':latest.long_signal&&!latest.short_signal?'LONG':latest.short_signal&&latest.long_signal?'BOTH':'WAIT';$('heroSignal').textContent=sig;$('heroSignal').className='heroSignal '+(sig==='SHORT'?'short':sig==='LONG'?'long':'wait');$('signalBits').textContent=`LONG ${latest.long_signal?'ON':'OFF'} / SHORT ${latest.short_signal?'ON':'OFF'}`;$('price').textContent=n(latest.current_price||latest.current_price_raw);$('collectState').textContent=latest.success?'정상':'오류';$('counts').textContent=`성공 ${n(db.successful||0)} / 실패 ${n(db.failed||0)}`;$('db').textContent=db.database_ok?'Postgres OK':'Postgres 오류';$('server').textContent=`collector ${(s.collector||{}).running?'running':'idle'}`;$('lastTop').textContent='마지막 수집: '+kst(latest.observed_at);renderErang(latest.parsed||{});let b=latest.binance||{};$('bLast').textContent=n(b.ticker_24h?.lastPrice);$('funding').textContent=b.premium_index?.lastFundingRate??'-';$('oi').textContent=n(b.open_interest?.openInterest);$('vol24').textContent=n(b.ticker_24h?.volume);$('bUpdate').textContent='업데이트: '+kst(latest.observed_at);renderIndicators();renderEvidence();$('history').innerHTML=(h.items||[]).map((r,idx)=>{let i=eventTF(r,'15m'),mh=i.macd?.histogram,rel=Number(i.close)>Number(i.ema20)?'상회':Number(i.close)<Number(i.ema20)?'하회':'-';return `<tr class="clickrow" data-idx="${idx}"><td>${r.id}</td><td>${kst(r.observed_at)}</td><td>${n(r.current_price||r.current_price_raw)}</td><td class="${r.long_signal?'long':''}">${r.long_signal?'ON':'OFF'}</td><td class="${r.short_signal?'short':''}">${r.short_signal?'ON':'OFF'}</td><td>${n(i.rsi14)}</td><td class="${Number(mh)>=0?'statusUp':'statusDown'}">${n(mh)}</td><td>${rel}</td><td>${r.http_status||'-'}</td></tr>`}).join('');document.querySelectorAll('.clickrow').forEach(tr=>tr.onclick=()=>renderEventDetail((h.items||[])[Number(tr.dataset.idx)]));let firstOn=(h.items||[]).find(r=>r.long_signal||r.short_signal);if(firstOn)renderEventDetail(firstOn)}catch(e){$('live').textContent='● UI 오류';$('live').className='short'}}
+document.querySelectorAll('.tab').forEach(x=>x.onclick=()=>{document.querySelectorAll('.tab').forEach(y=>y.classList.remove('active'));x.classList.add('active');activeTF=x.dataset.tf;renderIndicators()});$('collect').onclick=async()=>{await fetch('/api/collect-now',{method:'POST'});refresh()};refresh();setInterval(refresh,5000);
+</script></body></html>
 """
 
 
