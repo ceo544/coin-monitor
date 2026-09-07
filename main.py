@@ -1437,6 +1437,15 @@ function renderBitgetTable(container,rows,emptyMsg){
         out+=`<td>${esc(kst(Number(v)))}</td>`;
       } else if(k==='orderId'){
         out+=`<td>${esc(v??'')}</td>`;
+      } else if(k==='unrealisedPnl'||k==='execPnl'){
+        let pnlNum=Number(v),margin=Number(row.positionBalance);
+        let cls=Number.isFinite(pnlNum)?(pnlNum>=0?'statusUp':'statusDown'):'';
+        let pctText='';
+        if(Number.isFinite(pnlNum)&&Number.isFinite(margin)&&margin!==0){
+          let pct=pnlNum/margin*100;
+          pctText=` <span class="muted">(${pct>=0?'+':''}${pct.toFixed(2)}%)</span>`;
+        }
+        out+=`<td class="pnum ${cls}">${n(v)}${pctText}</td>`;
       } else if(bgLooksNumeric(v)){
         let cls=isPnl?(Number(v)>=0?'statusUp':'statusDown'):'';
         out+=`<td class="pnum ${cls}">${n(v)}</td>`;
@@ -1460,8 +1469,13 @@ function renderPositionMini(bg){
     const MAX_ROWS=3;
     rows=positions.slice(0,MAX_ROWS).map(p=>{
       let isLong=String(p.posSide).toLowerCase()==='long';
-      let pnl=Number(p.unrealisedPnl);
-      let pnlTxt=Number.isFinite(pnl)?(pnl>=0?'+':'')+n(pnl):'-';
+      let pnl=Number(p.unrealisedPnl),margin=Number(p.positionBalance);
+      let pctTxt='';
+      if(Number.isFinite(pnl)&&Number.isFinite(margin)&&margin!==0){
+        let pct=pnl/margin*100;
+        pctTxt=` (${pct>=0?'+':''}${pct.toFixed(1)}%)`;
+      }
+      let pnlTxt=Number.isFinite(pnl)?(pnl>=0?'+':'')+n(pnl)+pctTxt:'-';
       let pnlCls=Number.isFinite(pnl)?(pnl>=0?'statusUp':'statusDown'):'';
       return `<div class="prow"><span class="${isLong?'long':'short'}">${esc(p.symbol||'-')} ${isLong?'LONG':'SHORT'}</span><b class="${pnlCls}">${pnlTxt}</b></div>`;
     }).join('');
@@ -1503,10 +1517,19 @@ function renderBitget(bg){
   let combined=Number(bg.combined_pnl),combinedEl=$('bgCombinedPnl');
   combinedEl.textContent=Number.isFinite(combined)?(combined>=0?'+':'')+n(combined):'-';
   combinedEl.className='num '+(Number.isFinite(combined)?(combined>=0?'statusUp':'statusDown'):'');
-  let lifetimeEl=$('bgLifetimePnl');
-  lifetimeEl.textContent=Number.isFinite(combined)?(combined>=0?'+':'')+n(combined):'-';
-  lifetimeEl.className='num '+(Number.isFinite(combined)?(combined>=0?'statusUp':'statusDown'):'');
   let equity=Number(bg.total_equity);
+  let lifetimeEl=$('bgLifetimePnl');
+  if(Number.isFinite(combined)){
+    let lifetimeTxt=(combined>=0?'+':'')+n(combined);
+    if(Number.isFinite(equity)&&equity!==0){
+      let lifetimePct=combined/equity*100;
+      lifetimeTxt+=` (${lifetimePct>=0?'+':''}${lifetimePct.toFixed(2)}%)`;
+    }
+    lifetimeEl.textContent=lifetimeTxt;
+  } else {
+    lifetimeEl.textContent='-';
+  }
+  lifetimeEl.className='num '+(Number.isFinite(combined)?(combined>=0?'statusUp':'statusDown'):'');
   $('bgEquity').textContent=Number.isFinite(equity)?n(equity):'-';
   renderBitgetTable($('ppanel-positions'),positions,'보유 중인 포지션이 없습니다.');
   renderBitgetTable($('ppanel-fills'),fills,'체결 내역이 없습니다.');
