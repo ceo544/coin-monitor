@@ -69,29 +69,34 @@ def _find_side_nodes(soup: BeautifulSoup, side: str) -> List[Tag]:
     return expanded
 
 
-def _visual_context(node: Optional[Tag]) -> str:
-    """Return only the visual scope that can actually belong to this side label.
+def _background_declarations(text: str) -> str:
+    """Keep only background/background-color declarations for signal colors."""
+    found = []
+    for m in re.finditer(r"(?:^|;)\s*(background(?:-color)?)\s*:\s*([^;}{]+)", text or "", re.I):
+        found.append(f"{m.group(1)}:{m.group(2).strip()}")
+    return ";".join(found)
 
-    Important: do not walk up to <table>/<div> containers or inspect unrelated
-    siblings. e-rang uses a blue table header; the old broad scan could see that
-    header while parsing the Long row and incorrectly report LONG=True.
-    """
+
+def _label_node(node: Optional[Tag]) -> Optional[Tag]:
+    if node is None:
+        return None
+    # The actual E-RANG signal is the Long/Short label cell. Never inherit
+    # header/row/container colors into the decision.
+    if node.name in {"td", "th"}:
+        return node
+    td = node.find_parent(["td", "th"])
+    return td if isinstance(td, Tag) else node
+
+
+def _visual_context(node: Optional[Tag]) -> str:
+    node = _label_node(node)
     if node is None:
         return ""
-    parts: List[str] = []
-    candidates: List[Tag] = [node]
-    td = node.find_parent("td")
-    tr = node.find_parent("tr")
-    for candidate in (td, tr):
-        if isinstance(candidate, Tag) and candidate not in candidates:
-            candidates.append(candidate)
-    for cur in candidates:
-        cls = cur.get("class", [])
-        cls_text = cls if isinstance(cls, str) else " ".join(str(x) for x in cls)
-        style_text = str(cur.get("style", ""))
-        data_text = " ".join(f"{k}={v}" for k, v in cur.attrs.items() if k.startswith("data-"))
-        parts.append(f"<{cur.name}> class='{cls_text}' style='{style_text}' {data_text} text='{_node_text(cur)[:240]}'")
-    return " | ".join(parts)
+    cls = node.get("class", [])
+    cls_text = cls if isinstance(cls, str) else " ".join(str(x) for x in cls)
+    style_bg = _background_declarations(str(node.get("style", "")))
+    data_text = " ".join(f"{k}={v}" for k, v in node.attrs.items() if k.startswith("data-"))
+    return f"<{node.name}> class='{cls_text}' background='{style_bg}' {data_text} text='{_node_text(node)[:120]}'"
 
 
 def _css_colors(visual: str) -> List[tuple[int, int, int, str]]:
@@ -108,13 +113,59 @@ def _css_colors(visual: str) -> List[tuple[int, int, int, str]]:
     return colors
 
 
-def _stylesheet_context(soup: BeautifulSoup, node: Optional[Tag]) -> str:
-    """Return CSS declarations that actually match this node's current class/id.
+def _own_style_background(node: Optional[Tag]) -> str:
+    node = _label_node(node)
+    if node is None:
+        return ""
+    return _background_declarations(str(node.get("style", "")))
 
-    Older versions searched for any selector containing one of the node classes.
-    That incorrectly matched rules such as `.long-label.active` even when the
-    element only had `class="long-label"`, making inactive LONG and SHORT both ON.
-    """
+
+def _stylesheet_backgrounds(soup: BeautifulSoup, node: Optional[Tag]) -> List[str]:
+    """Same selector-matching as _stylesheet_context but returns only the
+    background declaration values (no selector text), for color detection."""
+    node = _label_node(node)
+    if node is None:
+        return []
+    classes = node.get("class", [])
+    if isinstance(classes, str):
+        classes = classes.split()
+    class_set = {str(c) for c in classes if c}
+    node_id = str(node.get("id") or "")
+    tag_name = (node.name or "").lower()
+
+    def selector_matches(selector: str) -> bool:
+        simple = selector.strip().split()[-1] if selector.strip() else ""
+        simple = simple.split(":", 1)[0]
+        if not simple:
+            return False
+        ids = re.findall(r"#([A-Za-z0-9_-]+)", simple)
+        if ids and any(x != node_id for x in ids):
+            return False
+        required_classes = set(re.findall(r"\.([A-Za-z0-9_-]+)", simple))
+        if not required_classes.issubset(class_set):
+            return False
+        tag_match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)", simple)
+        if tag_match and tag_match.group(1).lower() != tag_name:
+            return False
+        return bool(ids or required_classes or tag_match)
+
+    backgrounds: List[str] = []
+    for style in soup.find_all("style"):
+        css = style.get_text(" ", strip=True)
+        for m in re.finditer(r"([^{}]+)\{([^{}]+)\}", css, re.I):
+            selector_group, declarations = m.group(1), m.group(2)
+            bg = _background_declarations(declarations)
+            if not bg:
+                continue
+            for selector in selector_group.split(","):
+                if selector_matches(selector):
+                    backgrounds.append(bg)
+                    break
+    return backgrounds
+
+
+def _stylesheet_context(soup: BeautifulSoup, node: Optional[Tag]) -> str:
+    node = _label_node(node)
     if node is None:
         return ""
     classes = node.get("class", [])
@@ -125,10 +176,8 @@ def _stylesheet_context(soup: BeautifulSoup, node: Optional[Tag]) -> str:
     tag_name = (node.name or "").lower()
 
     def selector_matches(selector: str) -> bool:
-        # Only evaluate the final simple selector. This is sufficient for the
-        # label-cell rules we need and, importantly, is conservative.
         simple = selector.strip().split()[-1] if selector.strip() else ""
-        simple = simple.split(":", 1)[0]  # ignore :hover/:focus etc.
+        simple = simple.split(":", 1)[0]
         if not simple:
             return False
         ids = re.findall(r"#([A-Za-z0-9_-]+)", simple)
@@ -147,20 +196,23 @@ def _stylesheet_context(soup: BeautifulSoup, node: Optional[Tag]) -> str:
         css = style.get_text(" ", strip=True)
         for m in re.finditer(r"([^{}]+)\{([^{}]+)\}", css, re.I):
             selector_group, declarations = m.group(1), m.group(2)
+            bg = _background_declarations(declarations)
+            if not bg:
+                continue
             for selector in selector_group.split(","):
                 if selector_matches(selector):
-                    evidence.append(f"css {selector.strip()} {{{declarations.strip()}}}")
+                    evidence.append(f"css {selector.strip()} {{{bg}}}")
                     break
     return " | ".join(evidence)
 
 
 def _detect_color(side: str, visual: str) -> Optional[str]:
+    # visual contains only label class names + background declarations.
     low = visual.lower().replace(" ", "")
     hints = LONG_COLOR_HINTS if side == "long" else SHORT_COLOR_HINTS
     hinted = next((hint for hint in hints if hint.replace(" ", "") in low), None)
     if hinted:
         return hinted
-    # Accept close CSS shades too, e.g. e-rang's bright #ff3b30 SHORT badge.
     for r, g, b, raw in _css_colors(visual):
         if side == "short" and r >= 180 and r >= g * 1.45 and r >= b * 1.35:
             return raw
@@ -170,31 +222,32 @@ def _detect_color(side: str, visual: str) -> Optional[str]:
 
 
 def _signal_for(soup: BeautifulSoup, side: str) -> Dict[str, Any]:
-    best: Dict[str, Any] = {
-        "active": False,
-        "detected_color": None,
-        "visual_evidence": "",
-        "label_html": None,
-        "matched_text": None,
-    }
-    for node in _find_side_nodes(soup, side):
-        # Prefer the exact Long/Short label element. Include CSS rules that target
-        # that element's class/id, because the rendered background may come from
-        # a stylesheet instead of an inline style.
+    best: Dict[str, Any] = {"active": False, "detected_color": None, "visual_evidence": "", "label_html": None, "matched_text": None}
+    seen = set()
+    for raw_node in _find_side_nodes(soup, side):
+        node = _label_node(raw_node)
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
         visual = _visual_context(node)
         css_visual = _stylesheet_context(soup, node)
         combined_visual = " | ".join(x for x in (visual, css_visual) if x)
-        color = _detect_color(side, combined_visual)
-        active = bool(color)
-        text = _node_text(node)
+        # Color detection must only ever look at actual background declarations
+        # (inline style or matched stylesheet rules), never at raw class names,
+        # text color/border color, or node text. Class names like
+        # "text-blue-600" or "border-green-500" contain color words but do not
+        # mean the label cell's background is that color, so they must not be
+        # able to flip a signal ON.
+        own_bg = _own_style_background(node)
+        sheet_bgs = _stylesheet_backgrounds(soup, node)
+        background_only = ";".join(x for x in [own_bg, *sheet_bgs] if x)
+        color = _detect_color(side, background_only)
         candidate = {
-            "active": active,
-            "detected_color": color,
-            "visual_evidence": combined_visual,
-            "label_html": str(node)[:3000],
-            "matched_text": text,
+            "active": bool(color), "detected_color": color,
+            "visual_evidence": combined_visual, "label_html": str(node)[:3000],
+            "matched_text": _node_text(node),
         }
-        if active:
+        if candidate["active"]:
             return candidate
         if not best["label_html"]:
             best = candidate
@@ -293,6 +346,6 @@ def parse_page(html: str) -> Dict[str, Any]:
             "short": _signal_for(soup, "short"),
         },
         "entry_message": bool(re.search(r"진입\s*(?:해도\s*)?(?:좋|가능)|진입\s*추천|entry\s*(?:ok|signal|possible)", text, re.I)),
-        "parser_version": "3.0.0",
+        "parser_version": "3.5.1",
     }
     return result
