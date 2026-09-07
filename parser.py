@@ -1,46 +1,237 @@
 import re
-from bs4 import BeautifulSoup
+from typing import Any, Dict, List, Optional
+from bs4 import BeautifulSoup, Tag
 
-LONG_COLOR_HINTS = ('green','blue','#16a34a','#22c55e','#10b981','#008000','#0000ff','#2563eb','#3b82f6','rgb(0, 128, 0)','rgb(0, 0, 255)')
-SHORT_COLOR_HINTS = ('red','#dc2626','#ef4444','#f00','#ff0000','rgb(255, 0, 0)')
-ACTIVE_HINTS = ('active','signal','entry','enter','진입','매수','매도')
+NUM_RE = r"-?\d[\d,]*(?:\.\d+)?"
 
-def _visual_context(node):
-    if node is None: return ''
-    parts=[]
-    for el in [node, node.parent, node.find_parent('tr')]:
-        if el is None: continue
-        parts += [str(el.get('style','')), ' '.join(el.get('class',[]))]
-    return ' | '.join(dict.fromkeys(x for x in parts if x)).strip()
+LONG_COLOR_HINTS = (
+    "green", "blue", "lime", "emerald", "cyan", "teal",
+    "#16a34a", "#22c55e", "#10b981", "#008000", "#00ff00",
+    "#0000ff", "#2563eb", "#3b82f6", "#1d4ed8", "#0ea5e9",
+    "rgb(0,128,0)", "rgb(0, 128, 0)", "rgb(0,0,255)", "rgb(0, 0, 255)",
+)
+SHORT_COLOR_HINTS = (
+    "red", "rose", "pink", "crimson", "danger",
+    "#dc2626", "#ef4444", "#f00", "#ff0000", "#b91c1c",
+    "rgb(255,0,0)", "rgb(255, 0, 0)",
+)
+SIDE_ALIASES = {
+    "long": ("long", "롱", "매수"),
+    "short": ("short", "숏", "매도"),
+}
+ENTRY_WORDS = ("진입", "entry", "buy", "sell")
+TP_WORDS = ("tp", "take profit", "목표", "익절")
+SL_WORDS = ("sl", "stop loss", "손절", "스탑")
 
-def _signal_for(soup, side):
-    label=soup.find(string=re.compile(rf'^\s*{side}\s*$', re.I))
-    node=label.parent if label else None
-    visual=_visual_context(node)
-    low=visual.lower()
-    color_hints=LONG_COLOR_HINTS if side.lower()=='long' else SHORT_COLOR_HINTS
-    color_match=next((x for x in color_hints if x in low), None)
-    # Colored Long/Short is the primary signal. Classes such as active/signal are preserved as evidence.
-    active=bool(color_match)
-    return {
-        'active': active,
-        'detected_color': color_match,
-        'visual_evidence': visual,
-        'label_html': str(node) if node else None,
+
+def _clean_num(value: str) -> str:
+    return value.strip().replace(" ", "")
+
+
+def _numbers(text: str) -> List[str]:
+    return [_clean_num(x) for x in re.findall(NUM_RE, text)]
+
+
+def _lower_join(values: List[str]) -> str:
+    return " ".join(v for v in values if v).lower().replace(" ", "")
+
+
+def _visible_text(soup: BeautifulSoup) -> str:
+    return "\n".join(s.strip() for s in soup.stripped_strings if s.strip())
+
+
+def _node_text(node: Optional[Tag]) -> str:
+    if node is None:
+        return ""
+    return " ".join(node.get_text(" ", strip=True).split())
+
+
+def _side_match_text(side: str) -> re.Pattern[str]:
+    aliases = [re.escape(x) for x in SIDE_ALIASES[side]]
+    return re.compile(r"(?:^|\b|\s)(" + "|".join(aliases) + r")(?:\b|\s|$)", re.I)
+
+
+def _find_side_nodes(soup: BeautifulSoup, side: str) -> List[Tag]:
+    pattern = _side_match_text(side)
+    nodes: List[Tag] = []
+    for string in soup.find_all(string=pattern):
+        parent = string.parent
+        if isinstance(parent, Tag) and parent not in nodes:
+            nodes.append(parent)
+    # Add table rows/cards containing the side label because colors are often on ancestors.
+    expanded: List[Tag] = []
+    for node in nodes:
+        for candidate in [node, node.find_parent("td"), node.find_parent("tr"), node.find_parent("div"), node.find_parent("section")]:
+            if isinstance(candidate, Tag) and candidate not in expanded:
+                expanded.append(candidate)
+    return expanded
+
+
+def _visual_context(node: Optional[Tag]) -> str:
+    if node is None:
+        return ""
+    parts: List[str] = []
+    cur: Optional[Tag] = node
+    depth = 0
+    while isinstance(cur, Tag) and depth < 5:
+        cls = cur.get("class", [])
+        if isinstance(cls, str):
+            cls_text = cls
+        else:
+            cls_text = " ".join(str(x) for x in cls)
+        style_text = str(cur.get("style", ""))
+        data_text = " ".join(f"{k}={v}" for k, v in cur.attrs.items() if k.startswith("data-"))
+        text = _node_text(cur)[:240]
+        if cls_text or style_text or data_text:
+            parts.append(f"<{cur.name}> class='{cls_text}' style='{style_text}' {data_text} text='{text}'")
+        cur = cur.parent if isinstance(cur.parent, Tag) else None
+        depth += 1
+    # Keep immediate siblings because many pages color an adjacent badge/icon instead of label itself.
+    parent = node.parent if isinstance(node.parent, Tag) else None
+    if parent:
+        for sib in list(parent.children)[:12]:
+            if isinstance(sib, Tag):
+                cls = sib.get("class", [])
+                cls_text = cls if isinstance(cls, str) else " ".join(str(x) for x in cls)
+                style_text = str(sib.get("style", ""))
+                if cls_text or style_text:
+                    parts.append(f"<sibling {sib.name}> class='{cls_text}' style='{style_text}' text='{_node_text(sib)[:160]}'")
+    # Deduplicate while preserving order.
+    seen = set()
+    out = []
+    for item in parts:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return " | ".join(out)
+
+
+def _detect_color(side: str, visual: str) -> Optional[str]:
+    low = visual.lower().replace(" ", "")
+    hints = LONG_COLOR_HINTS if side == "long" else SHORT_COLOR_HINTS
+    return next((hint for hint in hints if hint.replace(" ", "") in low), None)
+
+
+def _signal_for(soup: BeautifulSoup, side: str) -> Dict[str, Any]:
+    best: Dict[str, Any] = {
+        "active": False,
+        "detected_color": None,
+        "visual_evidence": "",
+        "label_html": None,
+        "matched_text": None,
     }
+    for node in _find_side_nodes(soup, side):
+        visual = _visual_context(node)
+        color = _detect_color(side, visual)
+        active = bool(color)
+        text = _node_text(node)
+        candidate = {
+            "active": active,
+            "detected_color": color,
+            "visual_evidence": visual,
+            "label_html": str(node)[:3000],
+            "matched_text": text,
+        }
+        if active:
+            return candidate
+        if not best["label_html"]:
+            best = candidate
+    return best
 
-def parse_page(html):
-    soup=BeautifulSoup(html,'html.parser')
-    text='\n'.join(s.strip() for s in soup.stripped_strings)
-    result={'page_text': text}
-    price=re.search(r'(?:현재가|Current\s*Price|BTCUSDT)[^0-9]{0,40}([0-9][0-9,]*(?:\.\d+)?)',text,re.I)
-    if price: result['current_price_raw']=price.group(1)
-    sides={}
-    for side in ('Long','Short'):
-        block=re.search(side+r'(.*?)(?=Long|Short|$)',text,re.I|re.S)
-        if block:
-            sides[side.lower()]={'numbers_raw':re.findall(r'(?<!\w)-?\d[\d,]*(?:\.\d+)?',block.group(1))}
-    result['sides']=sides
-    result['signals']={'long':_signal_for(soup,'Long'),'short':_signal_for(soup,'Short')}
-    result['entry_message']=bool(re.search(r'진입\s*(?:해도\s*)?(?:좋|가능)|진입\s*추천', text))
+
+def _extract_side_blocks_from_text(text: str) -> Dict[str, Dict[str, Any]]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    joined = "\n".join(lines)
+    result: Dict[str, Dict[str, Any]] = {}
+    side_positions = []
+    for side in ("long", "short"):
+        pattern = _side_match_text(side)
+        m = pattern.search(joined)
+        if m:
+            side_positions.append((m.start(), side))
+    side_positions.sort()
+    for idx, (start, side) in enumerate(side_positions):
+        end = side_positions[idx + 1][0] if idx + 1 < len(side_positions) else len(joined)
+        block = joined[start:end]
+        nums = _numbers(block)
+        result[side] = {
+            "text_block": block[:5000],
+            "numbers_raw": nums,
+            "entry_prices_guess": nums[:5],
+            "extra_numbers": nums[5:],
+            "tp_values_guess": _labeled_numbers(block, TP_WORDS),
+            "sl_values_guess": _labeled_numbers(block, SL_WORDS),
+        }
+    return result
+
+
+def _labeled_numbers(text: str, labels: tuple[str, ...]) -> List[str]:
+    found: List[str] = []
+    for label in labels:
+        pattern = re.compile(re.escape(label) + rf"[^0-9\-]{{0,60}}({NUM_RE})", re.I)
+        found.extend(_clean_num(m.group(1)) for m in pattern.finditer(text))
+    return found[:20]
+
+
+def _extract_rows(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for tr in soup.find_all("tr"):
+        text = _node_text(tr)
+        if not text:
+            continue
+        nums = _numbers(text)
+        side = None
+        low = text.lower()
+        if any(alias in low for alias in SIDE_ALIASES["long"]):
+            side = "long"
+        if any(alias in low for alias in SIDE_ALIASES["short"]):
+            side = "short"
+        if side or nums:
+            rows.append({
+                "side": side,
+                "text": text[:1000],
+                "numbers_raw": nums,
+                "class": " ".join(tr.get("class", [])) if not isinstance(tr.get("class", []), str) else tr.get("class", ""),
+                "style": str(tr.get("style", "")),
+            })
+    return rows[:80]
+
+
+def _current_price_from_text(text: str) -> Optional[str]:
+    patterns = [
+        rf"(?:현재가|Current\s*Price|BTCUSDT|BTC\s*USDT)[^0-9\-]{{0,80}}({NUM_RE})",
+        rf"({NUM_RE})[^\n]{{0,30}}(?:BTCUSDT|BTC\s*USDT)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            return _clean_num(m.group(1))
+    nums = _numbers(text)
+    # BTC price is usually the first large 5+ digit number when labels are absent.
+    for n in nums:
+        try:
+            if abs(float(n.replace(",", ""))) >= 10000:
+                return n
+        except ValueError:
+            pass
+    return None
+
+
+def parse_page(html: str) -> Dict[str, Any]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    text = _visible_text(soup)
+    sides = _extract_side_blocks_from_text(text)
+    rows = _extract_rows(soup)
+    result: Dict[str, Any] = {
+        "page_text": text,
+        "current_price_raw": _current_price_from_text(text),
+        "sides": sides,
+        "table_rows": rows,
+        "signals": {
+            "long": _signal_for(soup, "long"),
+            "short": _signal_for(soup, "short"),
+        },
+        "entry_message": bool(re.search(r"진입\s*(?:해도\s*)?(?:좋|가능)|진입\s*추천|entry\s*(?:ok|signal|possible)", text, re.I)),
+        "parser_version": "2.0.0",
+    }
     return result
