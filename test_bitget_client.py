@@ -113,7 +113,13 @@ class WinRateAndBalanceTests(unittest.TestCase):
             bitget_client.fetch_position_history = orig_history
 
     def test_win_rate_none_when_no_decided_trades(self):
-        orig_history = bitget_client.fetch_position_history
+        orig = (
+            bitget_client.fetch_position_history,
+            bitget_client.fetch_positions,
+            bitget_client.fetch_pending_orders,
+            bitget_client.fetch_fills,
+            bitget_client.fetch_account_list,
+        )
         try:
             bitget_client.fetch_position_history = lambda limit=100: [{"netProfit": "0.0"}]
             bitget_client.fetch_positions = lambda: []
@@ -123,13 +129,38 @@ class WinRateAndBalanceTests(unittest.TestCase):
             summary = bitget_client.fetch_summary()
             self.assertIsNone(summary["win_rate_pct"])
         finally:
-            bitget_client.fetch_position_history = orig_history
+            (
+                bitget_client.fetch_position_history,
+                bitget_client.fetch_positions,
+                bitget_client.fetch_pending_orders,
+                bitget_client.fetch_fills,
+                bitget_client.fetch_account_list,
+            ) = orig
 
     def test_equity_of_and_realized_pnl_of_key_fallbacks(self):
         self.assertEqual(bitget_client._equity_of({"accountEquity": "500"}), 500.0)
         self.assertEqual(bitget_client._equity_of({"symbol": "BTCUSDT"}), 0.0)
         self.assertEqual(bitget_client._realized_pnl_of({"pnl": "12.3"}), 12.3)
         self.assertEqual(bitget_client._realized_pnl_of({}), 0.0)
+
+
+class AccountModulePathTests(unittest.TestCase):
+    def test_fetch_positions_uses_configured_module_in_path(self):
+        orig_module = bitget_client.BITGET_ACCOUNT_MODULE
+        orig_get = bitget_client._get
+        captured = {}
+        try:
+            bitget_client.BITGET_ACCOUNT_MODULE = "uta"
+            bitget_client._get = lambda path, params=None: captured.update(path=path) or []
+            bitget_client.fetch_positions()
+            self.assertEqual(captured["path"], "/api/v2/uta/position/all-position")
+
+            bitget_client.BITGET_ACCOUNT_MODULE = "mix"
+            bitget_client.fetch_positions()
+            self.assertEqual(captured["path"], "/api/v2/mix/position/all-position")
+        finally:
+            bitget_client.BITGET_ACCOUNT_MODULE = orig_module
+            bitget_client._get = orig_get
 
 
 if __name__ == "__main__":

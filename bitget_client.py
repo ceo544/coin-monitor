@@ -16,6 +16,14 @@ BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "").strip()
 BITGET_TIMEOUT = float(os.getenv("BITGET_TIMEOUT", "12"))
 BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")
 BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN", "USDT")
+# Bitget rejects the Classic Account "mix" endpoints with error 40085 for
+# accounts running in Unified Trading Account (UTA) mode - the account type
+# changes which URL segment ("mix" vs "uta") the same operations live under.
+# This is a best-effort guess at the UTA path segment since it can't be
+# verified against live docs from here; if it's wrong, Bitget will return a
+# different, equally specific error (404, or another {code, msg} pair) that
+# tells us how to correct it - one env var change away, no redeploy of code.
+BITGET_ACCOUNT_MODULE = os.getenv("BITGET_ACCOUNT_MODULE", "uta").strip().strip("/")
 
 # Same field names the uploaded dashboard used to spot PnL/side columns
 # across whatever shape Bitget's response happens to have.
@@ -79,21 +87,21 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
 
 def fetch_positions() -> List[Dict[str, Any]]:
     data = _get(
-        "/api/v2/mix/position/all-position",
+        f"/api/v2/{BITGET_ACCOUNT_MODULE}/position/all-position",
         {"productType": BITGET_PRODUCT_TYPE, "marginCoin": BITGET_MARGIN_COIN},
     )
     return data or []
 
 
 def fetch_pending_orders() -> List[Dict[str, Any]]:
-    data = _get("/api/v2/mix/order/orders-pending", {"productType": BITGET_PRODUCT_TYPE})
+    data = _get(f"/api/v2/{BITGET_ACCOUNT_MODULE}/order/orders-pending", {"productType": BITGET_PRODUCT_TYPE})
     if isinstance(data, dict):
         return data.get("entrustedList") or []
     return data or []
 
 
 def fetch_fills(limit: int = 50) -> List[Dict[str, Any]]:
-    data = _get("/api/v2/mix/order/fills", {"productType": BITGET_PRODUCT_TYPE, "limit": limit})
+    data = _get(f"/api/v2/{BITGET_ACCOUNT_MODULE}/order/fills", {"productType": BITGET_PRODUCT_TYPE, "limit": limit})
     if isinstance(data, dict):
         return data.get("fillList") or []
     return data or []
@@ -101,7 +109,7 @@ def fetch_fills(limit: int = 50) -> List[Dict[str, Any]]:
 
 def fetch_account_list() -> List[Dict[str, Any]]:
     """Futures account balance/equity per margin coin."""
-    data = _get("/api/v2/mix/account/accounts", {"productType": BITGET_PRODUCT_TYPE})
+    data = _get(f"/api/v2/{BITGET_ACCOUNT_MODULE}/account/accounts", {"productType": BITGET_PRODUCT_TYPE})
     return data or []
 
 
@@ -110,7 +118,7 @@ def fetch_position_history(limit: int = 100) -> List[Dict[str, Any]]:
     used to compute win rate and realized PnL, since open positions alone
     can't tell you whether past trades were winners or losers."""
     data = _get(
-        "/api/v2/mix/position/history-position",
+        f"/api/v2/{BITGET_ACCOUNT_MODULE}/position/history-position",
         {"productType": BITGET_PRODUCT_TYPE, "pageSize": limit},
     )
     if isinstance(data, dict):
