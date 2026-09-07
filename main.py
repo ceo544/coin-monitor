@@ -93,6 +93,10 @@ telegram_state: Dict[str, Any] = {
     "enabled": False,  # set once at boot after checking token/chat id
     "last_long_signal": None,   # None = unknown yet (e.g. right after boot)
     "last_short_signal": None,
+    "long_active_color": None,   # last known "on" color, kept even after it turns off, so the OFF message can reference what it was
+    "short_active_color": None,
+    "long_activated_at": None,  # ISO timestamp of when it turned ON, cleared when it turns OFF, used to report how long it stayed ON
+    "short_activated_at": None,
     "last_sent_at": None,
     "last_error": None,
     "sent_count": 0,
@@ -338,6 +342,23 @@ def _narrative_for(ind: Dict[str, Any]) -> list[str]:
     return bullets
 
 
+def _format_duration(started_iso: Optional[str], now_dt: datetime) -> Optional[str]:
+    if not started_iso:
+        return None
+    try:
+        started = datetime.fromisoformat(started_iso)
+    except (TypeError, ValueError):
+        return None
+    secs = max(0, int((now_dt - started).total_seconds()))
+    if secs < 60:
+        return f"{secs}초"
+    mins, secs = divmod(secs, 60)
+    if mins < 60:
+        return f"{mins}분 {secs}초"
+    hours, mins = divmod(mins, 60)
+    return f"{hours}시간 {mins}분"
+
+
 def _build_signal_message(
     side: str,
     turned_on: bool,
@@ -345,14 +366,10 @@ def _build_signal_message(
     current_price_raw: Optional[str],
     color: Optional[str],
     binance_snapshot: Optional[Dict[str, Any]] = None,
+    prev_color: Optional[str] = None,
+    duration_text: Optional[str] = None,
 ) -> str:
     rows = _row_map_from_parsed(parsed)
-    key = "long" if side == "long" else "short"
-    tp_key = "tpLong" if side == "long" else "tpShort"
-    sl_key = "slLong" if side == "long" else "slShort"
-    entries = rows.get(key) or []
-    tps = rows.get(tp_key) or []
-    sls = rows.get(sl_key) or []
     label_kr = "롱(LONG)" if side == "long" else "숏(SHORT)"
     emoji = "🟦" if side == "long" else "🟥"
     state_kr = "진입 신호 발생" if turned_on else "신호 해제"
@@ -361,7 +378,11 @@ def _build_signal_message(
         f"{emoji} <b>E-RANG {label_kr} {state_kr}</b>",
         f"현재가: {_fmt_num(current_price_raw)}",
     ]
-    if entries:
+
+    def entry_block(title: str, entries: list, tps: list, sls: list) -> list:
+        if not entries:
+            return []
+        block = [f"<b>[{title} 진입가]</b>"]
         stage_labels = ["25%", "40%", "60%", "100%", "예비"]
         for idx, val in enumerate(entries[:5]):
             tp = tps[idx] if idx < len(tps) else None
@@ -372,12 +393,36 @@ def _build_signal_message(
                 piece += f" · TP {_fmt_num(tp)}"
             if sl is not None:
                 piece += f" · SL {_fmt_num(sl)}"
-            lines.append(piece)
-    # Actual E-RANG evidence (the real cause: label background color/CSS rule).
-    evidence = _sig_evidence_text(parsed, side)
-    if evidence:
+            block.append(piece)
+        return block
+
+    # Always show BOTH Long and Short entry tables, regardless of which side
+    # triggered this notification, so the person doesn't have to check the
+    # dashboard separately to see the other side's levels.
+    lines.append("")
+    lines.extend(entry_block("LONG", rows.get("long") or [], rows.get("tpLong") or [], rows.get("slLong") or []))
+    lines.append("")
+    lines.extend(entry_block("SHORT", rows.get("short") or [], rows.get("tpShort") or [], rows.get("slShort") or []))
+    # Actual E-RANG evidence - the real cause of the ON/OFF flip.
+    # ON: the label's currently-detected background color/CSS rule.
+    # OFF: there is no "current" color to detect (that's what being OFF
+    # means), so instead report the color it HAD right before this and how
+    # long it stayed on, which is what actually answers "why did it turn off".
+    if turned_on:
+        evidence = _sig_evidence_text(parsed, side)
+        if evidence:
+            lines.append("")
+            lines.append(f"📌 <b>E-RANG 실제 판정 근거 (진입)</b>\n{evidence}")
+    else:
         lines.append("")
-        lines.append(f"📌 <b>E-RANG 실제 판정 근거</b>\n{evidence}")
+        off_evidence = []
+        if prev_color:
+            off_evidence.append(f"직전 감지 배경색 {html.escape(str(prev_color))} → 기본(비활성) 배경색으로 복귀")
+        else:
+            off_evidence.append("라벨이 기본(비활성) 배경색으로 복귀")
+        if duration_text:
+            off_evidence.append(f"활성 유지 시간: {duration_text}")
+        lines.append("📌 <b>E-RANG 실제 판정 근거 (해제)</b>\n" + "\n".join(off_evidence))
     # Binance indicator context - correlation only, never claimed as cause.
     indicators = (binance_snapshot or {}).get("indicators") or {}
     tf_bullets = []
@@ -387,8 +432,9 @@ def _build_signal_message(
             safe_bullets = [html.escape(b) for b in bullets]
             tf_bullets.append(f"<b>{tf}</b>\n" + "\n".join(f"· {b}" for b in safe_bullets))
     if tf_bullets:
+        header = "진입 시점" if turned_on else "해제 시점"
         lines.append("")
-        lines.append("📊 <b>Binance 지표 참고 (참고용, 확정 원인 아님)</b>")
+        lines.append(f"📊 <b>Binance 지표 참고 ({header}, 참고용·확정 원인 아님)</b>")
         lines.extend(tf_bullets)
     lines.append(now_kst + " (KST)")
     if DASHBOARD_URL:
@@ -407,20 +453,60 @@ def _maybe_notify_telegram(
 ) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
     with _state_lock:
         prev_long = telegram_state["last_long_signal"]
         prev_short = telegram_state["last_short_signal"]
         telegram_state["last_long_signal"] = long_active
         telegram_state["last_short_signal"] = short_active
+        # Capture "what it was" BEFORE updating, so an OFF message can report
+        # the color/duration that led up to this exact turn-off.
+        long_prev_color = telegram_state.get("long_active_color")
+        long_activated_at = telegram_state.get("long_activated_at")
+        short_prev_color = telegram_state.get("short_active_color")
+        short_activated_at = telegram_state.get("short_activated_at")
+        if long_active:
+            if long_color:
+                telegram_state["long_active_color"] = long_color
+            if not telegram_state.get("long_activated_at"):
+                telegram_state["long_activated_at"] = now_iso
+        else:
+            telegram_state["long_activated_at"] = None
+        if short_active:
+            if short_color:
+                telegram_state["short_active_color"] = short_color
+            if not telegram_state.get("short_activated_at"):
+                telegram_state["short_activated_at"] = now_iso
+        else:
+            telegram_state["short_activated_at"] = None
     # Only fire on a real transition, and never on the very first cycle after
     # boot (prev is None) - otherwise every restart would re-announce
-    # whatever state happened to already be true.
+    # whatever state happened to already be true. Each side is wrapped in its
+    # own try/except so a failure building/sending the LONG message (say, an
+    # unexpected data shape) can never suppress the SHORT message in the same
+    # cycle, and vice versa - every real transition gets its own send attempt
+    # no matter what happened to the other side.
     if prev_long is not None and long_active != prev_long:
         if long_active or TELEGRAM_NOTIFY_OFF:
-            send_telegram_message(_build_signal_message("long", long_active, parsed, current_price_raw, long_color, binance_snapshot))
+            try:
+                duration = None if long_active else _format_duration(long_activated_at, now_dt)
+                send_telegram_message(_build_signal_message(
+                    "long", long_active, parsed, current_price_raw, long_color, binance_snapshot,
+                    prev_color=long_prev_color, duration_text=duration,
+                ))
+            except Exception as exc:
+                log("TELEGRAM_ERROR", f"failed to build/send LONG {'ON' if long_active else 'OFF'} message: {type(exc).__name__}: {exc}")
     if prev_short is not None and short_active != prev_short:
         if short_active or TELEGRAM_NOTIFY_OFF:
-            send_telegram_message(_build_signal_message("short", short_active, parsed, current_price_raw, short_color, binance_snapshot))
+            try:
+                duration = None if short_active else _format_duration(short_activated_at, now_dt)
+                send_telegram_message(_build_signal_message(
+                    "short", short_active, parsed, current_price_raw, short_color, binance_snapshot,
+                    prev_color=short_prev_color, duration_text=duration,
+                ))
+            except Exception as exc:
+                log("TELEGRAM_ERROR", f"failed to build/send SHORT {'ON' if short_active else 'OFF'} message: {type(exc).__name__}: {exc}")
 
 
 def collect_once() -> Dict[str, Any]:
