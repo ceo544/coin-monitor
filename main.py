@@ -437,6 +437,7 @@ DASHBOARD_HTML = r"""
       <div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collectBtn" type="button">강제 수집</button><span id="liveBadge" class="badge"><span class="dot"></span>LIVE</span></div>
     </div>
     <div class="grid">
+      <div class="card span12" id="decisionCard"><div class="label">현재 E-RANG 판정</div><div id="decision" class="value" style="font-size:38px">판정 대기</div><div id="decisionSub" class="small">LONG/SHORT 활성 색상을 확인합니다.</div></div>
       <div class="card span3"><div class="label">BTCUSDT</div><div id="btc" class="value">-</div><div id="btcSub" class="small">대기 중</div></div>
       <div class="card span3"><div class="label">LONG SIGNAL</div><div class="signal"><strong id="longText">-</strong><span id="longPill" class="pill off">OFF</span></div><div id="longColor" class="small">color: -</div></div>
       <div class="card span3"><div class="label">SHORT SIGNAL</div><div class="signal"><strong id="shortText">-</strong><span id="shortPill" class="pill off">OFF</span></div><div id="shortColor" class="small">color: -</div></div>
@@ -466,6 +467,7 @@ DASHBOARD_HTML = r"""
         const [statusRes, histRes] = await Promise.all([fetch('/api/status'), fetch('/api/history?limit=80')]);
         const status = await statusRes.json(); const hist = await histRes.json();
         const db = status.db || {}; const latest = db.latest || {}; const parsed = latest.parsed || {}; const sides = parsed.sides || {};
+        const isLong=!!latest.long_signal, isShort=!!latest.short_signal; const decision=isLong&&!isShort?'LONG':isShort&&!isLong?'SHORT':isLong&&isShort?'충돌':'WAIT'; $('decision').textContent=decision; $('decision').className='value '+(decision==='SHORT'?'bad':decision==='LONG'?'ok':'warn'); $('decisionSub').textContent=`LONG ${isLong?'ON':'OFF'} / SHORT ${isShort?'ON':'OFF'} · 5초마다 UI 갱신`;
         $('btc').textContent = fmtNum(latest.current_price || latest.current_price_raw);
         $('btcSub').textContent = latest.success ? '수집 성공' : (latest.error || '아직 데이터 없음');
         $('longText').textContent = latest.long_signal ? 'ACTIVE' : 'WAIT'; setPill($('longPill'), latest.long_signal, 'on-long'); $('longColor').textContent = 'color: '+fmt(latest.long_color);
