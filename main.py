@@ -20,16 +20,29 @@ from parser import parse_page
 from signal_analysis import signal_snapshot, summarize_signal_records
 
 try:
-    from binance_data import collect_binance_snapshot
+    from binance_data import collect_binance_snapshot, fetch_last_price
 except Exception:  # pragma: no cover
     collect_binance_snapshot = None
+    fetch_last_price = None
 
 TARGET_URL = os.getenv("TARGET_URL", "https://e-rang.kr/api/coin.php")
-INTERVAL = max(60, int(os.getenv("INTERVAL_SECONDS", "60")))
+INTERVAL = max(1, int(os.getenv("INTERVAL_SECONDS", "30")))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
 USER_AGENT = os.getenv("USER_AGENT", "CoinMonitor/2.0 (+public-page-observation)")
 ENABLE_BINANCE = os.getenv("ENABLE_BINANCE", "true").lower() not in {"0", "false", "no", "off"}
 MAX_HTML_BYTES = int(os.getenv("MAX_HTML_BYTES", "2000000"))
+# Safety valve for aggressive polling intervals (e.g. INTERVAL_SECONDS=1):
+# if the target starts failing repeatedly (likely a rate limit / block),
+# back off instead of hammering it forever at the same short interval.
+BACKOFF_AFTER_FAILURES = int(os.getenv("BACKOFF_AFTER_FAILURES", "5"))
+BACKOFF_SECONDS = float(os.getenv("BACKOFF_SECONDS", "30"))
+# Binance's public REST API is far more forgiving than scraping e-rang.kr,
+# so ALL Binance-derived data (price, funding, open interest, 1m/5m/15m/1h
+# indicators) is refreshed on its own fast, independent loop below - not on
+# the 30s e-rang scrape cycle, which only exists to read the Long/Short
+# signal that can't be obtained anywhere else.
+LIVE_PRICE_INTERVAL = float(os.getenv("LIVE_PRICE_INTERVAL_SECONDS", "2"))
+BINANCE_SNAPSHOT_INTERVAL = float(os.getenv("BINANCE_SNAPSHOT_INTERVAL_SECONDS", "3"))
 
 app = Flask(__name__)
 
@@ -51,6 +64,20 @@ collector_state: Dict[str, Any] = {
     "last_error": None,
     "last_saved_id": None,
     "running": False,
+    "consecutive_failures": 0,
+}
+live_price_state: Dict[str, Any] = {
+    "started": False,
+    "symbol": None,
+    "price": None,
+    "updated_at": None,
+    "last_error": None,
+}
+live_binance_state: Dict[str, Any] = {
+    "started": False,
+    "snapshot": {},
+    "updated_at": None,
+    "last_error": None,
 }
 _state_lock = threading.Lock()
 
@@ -202,15 +229,10 @@ def collect_once() -> Dict[str, Any]:
             f"LONG={long_sig.get('active')} color={long_sig.get('detected_color')} | "
             f"SHORT={short_sig.get('active')} color={short_sig.get('detected_color')} | entry_message={parsed.get('entry_message')}",
         )
-        binance_json: Dict[str, Any] = {}
-        if ENABLE_BINANCE and collect_binance_snapshot is not None:
-            try:
-                binance_json = collect_binance_snapshot()
-                b_price = (binance_json.get("ticker_24h") or {}).get("lastPrice")
-                log("BINANCE", f"snapshot ok lastPrice={b_price or '-'} errors={len(binance_json.get('errors') or {})}")
-            except Exception as exc:
-                binance_json = {"errors": {"snapshot": f"{type(exc).__name__}: {exc}"}}
-                log("BINANCE_ERROR", binance_json["errors"]["snapshot"])
+        binance_json: Dict[str, Any] = current_binance_snapshot() if ENABLE_BINANCE else {}
+        if ENABLE_BINANCE:
+            b_price = (binance_json.get("ticker_24h") or {}).get("lastPrice")
+            log("BINANCE", f"using live snapshot lastPrice={b_price or '-'} errors={len(binance_json.get('errors') or {})}")
         sha = hashlib.sha256(html.encode("utf-8", "replace")).hexdigest()
         record.update(
             {
@@ -255,12 +277,26 @@ def collect_once() -> Dict[str, Any]:
 
 def collector_loop() -> None:
     log("BOOT", f"collector started interval={INTERVAL}s target={TARGET_URL} binance={ENABLE_BINANCE}")
+    consecutive_failures = 0
     while True:
         started = time.monotonic()
-        collect_once()
+        record = collect_once()
         elapsed = time.monotonic() - started
-        sleep_for = max(1.0, INTERVAL - elapsed)
+        if record.get("success"):
+            consecutive_failures = 0
+            sleep_for = max(1.0, INTERVAL - elapsed)
+        else:
+            consecutive_failures += 1
+            if consecutive_failures >= BACKOFF_AFTER_FAILURES:
+                # The target is very likely rate-limiting or blocking us at
+                # this interval. Back off instead of retrying at full speed
+                # forever, which would only make being blocked more likely.
+                sleep_for = max(BACKOFF_SECONDS, INTERVAL - elapsed)
+                log("BACKOFF", f"{consecutive_failures} consecutive failures, backing off to {sleep_for:.1f}s")
+            else:
+                sleep_for = max(1.0, INTERVAL - elapsed)
         with _state_lock:
+            collector_state["consecutive_failures"] = consecutive_failures
             collector_state["next_run_at"] = datetime.fromtimestamp(time.time() + sleep_for, timezone.utc).isoformat()
         log("NEXT", f"sleeping {sleep_for:.1f}s")
         time.sleep(sleep_for)
@@ -274,6 +310,76 @@ def start_collector_once() -> None:
         collector_state["booted_at"] = datetime.now(timezone.utc).isoformat()
     thread = threading.Thread(target=collector_loop, name="coin-collector", daemon=True)
     thread.start()
+
+
+def live_price_loop() -> None:
+    if fetch_last_price is None:
+        log("LIVE_PRICE", "binance_data.fetch_last_price unavailable, live price loop not starting")
+        return
+    log("LIVE_PRICE_BOOT", f"live price loop started interval={LIVE_PRICE_INTERVAL}s")
+    while True:
+        started = time.monotonic()
+        try:
+            data = fetch_last_price()
+            with _state_lock:
+                live_price_state["symbol"] = data.get("symbol")
+                live_price_state["price"] = data.get("price")
+                live_price_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                live_price_state["last_error"] = None
+        except Exception as exc:
+            with _state_lock:
+                live_price_state["last_error"] = f"{type(exc).__name__}: {exc}"
+            log("LIVE_PRICE_ERROR", live_price_state["last_error"])
+        elapsed = time.monotonic() - started
+        time.sleep(max(0.5, LIVE_PRICE_INTERVAL - elapsed))
+
+
+def start_live_price_once() -> None:
+    with _state_lock:
+        if live_price_state["started"]:
+            return
+        live_price_state["started"] = True
+    thread = threading.Thread(target=live_price_loop, name="binance-live-price", daemon=True)
+    thread.start()
+
+
+def binance_snapshot_loop() -> None:
+    if collect_binance_snapshot is None:
+        log("BINANCE_LIVE", "collect_binance_snapshot unavailable, snapshot loop not starting")
+        return
+    log("BINANCE_LIVE_BOOT", f"binance snapshot loop started interval={BINANCE_SNAPSHOT_INTERVAL}s")
+    while True:
+        started = time.monotonic()
+        try:
+            snapshot = collect_binance_snapshot()
+            with _state_lock:
+                live_binance_state["snapshot"] = snapshot
+                live_binance_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                live_binance_state["last_error"] = (snapshot.get("errors") or None)
+        except Exception as exc:
+            with _state_lock:
+                live_binance_state["last_error"] = f"{type(exc).__name__}: {exc}"
+            log("BINANCE_LIVE_ERROR", live_binance_state["last_error"])
+        elapsed = time.monotonic() - started
+        time.sleep(max(1.0, BINANCE_SNAPSHOT_INTERVAL - elapsed))
+
+
+def start_binance_snapshot_once() -> None:
+    with _state_lock:
+        if live_binance_state["started"]:
+            return
+        live_binance_state["started"] = True
+    thread = threading.Thread(target=binance_snapshot_loop, name="binance-live-snapshot", daemon=True)
+    thread.start()
+
+
+def current_binance_snapshot() -> Dict[str, Any]:
+    """Freshest Binance snapshot available (updated every BINANCE_SNAPSHOT_INTERVAL
+    seconds, independent of the e-rang scrape cycle). Used both for the live
+    dashboard view and to tag each e-rang observation with the indicator
+    context at that moment, without making a new Binance call per e-rang row."""
+    with _state_lock:
+        return dict(live_binance_state.get("snapshot") or {})
 
 
 def db_summary() -> Dict[str, Any]:
@@ -333,6 +439,8 @@ def api_status() -> Response:
     summary = db_summary()
     with _state_lock:
         state = dict(collector_state)
+        live_price = dict(live_price_state)
+        live_binance = dict(live_binance_state)
     return jsonify(
         {
             "service": "coin-monitor",
@@ -340,9 +448,23 @@ def api_status() -> Response:
             "interval_seconds": INTERVAL,
             "binance_enabled": ENABLE_BINANCE,
             "collector": state,
+            "live_price": live_price,
+            "live_binance": live_binance,
             "db": summary,
         }
     )
+
+
+@app.get("/api/live-price")
+def api_live_price() -> Response:
+    with _state_lock:
+        return jsonify(dict(live_price_state))
+
+
+@app.get("/api/binance-live")
+def api_binance_live() -> Response:
+    with _state_lock:
+        return jsonify(dict(live_binance_state))
 
 
 @app.get("/api/history")
@@ -475,7 +597,7 @@ DASHBOARD_HTML = r"""
 <div class="top"><div><h1>Coin Monitor</h1><div class="sub">e-rang coin.php 1분 수집 + LONG/SHORT 색상 신호 + Binance 보조 데이터</div></div><div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collect" class="btn">강제 수집</button><span id="live" class="live">● 정상 수집 중</span><span id="lastSync" class="muted"></span><span id="lastTop" class="muted"></span></div></div>
 <div class="grid">
 <div class="card s6 hero"><div><div class="label">현재 E-RANG 판정</div><div id="heroSignal" class="heroSignal wait">WAIT</div></div><div><div id="signalBits" class="big" style="font-size:15px">LONG OFF / SHORT OFF</div><div class="muted">E-RANG 화면의 색상 신호를 기준으로 판정합니다.</div></div></div>
-<div class="card s2"><div class="label">BTCUSDT 현재가</div><div id="price" class="big">-</div><div id="priceDelta" class="muted">E-RANG</div></div>
+<div class="card s2"><div class="label">BTCUSDT 현재가</div><div id="price" class="big">-</div><div id="priceDelta" class="muted">Binance 실시간</div></div>
 <div class="card s2"><div class="label">수집 상태</div><div id="collectState" class="big ok">정상</div><div id="counts" class="muted">-</div></div>
 <div class="card s2"><div class="label">DB / 서버</div><div id="db" class="big ok" style="font-size:21px">-</div><div id="server" class="muted">-</div></div>
 <div class="card s6"><h2>E-RANG 진입가 <span class="muted">(현재 화면 기준)</span></h2><div class="tablewrap"><table><thead><tr><th>구분</th><th>진입 1<br>(25%)</th><th>진입 2<br>(40%)</th><th>진입 3<br>(60%)</th><th>진입 4<br>(100%)</th><th>진입 5<br>(예비)</th></tr></thead><tbody id="erangRows"></tbody></table></div></div>
@@ -486,7 +608,7 @@ DASHBOARD_HTML = r"""
 <div class="card s12"><div class="detailHead"><h2>선택한 수집 시점 보조지표</h2><span class="hint">아래 최근 수집 데이터 행을 클릭하면 당시 1m·5m·15m·1h 상태를 확인합니다.</span></div><div id="eventDetail" class="muted">수집 데이터 행을 선택하세요.</div></div>
 <div class="card s12"><h2>최근 수집 데이터 <span class="muted" style="font-size:12px">(행 클릭 → 당시 보조지표)</span></h2><div class="tablewrap" style="max-height:360px;overflow:auto"><table><thead><tr><th>ID</th><th>시간</th><th>BTC</th><th>LONG</th><th>SHORT</th><th>판정 근거</th><th>15m RSI</th><th>15m MACD Hist</th><th>15m EMA20 관계</th><th>HTTP</th></tr></thead><tbody id="history"></tbody></table></div></div>
 </div></div><script>
-const $=id=>document.getElementById(id); let latest={},activeTF='15m';
+const $=id=>document.getElementById(id); let latest={},activeTF='15m',liveBinance={};
 const n=v=>{let x=Number(v);return Number.isFinite(x)?x.toLocaleString('en-US',{maximumFractionDigits:4}):'-'}; const kst=v=>v?new Date(v).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',hour12:false}):'-';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function sigReason(r,side){
@@ -509,21 +631,21 @@ function historyReasonCell(r){
 }
 function rowMap(parsed){let rows=parsed.table_rows||[], out={}; for(const r of rows){let t=(r.text||'').trim(), nums=r.numbers_raw||[]; if(/^Long\b/i.test(t))out.long=nums.slice(0,5); else if(/^Short\b/i.test(t))out.short=nums.slice(0,5); else if(/^TP\b/i.test(t)){if(!out.tpLong)out.tpLong=nums.slice(0,5);else out.tpShort=nums.slice(0,5)} else if(/^SL\b/i.test(t)){if(!out.slLong)out.slLong=nums.slice(0,5);else out.slShort=nums.slice(0,5)}} let sides=parsed.sides||{}; out.long=out.long||(sides.long?.entry_prices_guess||[]);out.short=out.short||(sides.short?.entry_prices_guess||[]);return out}
 function cells(a){return [0,1,2,3,4].map(i=>`<td>${n(a?.[i])}</td>`).join('')}
-function renderErang(parsed){let r=rowMap(parsed); let longOn=!!latest.long_signal, shortOn=!!latest.short_signal; $('erangRows').innerHTML=`<tr class="rowlong${longOn?' on':''}"><td>Long</td>${cells(r.long)}</tr><tr><td>TP (Long)</td>${cells(r.tpLong)}</tr><tr><td>SL (Long)</td>${cells(r.slLong)}</tr><tr class="rowshort${shortOn?' on':''}"><td>Short</td>${cells(r.short)}</tr><tr><td>TP (Short)</td>${cells(r.tpShort)}</tr><tr><td>SL (Short)</td>${cells(r.slShort)}</tr>`; let p=Number(latest.current_price||latest.current_price_raw); let renderDist=(elId,arr)=>{$(elId).innerHTML=[0,1,2,3,4].map(i=>{let x=Number(arr?.[i]),d=x-p,pct=p?d/p*100:0;return `<div class="entry"><b>진입 ${i+1}</b><strong>${Number.isFinite(d)?(d>=0?'+':'')+n(d):'-'}</strong><span class="${d>=0?'short':'long'}">${Number.isFinite(pct)?(pct>=0?'+':'')+pct.toFixed(2)+'%':'-'}</span></div>`}).join('')}; renderDist('distanceLong',r.long); renderDist('distanceShort',r.short)}
+function renderErang(parsed,priceOverride){let r=rowMap(parsed); let longOn=!!latest.long_signal, shortOn=!!latest.short_signal; $('erangRows').innerHTML=`<tr class="rowlong${longOn?' on':''}"><td>Long</td>${cells(r.long)}</tr><tr><td>TP (Long)</td>${cells(r.tpLong)}</tr><tr><td>SL (Long)</td>${cells(r.slLong)}</tr><tr class="rowshort${shortOn?' on':''}"><td>Short</td>${cells(r.short)}</tr><tr><td>TP (Short)</td>${cells(r.tpShort)}</tr><tr><td>SL (Short)</td>${cells(r.slShort)}</tr>`; let p=Number.isFinite(priceOverride)&&priceOverride>0?priceOverride:Number(latest.current_price||latest.current_price_raw); let renderDist=(elId,arr)=>{$(elId).innerHTML=[0,1,2,3,4].map(i=>{let x=Number(arr?.[i]),d=x-p,pct=p?d/p*100:0;return `<div class="entry"><b>진입 ${i+1}</b><strong>${Number.isFinite(d)?(d>=0?'+':'')+n(d):'-'}</strong><span class="${d>=0?'short':'long'}">${Number.isFinite(pct)?(pct>=0?'+':'')+pct.toFixed(2)+'%':'-'}</span></div>`}).join('')}; renderDist('distanceLong',r.long); renderDist('distanceShort',r.short)}
 function statusFor(name,val,ind){if(val==null)return '-';if(name==='RSI 14')return val>=70?'과매수':val<=30?'과매도':'중립';if(name.startsWith('EMA')){let c=Number(ind.close);return c>val?'▲ 현재가 상회':'▼ 현재가 하회'}if(name==='MACD Histogram')return val>0?'▲ 양수 (상승 모멘텀)':val<0?'▼ 음수 (하락 모멘텀)':'중립';if(name==='MACD Line')return val>Number(ind.macd?.signal)?'▲ Signal 상회':'▼ Signal 하회';return '-'}
 function clsStatus(s){return s.includes('▲')?'statusUp':s.includes('▼')?'statusDown':'statusNeutral'}
-function renderIndicators(){let b=latest.binance||{}, ind=b.indicators?.[activeTF]||{}, mac=ind.macd||{}, bol=ind.bollinger20||{};let rows=[['현재가 (Close)',ind.close],['고가 (High)',ind.high],['저가 (Low)',ind.low],['거래량 (Volume)',ind.volume],['EMA 20',ind.ema20],['EMA 50',ind.ema50],['EMA 200',ind.ema200],['RSI 14',ind.rsi14],['MACD Line',mac.macd],['MACD Signal',mac.signal],['MACD Histogram',mac.histogram],['Bollinger 상단',bol.upper],['Bollinger 중단',bol.middle],['Bollinger 하단',bol.lower],['ATR 14',ind.atr14]];$('indicatorRows').innerHTML=rows.map(([name,val])=>{let st=statusFor(name,Number(val),ind);return `<tr><td>${name}</td><td>${n(val)}</td><td class="${clsStatus(st)}">${st}</td></tr>`}).join('');}
+function renderIndicators(){let b=liveBinance&&Object.keys(liveBinance).length?liveBinance:(latest.binance||{}), ind=b.indicators?.[activeTF]||{}, mac=ind.macd||{}, bol=ind.bollinger20||{};let rows=[['현재가 (Close)',ind.close],['고가 (High)',ind.high],['저가 (Low)',ind.low],['거래량 (Volume)',ind.volume],['EMA 20',ind.ema20],['EMA 50',ind.ema50],['EMA 200',ind.ema200],['RSI 14',ind.rsi14],['MACD Line',mac.macd],['MACD Signal',mac.signal],['MACD Histogram',mac.histogram],['Bollinger 상단',bol.upper],['Bollinger 중단',bol.middle],['Bollinger 하단',bol.lower],['ATR 14',ind.atr14]];$('indicatorRows').innerHTML=rows.map(([name,val])=>{let st=statusFor(name,Number(val),ind);return `<tr><td>${name}</td><td>${n(val)}</td><td class="${clsStatus(st)}">${st}</td></tr>`}).join('');}
 function renderEvidence(){let p=latest.parsed||{},s=p.signals||{},L=s.long||{},S=s.short||{};let active=latest.short_signal?'SHORT':latest.long_signal?'LONG':'WAIT';$('evidence').innerHTML=`<strong class="${active==='SHORT'?'short':active==='LONG'?'long':'wait'}">● ${active==='WAIT'?'활성 신호 없음':active+' 활성화 감지'}</strong><br>• Long 감지색: ${L.detected_color||'-'}<br>• Short 감지색: ${S.detected_color||'-'}<br>• 판정 기준: E-RANG Long/Short 라벨 셀의 활성 스타일/클래스`}
 function eventTF(r,tf){return r?.binance?.indicators?.[tf]||{}}
 function renderEventDetail(r){if(!r)return;let sig=r.short_signal&&!r.long_signal?'SHORT':r.long_signal&&!r.short_signal?'LONG':r.short_signal&&r.long_signal?'BOTH':'WAIT';let cards=['1m','5m','15m','1h'].map(tf=>{let i=eventTF(r,tf),m=i.macd||{},b=i.bollinger20||{};return `<div class="analysisBox"><h3>${tf} <span class="${sig==='SHORT'?'short':sig==='LONG'?'long':'wait'}">${sig}</span></h3><div class="chips"><span class="chip">RSI ${n(i.rsi14)}</span><span class="chip">EMA20 ${n(i.ema20)}</span><span class="chip">EMA50 ${n(i.ema50)}</span><span class="chip">EMA200 ${n(i.ema200)}</span><span class="chip">MACD Hist ${n(m.histogram)}</span><span class="chip">ATR ${n(i.atr14)}</span><span class="chip">BB 상 ${n(b.upper)}</span><span class="chip">BB 중 ${n(b.middle)}</span><span class="chip">BB 하 ${n(b.lower)}</span></div></div>`}).join('');$('eventDetail').innerHTML=`<div style="margin-bottom:12px"><strong>ID ${r.id} · ${kst(r.observed_at)} · BTC ${n(r.current_price||r.current_price_raw)}</strong> · Funding ${r.binance?.premium_index?.lastFundingRate??'-'} · OI ${n(r.binance?.open_interest?.openInterest)}</div><div class="analysisGrid">${cards}</div>`}
 function renderAnalysis(a){let sm=a?.summary||{};$('analysisSummary').innerHTML=['LONG','SHORT'].map(side=>{let g=sm[side]||{},t=g.timeframes?.['15m']||{};return `<div class="analysisBox"><h3 class="${side==='LONG'?'long':'short'}">${side} ON · ${g.count||0}건</h3><div class="chips"><span class="chip">15m 평균 RSI ${n(t.avg_rsi14)}</span><span class="chip">15m 평균 MACD Hist ${n(t.avg_macd_histogram)}</span><span class="chip">MACD Hist 양수 ${t.macd_hist_positive_pct??'-'}%</span><span class="chip">현재가 &gt; EMA20 ${t.price_above_ema20_pct??'-'}%</span><span class="chip">평균 ATR ${n(t.avg_atr14)}</span><span class="chip">평균 Funding ${n(g.avg_funding_rate)}</span></div><div class="hint" style="margin-top:10px">1m/5m/15m/1h 상세는 ON 발생 행을 클릭해서 확인</div></div>`}).join('')}
-async function refresh(){try{let [sr,hr,ar]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/history?limit=80',{cache:'no-store'}),fetch('/api/signal-analysis?limit=200',{cache:'no-store'})]),s=await sr.json(),h=await hr.json(),a=await ar.json(),db=s.db||{};renderAnalysis(a);latest=db.latest||{};let sig=latest.short_signal&&!latest.long_signal?'SHORT':latest.long_signal&&!latest.short_signal?'LONG':latest.short_signal&&latest.long_signal?'BOTH':'WAIT';$('heroSignal').textContent=sig;$('heroSignal').className='heroSignal '+(sig==='SHORT'?'short':sig==='LONG'?'long':'wait');$('signalBits').textContent=`LONG ${latest.long_signal?'ON':'OFF'} / SHORT ${latest.short_signal?'ON':'OFF'}`;$('price').textContent=n(latest.current_price||latest.current_price_raw);$('collectState').textContent=latest.success?'정상':'오류';$('counts').textContent=`성공 ${n(db.successful||0)} / 실패 ${n(db.failed||0)}`;$('db').textContent=db.database_ok?'Postgres OK':'Postgres 오류';$('server').textContent=`collector ${(s.collector||{}).running?'running':'idle'}`;$('lastTop').textContent='마지막 수집: '+kst(latest.observed_at);renderErang(latest.parsed||{});let b=latest.binance||{};$('bLast').textContent=n(b.ticker_24h?.lastPrice);$('funding').textContent=b.premium_index?.lastFundingRate??'-';$('oi').textContent=n(b.open_interest?.openInterest);$('vol24').textContent=n(b.ticker_24h?.volume);$('bUpdate').textContent='업데이트: '+kst(latest.observed_at);renderIndicators();renderEvidence();$('history').innerHTML=(h.items||[]).map((r,idx)=>{let i=eventTF(r,'15m'),mh=i.macd?.histogram,rel=Number(i.close)>Number(i.ema20)?'상회':Number(i.close)<Number(i.ema20)?'하회':'-';return `<tr class="clickrow" data-idx="${idx}"><td>${r.id}</td><td>${kst(r.observed_at)}</td><td>${n(r.current_price||r.current_price_raw)}</td><td class="${r.long_signal?'long':''}">${r.long_signal?'ON':'OFF'}</td><td class="${r.short_signal?'short':''}">${r.short_signal?'ON':'OFF'}</td><td class="reasonCell">${historyReasonCell(r)}</td><td>${n(i.rsi14)}</td><td class="${Number(mh)>=0?'statusUp':'statusDown'}">${n(mh)}</td><td>${rel}</td><td>${r.http_status||'-'}</td></tr>`}).join('');document.querySelectorAll('.clickrow').forEach(tr=>tr.onclick=()=>renderEventDetail((h.items||[])[Number(tr.dataset.idx)]));let firstOn=(h.items||[]).find(r=>r.long_signal||r.short_signal);if(firstOn)renderEventDetail(firstOn);$('live').textContent='● 실시간 동기화 중';$('live').className='live';lastSyncAt=Date.now();$('lastSync').textContent='방금 갱신'}catch(e){$('live').textContent='● UI 오류 (재시도 중)';$('live').className='short'}}
+async function refresh(){try{let [sr,hr,ar]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/history?limit=80',{cache:'no-store'}),fetch('/api/signal-analysis?limit=200',{cache:'no-store'})]),s=await sr.json(),h=await hr.json(),a=await ar.json(),db=s.db||{};renderAnalysis(a);latest=db.latest||{};let sig=latest.short_signal&&!latest.long_signal?'SHORT':latest.long_signal&&!latest.short_signal?'LONG':latest.short_signal&&latest.long_signal?'BOTH':'WAIT';$('heroSignal').textContent=sig;$('heroSignal').className='heroSignal '+(sig==='SHORT'?'short':sig==='LONG'?'long':'wait');$('signalBits').textContent=`LONG ${latest.long_signal?'ON':'OFF'} / SHORT ${latest.short_signal?'ON':'OFF'}`;let lp=s.live_price||{},livePriceNum=Number(lp.price);$('price').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?n(livePriceNum):n(latest.current_price||latest.current_price_raw);$('priceDelta').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?('Binance 실시간 · '+kst(lp.updated_at)):'E-RANG (Binance 실시간가 대기중)';$('collectState').textContent=latest.success?'정상':'오류';$('counts').textContent=`성공 ${n(db.successful||0)} / 실패 ${n(db.failed||0)}`;$('db').textContent=db.database_ok?'Postgres OK':'Postgres 오류';$('server').textContent=`collector ${(s.collector||{}).running?'running':'idle'}`;$('lastTop').textContent='마지막 수집: '+kst(latest.observed_at);renderErang(latest.parsed||{},livePriceNum);let lb=s.live_binance?.snapshot||{};liveBinance=Object.keys(lb).length?lb:(latest.binance||{});let b=liveBinance;$('bLast').textContent=n(b.ticker_24h?.lastPrice);$('funding').textContent=b.premium_index?.lastFundingRate??'-';$('oi').textContent=n(b.open_interest?.openInterest);$('vol24').textContent=n(b.ticker_24h?.volume);$('bUpdate').textContent='업데이트: '+kst(s.live_binance?.updated_at||latest.observed_at);renderIndicators();renderEvidence();$('history').innerHTML=(h.items||[]).map((r,idx)=>{let i=eventTF(r,'15m'),mh=i.macd?.histogram,rel=Number(i.close)>Number(i.ema20)?'상회':Number(i.close)<Number(i.ema20)?'하회':'-';return `<tr class="clickrow" data-idx="${idx}"><td>${r.id}</td><td>${kst(r.observed_at)}</td><td>${n(r.current_price||r.current_price_raw)}</td><td class="${r.long_signal?'long':''}">${r.long_signal?'ON':'OFF'}</td><td class="${r.short_signal?'short':''}">${r.short_signal?'ON':'OFF'}</td><td class="reasonCell">${historyReasonCell(r)}</td><td>${n(i.rsi14)}</td><td class="${Number(mh)>=0?'statusUp':'statusDown'}">${n(mh)}</td><td>${rel}</td><td>${r.http_status||'-'}</td></tr>`}).join('');document.querySelectorAll('.clickrow').forEach(tr=>tr.onclick=()=>renderEventDetail((h.items||[])[Number(tr.dataset.idx)]));let firstOn=(h.items||[]).find(r=>r.long_signal||r.short_signal);if(firstOn)renderEventDetail(firstOn);$('live').textContent='● 실시간 동기화 중';$('live').className='live';lastSyncAt=Date.now();$('lastSync').textContent='방금 갱신'}catch(e){$('live').textContent='● UI 오류 (재시도 중)';$('live').className='short'}}
 document.querySelectorAll('.tab').forEach(x=>x.onclick=()=>{document.querySelectorAll('.tab').forEach(y=>y.classList.remove('active'));x.classList.add('active');activeTF=x.dataset.tf;renderIndicators()});$('collect').onclick=async()=>{await fetch('/api/collect-now',{method:'POST',cache:'no-store'});refresh()};
 let lastSyncAt=Date.now();
 setInterval(()=>{let s=Math.max(0,Math.round((Date.now()-lastSyncAt)/1000));$('lastSync').textContent=s<=1?'방금 갱신':s+'초 전 갱신'},1000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()});
 refresh();
-setInterval(refresh,5000);
+setInterval(refresh,1000);
 </script></body></html>
 """
 
@@ -535,6 +657,8 @@ if __name__ == "__main__":
     except Exception as exc:
         log("DB_ERROR", f"initial schema failed: {type(exc).__name__}: {exc}")
     start_collector_once()
+    start_live_price_once()
+    start_binance_snapshot_once()
     port = int(os.getenv("PORT", "8080"))
     log("WEB", f"listening on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, threaded=True)

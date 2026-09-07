@@ -15,6 +15,18 @@ def _get_json(path: str, params: Dict[str, Any] | None = None) -> Any:
     return response.json()
 
 
+def fetch_last_price() -> Dict[str, Any]:
+    """Lightweight, single-field price fetch (no 24h stats, no klines).
+
+    Meant to be polled every few seconds independently of the heavier
+    collect_binance_snapshot() call, so the displayed current price can
+    stay continuously live instead of only updating on the e-rang.kr
+    collection cycle.
+    """
+    data = _get_json("/fapi/v1/ticker/price", {"symbol": SYMBOL})
+    return {"symbol": data.get("symbol", SYMBOL), "price": data.get("price")}
+
+
 def collect_binance_snapshot() -> Dict[str, Any]:
     snapshot: Dict[str, Any] = {"symbol": SYMBOL}
     errors: Dict[str, str] = {}
