@@ -2,21 +2,23 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import hmac
 import html
 import io
 import json
 import os
 import re
+import secrets
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 import psycopg
 import requests
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, redirect, request, session, url_for
 from psycopg.types.json import Jsonb
 
 from parser import parse_page
@@ -54,7 +56,109 @@ TELEGRAM_NOTIFY_OFF = os.getenv("TELEGRAM_NOTIFY_OFF", "true").lower() not in {"
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "").strip()
 KST = ZoneInfo("Asia/Seoul")
 
+# Simple single-user login so the dashboard/API/CSV export aren't publicly
+# viewable. Defaults match what was requested, but can (and for a real
+# deployment, should) be overridden via Railway env vars instead of leaving
+# credentials in source. FLASK_SECRET_KEY should also be set to a fixed
+# value in production - otherwise a fresh random key is generated on every
+# restart/redeploy, which invalidates existing login sessions and forces
+# everyone to log in again each time the app restarts.
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "1Q2w3e4r5t!!")
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "").strip()
+
 app = Flask(__name__)
+app.secret_key = FLASK_SECRET_KEY or secrets.token_hex(32)
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+if not FLASK_SECRET_KEY:
+    print("[BOOT] FLASK_SECRET_KEY not set - using a random key, so everyone will be logged out on the next restart/redeploy", flush=True)
+
+# Paths reachable without logging in. /healthz stays public for platform
+# health checks (e.g. a Railway healthcheckPath) that can't submit a login.
+PUBLIC_PATHS = {"/login", "/healthz"}
+
+
+@app.before_request
+def _require_login() -> Any:
+    if request.path in PUBLIC_PATHS:
+        return None
+    if session.get("authenticated"):
+        return None
+    if request.path.startswith("/api/") or request.path == "/export.csv":
+        return jsonify({"ok": False, "error": "login required"}), 401
+    return redirect(url_for("login_page", next=request.path))
+
+
+LOGIN_HTML = r"""
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coin Monitor · 로그인</title>
+<style>
+:root{--bg:#07101f;--panel:#0e1b31;--line:#243b5f;--text:#f4f7ff;--muted:#8fa7c9;--blue:#38a5ff;--red:#ff5364}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(circle at 20% 0,#102442 0,#07101f 45%);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+.card{background:linear-gradient(145deg,rgba(16,31,56,.98),rgba(10,24,44,.98));border:1px solid var(--line);border-radius:17px;padding:32px;box-shadow:0 14px 32px #0006;width:100%;max-width:360px}
+h1{margin:0 0 6px;font-size:22px}.sub{color:var(--muted);font-size:13px;margin-bottom:22px}
+label{display:block;font-size:13px;color:#a9bfdf;font-weight:700;margin-bottom:6px}
+input{width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:#0a172b;color:var(--text);font-size:15px;margin-bottom:16px}
+input:focus{outline:2px solid var(--blue)}
+button{width:100%;padding:12px;border-radius:10px;border:none;background:var(--blue);color:#04101f;font-weight:900;font-size:15px;cursor:pointer}
+button:hover{filter:brightness(1.08)}
+.error{color:var(--red);font-size:13px;margin:-10px 0 16px}
+</style></head><body>
+<div class="card">
+<h1>Coin Monitor</h1>
+<div class="sub">로그인 후 이용할 수 있습니다.</div>
+{ERROR_HTML}
+<form method="post" action="/login">
+<input type="hidden" name="next" value="{NEXT}">
+<label for="u">아이디</label>
+<input id="u" name="username" autocomplete="username" required autofocus>
+<label for="p">비밀번호</label>
+<input id="p" name="password" type="password" autocomplete="current-password" required>
+<button type="submit">로그인</button>
+</form>
+</div>
+</body></html>
+"""
+
+
+@app.get("/login")
+def login_page() -> str:
+    next_path = request.args.get("next", "/")
+    error_html = '<div class="error">아이디 또는 비밀번호가 올바르지 않습니다.</div>' if request.args.get("error") else ""
+    return LOGIN_HTML.replace("{ERROR_HTML}", error_html).replace("{NEXT}", html.escape(next_path, quote=True))
+
+
+@app.post("/login")
+def login_submit() -> Response:
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    next_path = request.form.get("next") or "/"
+    if not next_path.startswith("/"):
+        next_path = "/"
+    # Constant-time comparison to avoid leaking password length/prefix via timing.
+    valid = hmac.compare_digest(username, ADMIN_USERNAME) and hmac.compare_digest(password, ADMIN_PASSWORD)
+    if valid:
+        session.clear()
+        session["authenticated"] = True
+        session.permanent = True
+        return redirect(next_path)
+    return redirect(url_for("login_page", error="1", next=next_path))
+
+
+@app.get("/logout")
+def logout() -> Response:
+    session.clear()
+    return redirect(url_for("login_page"))
+
+# Shared column list for SELECTs against `observations`, used by db_summary(),
+# api_history(), api_signal_analysis(), api_signals() and export_csv() so the
+# column order (and therefore row_to_dict()'s indices) stays in one place.
+OBSERVATION_COLUMNS = """id, observed_at, http_status, success, current_price, current_price_raw,
+       long_signal, short_signal, long_color, short_color, entry_message,
+       long_matched_selector, long_matched_declaration, long_ancestor_classes,
+       long_label_classes, long_own_inline_background,
+       short_matched_selector, short_matched_declaration, short_ancestor_classes,
+       short_label_classes, short_own_inline_background,
+       error, parsed_json, binance_json"""
 
 
 @app.after_request
@@ -155,6 +259,19 @@ def init_db() -> None:
             "ALTER TABLE observations ADD COLUMN IF NOT EXISTS current_price_raw TEXT",
             "ALTER TABLE observations ADD COLUMN IF NOT EXISTS binance_json JSONB",
             "ALTER TABLE observations ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            # Precise, structured entry-basis evidence (v3.6) - split out of the
+            # combined visual_evidence text so it's directly queryable/exportable
+            # for building a separate dataset from collected observations.
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS long_matched_selector TEXT",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS long_matched_declaration TEXT",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS long_ancestor_classes TEXT",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS long_label_classes TEXT",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS long_own_inline_background TEXT",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS short_matched_selector TEXT",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS short_matched_declaration TEXT",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS short_ancestor_classes TEXT",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS short_label_classes TEXT",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS short_own_inline_background TEXT",
         ]
         for statement in migrations:
             cur.execute(statement)
@@ -194,11 +311,19 @@ def insert_observation(record: Dict[str, Any]) -> int:
                 observed_at, target_url, http_status, success,
                 current_price, current_price_raw,
                 long_signal, short_signal, long_color, short_color, entry_message,
+                long_matched_selector, long_matched_declaration, long_ancestor_classes,
+                long_label_classes, long_own_inline_background,
+                short_matched_selector, short_matched_declaration, short_ancestor_classes,
+                short_label_classes, short_own_inline_background,
                 parsed_json, binance_json, raw_text, raw_html, content_sha256, error
             ) VALUES (
                 %(observed_at)s, %(target_url)s, %(http_status)s, %(success)s,
                 %(current_price)s, %(current_price_raw)s,
                 %(long_signal)s, %(short_signal)s, %(long_color)s, %(short_color)s, %(entry_message)s,
+                %(long_matched_selector)s, %(long_matched_declaration)s, %(long_ancestor_classes)s,
+                %(long_label_classes)s, %(long_own_inline_background)s,
+                %(short_matched_selector)s, %(short_matched_declaration)s, %(short_ancestor_classes)s,
+                %(short_label_classes)s, %(short_own_inline_background)s,
                 %(parsed_json)s, %(binance_json)s, %(raw_text)s, %(raw_html)s, %(content_sha256)s, %(error)s
             ) RETURNING id
             """,
@@ -280,23 +405,27 @@ def _fmt_num(value: Any) -> str:
 
 
 def _sig_evidence_text(parsed: Dict[str, Any], side: str) -> str:
-    """Python port of the dashboard's sigReason(): the actual E-RANG
-    evidence (detected background color + matched CSS rule + label text).
-    Escaped for safe inclusion in a Telegram HTML-mode message (raw '<'/'&'
-    from CSS selector text like ':not(...)' or '&nbsp;' would otherwise be
-    parsed as broken HTML and silently drop or fail the whole message)."""
+    """The actual E-RANG evidence (detected background color + matched CSS
+    rule + ancestor toggle classes + label text), built from the parser's
+    structured evidence fields (v3.6) rather than re-parsing the combined
+    visual_evidence display string. Escaped for safe inclusion in a Telegram
+    HTML-mode message (raw '<'/'&' from CSS selector text like ':not(...)'
+    or '&nbsp;' would otherwise be parsed as broken HTML and silently drop
+    or fail the whole message)."""
     sig = ((parsed.get("signals") or {}).get(side)) or {}
     if not sig.get("active"):
         return ""
     color = sig.get("detected_color") or "-"
-    parts = [p for p in (sig.get("visual_evidence") or "").split(" | ") if p]
-    css_rule = next((p for p in parts if p.startswith("css ")), None)
-    text = f"라벨 '{sig['matched_text']}'" if sig.get("matched_text") else ""
     out = f"감지 배경색 {color}"
-    if css_rule:
-        out += f" · {css_rule}"
-    if text:
-        out += f" · {text}"
+    if sig.get("own_inline_background"):
+        out += f" · 인라인 style=\"{sig['own_inline_background']}\""
+    elif sig.get("matched_css_selector"):
+        out += f" · css {sig['matched_css_selector']} {{{sig.get('matched_css_declaration') or ''}}}"
+        ancestor_classes = sig.get("ancestor_classes") or []
+        if ancestor_classes:
+            out += f" · 조상 토글 클래스: {', '.join(ancestor_classes)}"
+    if sig.get("matched_text"):
+        out += f" · 라벨 '{sig['matched_text']}'"
     return html.escape(out)
 
 
@@ -446,13 +575,22 @@ def _build_signal_message(
     prev_color: Optional[str] = None,
     duration_text: Optional[str] = None,
 ) -> str:
-    rows = _row_map_from_parsed(parsed)
     label_kr = "롱(LONG)" if side == "long" else "숏(SHORT)"
     emoji = "🟦" if side == "long" else "🟥"
-    state_kr = "진입 신호 발생" if turned_on else "신호 해제"
     now_kst = datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+    if not turned_on:
+        # Release messages are intentionally minimal - just the announcement
+        # and when it happened. No entry tables, no evidence detail, no
+        # indicators: the dashboard already has all of that if it's needed.
+        lines = [f"{emoji} <b>E-RANG {label_kr} 신호해제</b>", now_kst + " (KST)"]
+        if DASHBOARD_URL:
+            lines.append(f'<a href="{html.escape(DASHBOARD_URL, quote=True)}">대시보드 열기</a>')
+        return "\n".join(lines)
+
+    rows = _row_map_from_parsed(parsed)
     lines = [
-        f"{emoji} <b>E-RANG {label_kr} {state_kr}</b>",
+        f"{emoji} <b>E-RANG {label_kr} 신호발생</b>",
         f"현재가: {_fmt_num(current_price_raw)}",
     ]
 
@@ -480,26 +618,11 @@ def _build_signal_message(
     lines.extend(entry_block("LONG", rows.get("long") or [], rows.get("tpLong") or [], rows.get("slLong") or []))
     lines.append("")
     lines.extend(entry_block("SHORT", rows.get("short") or [], rows.get("tpShort") or [], rows.get("slShort") or []))
-    # Actual E-RANG evidence - the real cause of the ON/OFF flip.
-    # ON: the label's currently-detected background color/CSS rule.
-    # OFF: there is no "current" color to detect (that's what being OFF
-    # means), so instead report the color it HAD right before this and how
-    # long it stayed on, which is what actually answers "why did it turn off".
-    if turned_on:
-        evidence = _sig_evidence_text(parsed, side)
-        if evidence:
-            lines.append("")
-            lines.append(f"📌 <b>E-RANG 실제 판정 근거 (진입)</b>\n{evidence}")
-    else:
+    # Actual E-RANG evidence - the real cause of the ON flip.
+    evidence = _sig_evidence_text(parsed, side)
+    if evidence:
         lines.append("")
-        off_evidence = []
-        if prev_color:
-            off_evidence.append(f"직전 감지 배경색 {html.escape(str(prev_color))} → 기본(비활성) 배경색으로 복귀")
-        else:
-            off_evidence.append("라벨이 기본(비활성) 배경색으로 복귀")
-        if duration_text:
-            off_evidence.append(f"활성 유지 시간: {duration_text}")
-        lines.append("📌 <b>E-RANG 실제 판정 근거 (해제)</b>\n" + "\n".join(off_evidence))
+        lines.append(f"📌 <b>E-RANG 실제 판정 근거</b>\n{evidence}")
     # Binance indicator context - correlation only, never claimed as cause.
     indicators = (binance_snapshot or {}).get("indicators") or {}
     tf_bullets = []
@@ -509,42 +632,9 @@ def _build_signal_message(
             safe_bullets = [html.escape(b) for b in bullets]
             tf_bullets.append(f"<b>{tf}</b>\n" + "\n".join(f"· {b}" for b in safe_bullets))
     if tf_bullets:
-        header = "진입 시점" if turned_on else "해제 시점"
         lines.append("")
-        lines.append(f"📊 <b>Binance 지표 참고 ({header}, 참고용·확정 원인 아님)</b>")
+        lines.append("📊 <b>Binance 지표 참고 (진입 시점, 참고용·확정 원인 아님)</b>")
         lines.extend(tf_bullets)
-    # Rule-based (non-LLM) read on whether the 1st-stage TP looks reasonable,
-    # shown for LONG and SHORT both, regardless of which side triggered this
-    # message - mirrors how the entry tables above always show both sides.
-    ind15 = indicators.get("15m") or {}
-    atr15 = _to_float_loose(ind15.get("atr14"))
-    rsi15 = _to_float_loose(ind15.get("rsi14"))
-    funding_rate = _to_float_loose((binance_snapshot or {}).get("premium_index", {}).get("lastFundingRate"))
-    long_entries, long_tps, long_sls = rows.get("long") or [], rows.get("tpLong") or [], rows.get("slLong") or []
-    short_entries, short_tps, short_sls = rows.get("short") or [], rows.get("tpShort") or [], rows.get("slShort") or []
-    long_opinion = _ai_tp_opinion(
-        "long",
-        long_entries[0] if long_entries else None,
-        long_tps[0] if long_tps else None,
-        long_sls[0] if long_sls else None,
-        atr15, rsi15, funding_rate,
-    )
-    short_opinion = _ai_tp_opinion(
-        "short",
-        short_entries[0] if short_entries else None,
-        short_tps[0] if short_tps else None,
-        short_sls[0] if short_sls else None,
-        atr15, rsi15, funding_rate,
-    )
-    if long_opinion or short_opinion:
-        lines.append("")
-        lines.append("🤖 <b>AI 의견 (1차 진입 TP 적정성 · 규칙 기반 자동분석, 투자 조언 아님)</b>")
-        if long_opinion:
-            lines.append("<b>LONG</b>")
-            lines.extend(f"· {html.escape(b)}" for b in long_opinion)
-        if short_opinion:
-            lines.append("<b>SHORT</b>")
-            lines.extend(f"· {html.escape(b)}" for b in short_opinion)
     lines.append(now_kst + " (KST)")
     if DASHBOARD_URL:
         lines.append(f'<a href="{html.escape(DASHBOARD_URL, quote=True)}">대시보드 열기</a>')
@@ -636,6 +726,16 @@ def collect_once() -> Dict[str, Any]:
         "long_color": None,
         "short_color": None,
         "entry_message": None,
+        "long_matched_selector": None,
+        "long_matched_declaration": None,
+        "long_ancestor_classes": None,
+        "long_label_classes": None,
+        "long_own_inline_background": None,
+        "short_matched_selector": None,
+        "short_matched_declaration": None,
+        "short_ancestor_classes": None,
+        "short_label_classes": None,
+        "short_own_inline_background": None,
         "parsed_json": {},
         "binance_json": {},
         "raw_text": None,
@@ -672,6 +772,11 @@ def collect_once() -> Dict[str, Any]:
             b_price = (binance_json.get("ticker_24h") or {}).get("lastPrice")
             log("BINANCE", f"using snapshot lastPrice={b_price or '-'} errors={len(binance_json.get('errors') or {})}")
         sha = hashlib.sha256(html.encode("utf-8", "replace")).hexdigest()
+
+        def _join_classes(values: Any) -> Optional[str]:
+            vals = [str(v) for v in (values or []) if v]
+            return ", ".join(vals) if vals else None
+
         record.update(
             {
                 "http_status": status_code,
@@ -683,6 +788,16 @@ def collect_once() -> Dict[str, Any]:
                 "long_color": long_sig.get("detected_color"),
                 "short_color": short_sig.get("detected_color"),
                 "entry_message": bool(parsed.get("entry_message")),
+                "long_matched_selector": long_sig.get("matched_css_selector"),
+                "long_matched_declaration": long_sig.get("matched_css_declaration"),
+                "long_ancestor_classes": _join_classes(long_sig.get("ancestor_classes")),
+                "long_label_classes": _join_classes(long_sig.get("label_own_classes")),
+                "long_own_inline_background": long_sig.get("own_inline_background"),
+                "short_matched_selector": short_sig.get("matched_css_selector"),
+                "short_matched_declaration": short_sig.get("matched_css_declaration"),
+                "short_ancestor_classes": _join_classes(short_sig.get("ancestor_classes")),
+                "short_label_classes": _join_classes(short_sig.get("label_own_classes")),
+                "short_own_inline_background": short_sig.get("own_inline_background"),
                 "parsed_json": parsed,
                 "binance_json": binance_json,
                 "raw_text": parsed.get("page_text"),
@@ -838,9 +953,8 @@ def db_summary() -> Dict[str, Any]:
             cur.execute("SELECT COUNT(*), COUNT(*) FILTER (WHERE success), COUNT(*) FILTER (WHERE NOT success) FROM observations")
             total, ok, fail = cur.fetchone()
             cur.execute(
-                """
-                SELECT id, observed_at, http_status, success, current_price, current_price_raw,
-                       long_signal, short_signal, long_color, short_color, entry_message, error, parsed_json, binance_json
+                f"""
+                SELECT {OBSERVATION_COLUMNS}
                 FROM observations ORDER BY id DESC LIMIT 1
                 """
             )
@@ -871,9 +985,26 @@ def row_to_dict(row: Any) -> Dict[str, Any]:
         "long_color": row[8],
         "short_color": row[9],
         "entry_message": row[10],
-        "error": row[11],
-        "parsed": row[12] or {},
-        "binance": row[13] or {},
+        # Precise, structured entry-basis evidence (v3.6) - what specifically
+        # caused the color to be detected, separate from the combined
+        # human-readable text inside parsed.signals.<side>.visual_evidence.
+        "long_evidence": {
+            "matched_selector": row[11],
+            "matched_declaration": row[12],
+            "ancestor_classes": row[13],
+            "label_classes": row[14],
+            "own_inline_background": row[15],
+        },
+        "short_evidence": {
+            "matched_selector": row[16],
+            "matched_declaration": row[17],
+            "ancestor_classes": row[18],
+            "label_classes": row[19],
+            "own_inline_background": row[20],
+        },
+        "error": row[21],
+        "parsed": row[22] or {},
+        "binance": row[23] or {},
     }
 
 
@@ -924,9 +1055,8 @@ def api_history() -> Response:
     limit = max(1, min(500, int(request.args.get("limit", "80"))))
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT id, observed_at, http_status, success, current_price, current_price_raw,
-                   long_signal, short_signal, long_color, short_color, entry_message, error, parsed_json, binance_json
+            f"""
+            SELECT {OBSERVATION_COLUMNS}
             FROM observations ORDER BY id DESC LIMIT %s
             """,
             (limit,),
@@ -940,9 +1070,8 @@ def api_signal_analysis() -> Response:
     limit = max(1, min(500, int(request.args.get("limit", "200"))))
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT id, observed_at, http_status, success, current_price, current_price_raw,
-                   long_signal, short_signal, long_color, short_color, entry_message, error, parsed_json, binance_json
+            f"""
+            SELECT {OBSERVATION_COLUMNS}
             FROM observations
             WHERE (COALESCE(long_signal, false) OR COALESCE(short_signal, false))
             ORDER BY id DESC LIMIT %s
@@ -962,9 +1091,8 @@ def api_signals() -> Response:
     limit = max(1, min(500, int(request.args.get("limit", "200"))))
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT id, observed_at, http_status, success, current_price, current_price_raw,
-                   long_signal, short_signal, long_color, short_color, entry_message, error, parsed_json, binance_json
+            f"""
+            SELECT {OBSERVATION_COLUMNS}
             FROM observations
             WHERE COALESCE(long_signal, false) OR COALESCE(short_signal, false)
             ORDER BY id DESC LIMIT %s
@@ -1035,6 +1163,14 @@ def export_csv() -> Response:
     writer.writerow([
         "id", "observed_at", "http_status", "success", "current_price", "current_price_raw",
         "long_signal", "short_signal", "long_color", "short_color", "entry_message",
+        # Precise, structured entry-basis evidence (v3.6) - exactly what
+        # caused each side's color to be detected, as flat CSV columns so
+        # this is directly usable for building a separate dataset without
+        # having to parse it back out of the JSON blob columns below.
+        "long_matched_selector", "long_matched_declaration", "long_ancestor_classes",
+        "long_label_classes", "long_own_inline_background",
+        "short_matched_selector", "short_matched_declaration", "short_ancestor_classes",
+        "short_label_classes", "short_own_inline_background",
         "content_sha256", "error", "parsed_json", "binance_json",
     ])
     with get_conn() as conn, conn.cursor() as cur:
@@ -1042,6 +1178,10 @@ def export_csv() -> Response:
             """
             SELECT id, observed_at, http_status, success, current_price, current_price_raw,
                    long_signal, short_signal, long_color, short_color, entry_message,
+                   long_matched_selector, long_matched_declaration, long_ancestor_classes,
+                   long_label_classes, long_own_inline_background,
+                   short_matched_selector, short_matched_declaration, short_ancestor_classes,
+                   short_label_classes, short_own_inline_background,
                    content_sha256, error, parsed_json, binance_json
             FROM observations ORDER BY id ASC
             """
@@ -1049,9 +1189,12 @@ def export_csv() -> Response:
         for row in cur:
             writer.writerow([
                 row[0], row[1].isoformat() if row[1] else None, row[2], row[3], row[4], row[5],
-                row[6], row[7], row[8], row[9], row[10], row[11], row[12],
-                json.dumps(row[13] or {}, ensure_ascii=False),
-                json.dumps(row[14] or {}, ensure_ascii=False),
+                row[6], row[7], row[8], row[9], row[10],
+                row[11], row[12], row[13], row[14], row[15],
+                row[16], row[17], row[18], row[19], row[20],
+                row[21], row[22],
+                json.dumps(row[23] or {}, ensure_ascii=False),
+                json.dumps(row[24] or {}, ensure_ascii=False),
             ])
     return Response(
         out.getvalue(),
@@ -1068,16 +1211,16 @@ def dashboard() -> str:
 DASHBOARD_HTML = r"""
 <!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coin Monitor</title>
 <style>
-:root{--bg:#07101f;--panel:#0e1b31;--panel2:#101f38;--line:#243b5f;--text:#f4f7ff;--muted:#8fa7c9;--blue:#38a5ff;--red:#ff5364;--green:#35e29a;--yellow:#ffc83d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,#102442 0,#07101f 45%);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1540px;margin:auto;padding:24px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.top h1{margin:0;font-size:30px}.sub,.muted{color:var(--muted)}.sub{margin-top:5px}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.btn{border:1px solid var(--line);background:#152540;color:#fff;padding:11px 15px;border-radius:11px;text-decoration:none;font-weight:800;cursor:pointer}.live{color:var(--green);font-weight:900}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{background:linear-gradient(145deg,rgba(16,31,56,.98),rgba(10,24,44,.98));border:1px solid var(--line);border-radius:17px;padding:18px;box-shadow:0 14px 32px #0004;min-width:0}.s2{grid-column:span 2}.s3{grid-column:span 3}.s4{grid-column:span 4}.s6{grid-column:span 6}.s8{grid-column:span 8}.s12{grid-column:span 12}.label{font-size:13px;color:#a9bfdf;font-weight:800}.big{font-size:29px;font-weight:950;margin-top:7px}.hero{display:flex;align-items:center;gap:22px;min-height:110px}.heroSignal{font-size:42px;font-weight:1000}.short{color:var(--red)}.long{color:var(--blue)}.wait{color:var(--yellow)}.ok{color:var(--green)}h2{font-size:18px;margin:0 0 14px}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:680px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}th{background:#132947;color:#c7dcfa;font-size:12px}.rowlong.on td:first-child{font-weight:950;color:var(--blue)}.rowshort.on td:first-child{background:#ef3340;color:#fff;font-weight:950}.entryrow{display:grid;grid-template-columns:82px repeat(5,1fr);gap:8px;align-items:stretch;margin-bottom:10px}.sideLabel{display:flex;align-items:center;font-size:20px;font-weight:950}.entry{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:10px;min-width:0}.entry b{font-size:12px;color:#9fb8db;display:block}.entry strong{font-size:17px;display:block;margin-top:5px;white-space:nowrap}.dist{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.dist .entry strong{font-size:20px}.tabs{display:flex;gap:7px;margin:12px 0}.tab{flex:1;border:1px solid var(--line);background:#102746;color:#c8daf4;padding:9px;border-radius:9px;font-weight:850;cursor:pointer}.tab.active{background:#168cff;color:white}.metricTop{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:12px}.metric b{display:block;color:#9fb8db;font-size:12px}.metric strong{display:block;font-size:19px;margin-top:6px}.indtable{min-width:0}.indtable td:nth-child(2){font-weight:800}.statusUp{color:var(--green)}.statusDown{color:var(--red)}.statusNeutral{color:#dbe7f8}.evidence{line-height:1.7}.evidence strong{font-size:18px}.foot{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:13px;gap:12px}.nowrap{white-space:nowrap}.clickrow{cursor:pointer}.clickrow:hover{background:#132947}.analysisGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.analysisBox{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:14px}.analysisBox h3{margin:0 0 10px;font-size:17px}.chips{display:flex;gap:7px;flex-wrap:wrap}.chip{background:#102746;border:1px solid var(--line);border-radius:999px;padding:6px 9px;font-size:12px}.detailHead{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}.hint{font-size:12px;color:var(--muted)}.reasonCell{text-align:left;white-space:normal;min-width:220px;max-width:320px}.reasonMini{font-size:11px;line-height:1.45;margin-bottom:5px;padding:5px 7px;border-radius:7px;background:#0a172b;border:1px solid var(--line)}.reasonMini:last-child{margin-bottom:0}.reasonMini.long{color:#bcdcff;border-color:#2563eb55}.reasonMini.short{color:#ffd0d6;border-color:#ef334055}.reasonMini b{font-weight:900}.reasonList{margin:9px 0 0;padding-left:18px;font-size:12px;color:#c7dcfa;line-height:1.6}.reasonList li{margin-bottom:3px}.reasonSummary{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:6px}.reasonSummary b{display:block;margin-bottom:6px;font-size:13px;color:#dbe7f8}
+:root{--bg:#07101f;--panel:#0e1b31;--panel2:#101f38;--line:#243b5f;--text:#f4f7ff;--muted:#8fa7c9;--blue:#38a5ff;--red:#ff5364;--green:#35e29a;--yellow:#ffc83d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,#102442 0,#07101f 45%);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1540px;margin:auto;padding:24px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.top h1{margin:0;font-size:30px}.sub,.muted{color:var(--muted)}.sub{margin-top:5px}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.btn{border:1px solid var(--line);background:#152540;color:#fff;padding:11px 15px;border-radius:11px;text-decoration:none;font-weight:800;cursor:pointer}.live{color:var(--green);font-weight:900}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{background:linear-gradient(145deg,rgba(16,31,56,.98),rgba(10,24,44,.98));border:1px solid var(--line);border-radius:17px;padding:18px;box-shadow:0 14px 32px #0004;min-width:0}.s2{grid-column:span 2}.s3{grid-column:span 3}.s4{grid-column:span 4}.s6{grid-column:span 6}.s8{grid-column:span 8}.s12{grid-column:span 12}.label{font-size:13px;color:#a9bfdf;font-weight:800}.big{font-size:29px;font-weight:950;margin-top:7px}.hero{display:flex;align-items:center;gap:22px;min-height:110px}.heroSignal{font-size:42px;font-weight:1000}.short{color:var(--red)}.long{color:var(--blue)}.wait{color:var(--yellow)}.ok{color:var(--green)}h2{font-size:18px;margin:0 0 14px}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:680px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}th{background:#132947;color:#c7dcfa;font-size:12px}.rowlong.on td:first-child{font-weight:950;color:var(--blue)}.rowshort.on td:first-child{background:#ef3340;color:#fff;font-weight:950}.entryrow{display:grid;grid-template-columns:82px repeat(5,1fr);gap:8px;align-items:stretch;margin-bottom:10px}.sideLabel{display:flex;align-items:center;font-size:20px;font-weight:950}.entry{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:10px;min-width:0}.entry b{font-size:12px;color:#9fb8db;display:block}.entry strong{font-size:17px;display:block;margin-top:5px;white-space:nowrap}.dist{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.dist .entry strong{font-size:20px}.tabs{display:flex;gap:7px;margin:12px 0}.tab{flex:1;border:1px solid var(--line);background:#102746;color:#c8daf4;padding:9px;border-radius:9px;font-weight:850;cursor:pointer}.tab.active{background:#168cff;color:white}.metricTop{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:12px}.metric b{display:block;color:#9fb8db;font-size:12px}.metric strong{display:block;font-size:19px;margin-top:6px}.indtable{min-width:0}.indtable td:nth-child(2){font-weight:800}.statusUp{color:var(--green)}.statusDown{color:var(--red)}.statusNeutral{color:#dbe7f8}.evidence{line-height:1.7}.evidence strong{font-size:18px}.foot{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:13px;gap:12px}.nowrap{white-space:nowrap}.clickrow{cursor:pointer}.clickrow:hover{background:#132947}.analysisGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.analysisBox{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:14px}.analysisBox h3{margin:0 0 10px;font-size:17px}.chips{display:flex;gap:7px;flex-wrap:wrap}.chip{background:#102746;border:1px solid var(--line);border-radius:999px;padding:6px 9px;font-size:12px}.detailHead{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}.hint{font-size:12px;color:var(--muted)}.reasonCell{text-align:left;white-space:normal;min-width:220px;max-width:320px}.profitCell{text-align:left;white-space:normal;min-width:170px}.profitCell div{margin-bottom:4px;font-weight:800}.profitCell div:last-child{margin-bottom:0}.profitCell .muted{font-weight:600;font-size:11px}.reasonMini{font-size:11px;line-height:1.45;margin-bottom:5px;padding:5px 7px;border-radius:7px;background:#0a172b;border:1px solid var(--line)}.reasonMini:last-child{margin-bottom:0}.reasonMini.long{color:#bcdcff;border-color:#2563eb55}.reasonMini.short{color:#ffd0d6;border-color:#ef334055}.reasonMini b{font-weight:900}.reasonList{margin:9px 0 0;padding-left:18px;font-size:12px;color:#c7dcfa;line-height:1.6}.reasonList li{margin-bottom:3px}.reasonSummary{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:6px}.reasonSummary b{display:block;margin-bottom:6px;font-size:13px;color:#dbe7f8}
 @media(max-width:1050px){.s2,.s3,.s4,.s6,.s8{grid-column:span 12}.metricTop{grid-template-columns:1fr 1fr}.two{grid-template-columns:1fr}.entryrow{grid-template-columns:70px repeat(5,130px);overflow-x:auto}.dist{grid-template-columns:repeat(5,140px);overflow-x:auto}}@media(max-width:600px){.wrap{padding:12px}.top{flex-direction:column}.metricTop{grid-template-columns:1fr 1fr}.heroSignal{font-size:34px}}
 </style></head><body><div class="wrap">
-<div class="top"><div><h1>Coin Monitor</h1><div class="sub">e-rang coin.php 1분 수집 + LONG/SHORT 색상 신호 + Binance 보조 데이터</div></div><div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collect" class="btn">강제 수집</button><button id="telegramTest" class="btn">텔레그램 현재상태 발송</button><span id="live" class="live">● 정상 수집 중</span><span id="lastSync" class="muted"></span><span id="lastTop" class="muted"></span></div></div>
+<div class="top"><div><h1>Coin Monitor</h1><div class="sub">e-rang coin.php 1분 수집 + LONG/SHORT 색상 신호 + Binance 보조 데이터</div></div><div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collect" class="btn">강제 수집</button><button id="telegramTest" class="btn">텔레그램 현재상태 발송</button><a class="btn" href="/logout">로그아웃</a><span id="live" class="live">● 정상 수집 중</span><span id="lastSync" class="muted"></span><span id="lastTop" class="muted"></span></div></div>
 <div class="grid">
 <div class="card s6 hero"><div><div class="label">현재 E-RANG 판정</div><div id="heroSignal" class="heroSignal wait">WAIT</div></div><div><div id="signalBits" class="big" style="font-size:15px">LONG OFF / SHORT OFF</div><div class="muted">E-RANG 화면의 색상 신호를 기준으로 판정합니다.</div></div></div>
 <div class="card s2"><div class="label">BTCUSDT 현재가</div><div id="price" class="big">-</div><div id="priceDelta" class="muted">Binance 실시간</div></div>
 <div class="card s2"><div class="label">수집 상태</div><div id="collectState" class="big ok">정상</div><div id="counts" class="muted">-</div></div>
 <div class="card s2"><div class="label">DB / 서버</div><div id="db" class="big ok" style="font-size:21px">-</div><div id="server" class="muted">-</div></div>
-<div class="card s12"><h2>실시간 BTC 선물 차트 <span class="muted">(Binance BTCUSDT Perpetual · TradingView 위젯)</span></h2><div class="tradingview-widget-container" style="height:520px;width:100%"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div><script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
+<div class="card s12"><h2>실시간 BTC 선물 차트 <span class="muted">(Binance BTCUSDT Perpetual · TradingView 위젯)</span></h2><div class="tradingview-widget-container" style="height:760px;width:100%"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div><script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
 {
 "autosize": true,
 "symbol": "BINANCE:BTCUSDT.P",
@@ -1101,7 +1244,7 @@ DASHBOARD_HTML = r"""
 <div class="card s6"><h2>신호 판정 근거</h2><div id="evidence" class="evidence muted">-</div></div>
 <div class="card s12"><div class="detailHead"><h2>LONG / SHORT ON 공통 보조지표 패턴</h2><span class="hint">※ E-RANG ON 당시 Binance 지표의 상관 패턴이며 ON의 원인으로 확정한 값은 아닙니다.</span></div><div id="analysisSummary" class="analysisGrid"></div></div>
 <div class="card s12"><div class="detailHead"><h2>선택한 수집 시점 보조지표</h2><span class="hint">아래 최근 수집 데이터 행을 클릭하면 당시 1m·5m·15m·1h 상태를 확인합니다.</span></div><div id="eventDetail" class="muted">수집 데이터 행을 선택하세요.</div></div>
-<div class="card s12"><h2>최근 수집 데이터 <span class="muted" style="font-size:12px">(행 클릭 → 당시 보조지표)</span></h2><div class="tablewrap" style="max-height:360px;overflow:auto"><table><thead><tr><th>ID</th><th>시간</th><th>BTC</th><th>LONG</th><th>SHORT</th><th>판정 근거</th><th>15m RSI</th><th>15m MACD Hist</th><th>15m EMA20 관계</th><th>HTTP</th></tr></thead><tbody id="history"></tbody></table></div></div>
+<div class="card s12"><h2>최근 수집 데이터 <span class="muted" style="font-size:12px">(행 클릭 → 당시 보조지표)</span></h2><div class="tablewrap" style="max-height:360px;overflow:auto"><table><thead><tr><th>ID</th><th>시간</th><th>BTC</th><th>LONG</th><th>SHORT</th><th>예상 수익<br><span class="hint">($5,000·5x·1차 TP)</span></th><th>판정 근거</th><th>15m RSI</th><th>15m MACD Hist</th><th>15m EMA20 관계</th><th>HTTP</th></tr></thead><tbody id="history"></tbody></table></div></div>
 </div></div><script>
 const $=id=>document.getElementById(id); let latest={},activeTF='15m',liveBinance={};
 const n=v=>{let x=Number(v);return Number.isFinite(x)?x.toLocaleString('en-US',{maximumFractionDigits:4}):'-'}; const kst=v=>v?new Date(v).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',hour12:false}):'-';
@@ -1110,12 +1253,20 @@ function sigReason(r,side){
   let s=(r.parsed&&r.parsed.signals&&r.parsed.signals[side])||{};
   if(!s.active)return '';
   let color=s.detected_color||(side==='long'?r.long_color:r.short_color)||'-';
-  let parts=(s.visual_evidence||'').split(' | ').filter(Boolean);
-  let cssRule=parts.find(p=>p.startsWith('css '));
-  let text=s.matched_text?`라벨 '${s.matched_text}'`:'';
+  let ev=(side==='long'?r.long_evidence:r.short_evidence)||{};
   let out=`감지 배경색 ${color}`;
-  if(cssRule)out+=` · ${cssRule}`;
-  if(text)out+=` · ${text}`;
+  if(ev.own_inline_background){
+    out+=` · 인라인 style="${ev.own_inline_background}"`;
+  } else if(ev.matched_selector){
+    out+=` · css ${ev.matched_selector} {${ev.matched_declaration||''}}`;
+    if(ev.ancestor_classes)out+=` · 조상 토글 클래스: ${ev.ancestor_classes}`;
+  } else {
+    // Fallback for observations collected before v3.6 structured evidence existed.
+    let parts=(s.visual_evidence||'').split(' | ').filter(Boolean);
+    let cssRule=parts.find(p=>p.startsWith('css '));
+    if(cssRule)out+=` · ${cssRule}`;
+  }
+  if(s.matched_text)out+=` · 라벨 '${s.matched_text}'`;
   return out;
 }
 function historyReasonCell(r){
@@ -1125,6 +1276,25 @@ function historyReasonCell(r){
   return blocks.length?blocks.join(''):'<span class="muted">-</span>';
 }
 function rowMap(parsed){let rows=parsed.table_rows||[], out={}; for(const r of rows){let t=(r.text||'').trim(), nums=r.numbers_raw||[]; if(/^Long\b/i.test(t))out.long=nums.slice(0,5); else if(/^Short\b/i.test(t))out.short=nums.slice(0,5); else if(/^TP\b/i.test(t)){if(!out.tpLong)out.tpLong=nums.slice(0,5);else out.tpShort=nums.slice(0,5)} else if(/^SL\b/i.test(t)){if(!out.slLong)out.slLong=nums.slice(0,5);else out.slShort=nums.slice(0,5)}} let sides=parsed.sides||{}; out.long=out.long||(sides.long?.entry_prices_guess||[]);out.short=out.short||(sides.short?.entry_prices_guess||[]);return out}
+const PROFIT_MARGIN=5000, PROFIT_LEVERAGE=5;
+function calcExpectedProfit(entry,tp){
+  let e=Number(entry), t=Number(tp);
+  if(!Number.isFinite(e)||!Number.isFinite(t)||e<=0)return null;
+  let notional=PROFIT_MARGIN*PROFIT_LEVERAGE, qty=notional/e, profit=qty*Math.abs(t-e);
+  return {profit, pct:profit/PROFIT_MARGIN*100};
+}
+function expectedProfitCell(r){
+  let rm=rowMap(r.parsed||{}), parts=[];
+  if(r.long_signal){
+    let c=calcExpectedProfit(rm.long?.[0], rm.tpLong?.[0]);
+    if(c)parts.push(`<div class="long">LONG +$${c.profit.toLocaleString('en-US',{maximumFractionDigits:0})} <span class="muted">(마진 대비 +${c.pct.toFixed(1)}%)</span></div>`);
+  }
+  if(r.short_signal){
+    let c=calcExpectedProfit(rm.short?.[0], rm.tpShort?.[0]);
+    if(c)parts.push(`<div class="short">SHORT +$${c.profit.toLocaleString('en-US',{maximumFractionDigits:0})} <span class="muted">(마진 대비 +${c.pct.toFixed(1)}%)</span></div>`);
+  }
+  return parts.length?parts.join(''):'<span class="muted">-</span>';
+}
 function cells(a){return [0,1,2,3,4].map(i=>`<td>${n(a?.[i])}</td>`).join('')}
 function renderErang(parsed,priceOverride){let r=rowMap(parsed); let longOn=!!latest.long_signal, shortOn=!!latest.short_signal; $('erangRows').innerHTML=`<tr class="rowlong${longOn?' on':''}"><td>Long</td>${cells(r.long)}</tr><tr><td>TP (Long)</td>${cells(r.tpLong)}</tr><tr><td>SL (Long)</td>${cells(r.slLong)}</tr><tr class="rowshort${shortOn?' on':''}"><td>Short</td>${cells(r.short)}</tr><tr><td>TP (Short)</td>${cells(r.tpShort)}</tr><tr><td>SL (Short)</td>${cells(r.slShort)}</tr>`; let p=Number.isFinite(priceOverride)&&priceOverride>0?priceOverride:Number(latest.current_price||latest.current_price_raw); let renderDist=(elId,arr)=>{$(elId).innerHTML=[0,1,2,3,4].map(i=>{let x=Number(arr?.[i]),d=x-p,pct=p?d/p*100:0;return `<div class="entry"><b>진입 ${i+1}</b><strong>${Number.isFinite(d)?(d>=0?'+':'')+n(d):'-'}</strong><span class="${d>=0?'short':'long'}">${Number.isFinite(pct)?(pct>=0?'+':'')+pct.toFixed(2)+'%':'-'}</span></div>`}).join('')}; renderDist('distanceLong',r.long); renderDist('distanceShort',r.short)}
 function statusFor(name,val,ind){if(val==null)return '-';if(name==='RSI 14')return val>=70?'과매수':val<=30?'과매도':'중립';if(name.startsWith('EMA')){let c=Number(ind.close);return c>val?'▲ 현재가 상회':'▼ 현재가 하회'}if(name==='MACD Histogram')return val>0?'▲ 양수 (상승 모멘텀)':val<0?'▼ 음수 (하락 모멘텀)':'중립';if(name==='MACD Line')return val>Number(ind.macd?.signal)?'▲ Signal 상회':'▼ Signal 하회';return '-'}
@@ -1155,7 +1325,7 @@ function narrativeFor(ind){
 }
 function renderEventDetail(r){if(!r)return;let sig=r.short_signal&&!r.long_signal?'SHORT':r.long_signal&&!r.short_signal?'LONG':r.short_signal&&r.long_signal?'BOTH':'WAIT';let cards=['1m','5m','15m','1h'].map(tf=>{let i=eventTF(r,tf),m=i.macd||{},b=i.bollinger20||{},reasons=narrativeFor(i);return `<div class="analysisBox"><h3>${tf} <span class="${sig==='SHORT'?'short':sig==='LONG'?'long':'wait'}">${sig}</span></h3><div class="chips"><span class="chip">RSI ${n(i.rsi14)}</span><span class="chip">EMA20 ${n(i.ema20)}</span><span class="chip">EMA50 ${n(i.ema50)}</span><span class="chip">EMA200 ${n(i.ema200)}</span><span class="chip">MACD Hist ${n(m.histogram)}</span><span class="chip">ATR ${n(i.atr14)}</span><span class="chip">BB 상 ${n(b.upper)}</span><span class="chip">BB 중 ${n(b.middle)}</span><span class="chip">BB 하 ${n(b.lower)}</span></div>${reasons.length?`<ul class="reasonList">${reasons.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:''}</div>`}).join('');let erangReasons=[r.long_signal?sigReason(r,'long'):'',r.short_signal?sigReason(r,'short'):''].filter(Boolean);let erangBlock=(r.long_signal||r.short_signal)?`<div class="reasonSummary"><b>E-RANG 실제 판정 근거</b>${r.long_signal?`<div class="reasonMini long"><b>LONG</b> ${esc(sigReason(r,'long'))}</div>`:''}${r.short_signal?`<div class="reasonMini short"><b>SHORT</b> ${esc(sigReason(r,'short'))}</div>`:''}</div>`:'';$('eventDetail').innerHTML=`<div style="margin-bottom:12px"><strong>ID ${r.id} · ${kst(r.observed_at)} · BTC ${n(r.current_price||r.current_price_raw)}</strong> · Funding ${r.binance?.premium_index?.lastFundingRate??'-'} · OI ${n(r.binance?.open_interest?.openInterest)}</div>${erangBlock}<div class="hint" style="margin:10px 0">※ 아래는 이 시점의 Binance 보조지표 상태를 정리한 참고용 관측입니다. E-RANG의 실제 ON 판정은 위 라벨 배경색 기준이며, 아래 지표 조합이 ON의 확정 원인이라는 뜻은 아닙니다.</div><div class="analysisGrid">${cards}</div>`}
 function renderAnalysis(a){let sm=a?.summary||{};$('analysisSummary').innerHTML=['LONG','SHORT'].map(side=>{let g=sm[side]||{},t=g.timeframes?.['15m']||{};return `<div class="analysisBox"><h3 class="${side==='LONG'?'long':'short'}">${side} ON · ${g.count||0}건</h3><div class="chips"><span class="chip">15m 평균 RSI ${n(t.avg_rsi14)}</span><span class="chip">15m 평균 MACD Hist ${n(t.avg_macd_histogram)}</span><span class="chip">MACD Hist 양수 ${t.macd_hist_positive_pct??'-'}%</span><span class="chip">현재가 &gt; EMA20 ${t.price_above_ema20_pct??'-'}%</span><span class="chip">평균 ATR ${n(t.avg_atr14)}</span><span class="chip">평균 Funding ${n(g.avg_funding_rate)}</span></div><div class="hint" style="margin-top:10px">1m/5m/15m/1h 상세는 ON 발생 행을 클릭해서 확인</div></div>`}).join('')}
-async function refresh(){try{let [sr,hr,ar]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/history?limit=80',{cache:'no-store'}),fetch('/api/signal-analysis?limit=200',{cache:'no-store'})]),s=await sr.json(),h=await hr.json(),a=await ar.json(),db=s.db||{};renderAnalysis(a);latest=db.latest||{};let sig=latest.short_signal&&!latest.long_signal?'SHORT':latest.long_signal&&!latest.short_signal?'LONG':latest.short_signal&&latest.long_signal?'BOTH':'WAIT';$('heroSignal').textContent=sig;$('heroSignal').className='heroSignal '+(sig==='SHORT'?'short':sig==='LONG'?'long':'wait');$('signalBits').textContent=`LONG ${latest.long_signal?'ON':'OFF'} / SHORT ${latest.short_signal?'ON':'OFF'}`;let lp=s.live_price||{},livePriceNum=Number(lp.price);$('price').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?n(livePriceNum):n(latest.current_price||latest.current_price_raw);$('priceDelta').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?('Binance 실시간 · '+kst(lp.updated_at)):'E-RANG (Binance 실시간가 대기중)';$('collectState').textContent=latest.success?'정상':'오류';$('counts').textContent=`성공 ${n(db.successful||0)} / 실패 ${n(db.failed||0)}`;$('db').textContent=db.database_ok?'Postgres OK':'Postgres 오류';$('server').textContent=`collector ${(s.collector||{}).running?'running':'idle'}`;$('lastTop').textContent='마지막 수집: '+kst(latest.observed_at);renderErang(latest.parsed||{},livePriceNum);let lb=s.live_binance?.snapshot||{};liveBinance=Object.keys(lb).length?lb:(latest.binance||{});let b=liveBinance;$('bLast').textContent=n(b.ticker_24h?.lastPrice);$('funding').textContent=b.premium_index?.lastFundingRate??'-';$('oi').textContent=n(b.open_interest?.openInterest);$('vol24').textContent=n(b.ticker_24h?.volume);$('bUpdate').textContent='업데이트: '+kst(s.live_binance?.updated_at||latest.observed_at);renderIndicators();renderEvidence();$('history').innerHTML=(h.items||[]).map((r,idx)=>{let i=eventTF(r,'15m'),mh=i.macd?.histogram,rel=Number(i.close)>Number(i.ema20)?'상회':Number(i.close)<Number(i.ema20)?'하회':'-';return `<tr class="clickrow" data-idx="${idx}"><td>${r.id}</td><td>${kst(r.observed_at)}</td><td>${n(r.current_price||r.current_price_raw)}</td><td class="${r.long_signal?'long':''}">${r.long_signal?'ON':'OFF'}</td><td class="${r.short_signal?'short':''}">${r.short_signal?'ON':'OFF'}</td><td class="reasonCell">${historyReasonCell(r)}</td><td>${n(i.rsi14)}</td><td class="${Number(mh)>=0?'statusUp':'statusDown'}">${n(mh)}</td><td>${rel}</td><td>${r.http_status||'-'}</td></tr>`}).join('');document.querySelectorAll('.clickrow').forEach(tr=>tr.onclick=()=>renderEventDetail((h.items||[])[Number(tr.dataset.idx)]));let firstOn=(h.items||[]).find(r=>r.long_signal||r.short_signal);if(firstOn)renderEventDetail(firstOn);$('live').textContent='● 실시간 동기화 중';$('live').className='live';lastSyncAt=Date.now();$('lastSync').textContent='방금 갱신'}catch(e){$('live').textContent='● UI 오류 (재시도 중)';$('live').className='short'}}
+async function refresh(){try{let [sr,hr,ar]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/history?limit=80',{cache:'no-store'}),fetch('/api/signal-analysis?limit=200',{cache:'no-store'})]),s=await sr.json(),h=await hr.json(),a=await ar.json(),db=s.db||{};renderAnalysis(a);latest=db.latest||{};let sig=latest.short_signal&&!latest.long_signal?'SHORT':latest.long_signal&&!latest.short_signal?'LONG':latest.short_signal&&latest.long_signal?'BOTH':'WAIT';$('heroSignal').textContent=sig;$('heroSignal').className='heroSignal '+(sig==='SHORT'?'short':sig==='LONG'?'long':'wait');$('signalBits').textContent=`LONG ${latest.long_signal?'ON':'OFF'} / SHORT ${latest.short_signal?'ON':'OFF'}`;let lp=s.live_price||{},livePriceNum=Number(lp.price);$('price').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?n(livePriceNum):n(latest.current_price||latest.current_price_raw);$('priceDelta').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?('Binance 실시간 · '+kst(lp.updated_at)):'E-RANG (Binance 실시간가 대기중)';$('collectState').textContent=latest.success?'정상':'오류';$('counts').textContent=`성공 ${n(db.successful||0)} / 실패 ${n(db.failed||0)}`;$('db').textContent=db.database_ok?'Postgres OK':'Postgres 오류';$('server').textContent=`collector ${(s.collector||{}).running?'running':'idle'}`;$('lastTop').textContent='마지막 수집: '+kst(latest.observed_at);renderErang(latest.parsed||{},livePriceNum);let lb=s.live_binance?.snapshot||{};liveBinance=Object.keys(lb).length?lb:(latest.binance||{});let b=liveBinance;$('bLast').textContent=n(b.ticker_24h?.lastPrice);$('funding').textContent=b.premium_index?.lastFundingRate??'-';$('oi').textContent=n(b.open_interest?.openInterest);$('vol24').textContent=n(b.ticker_24h?.volume);$('bUpdate').textContent='업데이트: '+kst(s.live_binance?.updated_at||latest.observed_at);renderIndicators();renderEvidence();$('history').innerHTML=(h.items||[]).map((r,idx)=>{let i=eventTF(r,'15m'),mh=i.macd?.histogram,rel=Number(i.close)>Number(i.ema20)?'상회':Number(i.close)<Number(i.ema20)?'하회':'-';return `<tr class="clickrow" data-idx="${idx}"><td>${r.id}</td><td>${kst(r.observed_at)}</td><td>${n(r.current_price||r.current_price_raw)}</td><td class="${r.long_signal?'long':''}">${r.long_signal?'ON':'OFF'}</td><td class="${r.short_signal?'short':''}">${r.short_signal?'ON':'OFF'}</td><td class="profitCell">${expectedProfitCell(r)}</td><td class="reasonCell">${historyReasonCell(r)}</td><td>${n(i.rsi14)}</td><td class="${Number(mh)>=0?'statusUp':'statusDown'}">${n(mh)}</td><td>${rel}</td><td>${r.http_status||'-'}</td></tr>`}).join('');document.querySelectorAll('.clickrow').forEach(tr=>tr.onclick=()=>renderEventDetail((h.items||[])[Number(tr.dataset.idx)]));let firstOn=(h.items||[]).find(r=>r.long_signal||r.short_signal);if(firstOn)renderEventDetail(firstOn);$('live').textContent='● 실시간 동기화 중';$('live').className='live';lastSyncAt=Date.now();$('lastSync').textContent='방금 갱신'}catch(e){$('live').textContent='● UI 오류 (재시도 중)';$('live').className='short'}}
 document.querySelectorAll('.tab').forEach(x=>x.onclick=()=>{document.querySelectorAll('.tab').forEach(y=>y.classList.remove('active'));x.classList.add('active');activeTF=x.dataset.tf;renderIndicators()});$('collect').onclick=async()=>{await fetch('/api/collect-now',{method:'POST',cache:'no-store'});refresh()};
 $('telegramTest').onclick=async()=>{let b=$('telegramTest'),orig=b.textContent;b.disabled=true;b.textContent='발송 중...';try{let r=await fetch('/api/telegram-test',{method:'POST',cache:'no-store'});let j=await r.json();alert(j.ok?('✅ 텔레그램 발송 완료'+(j.previewed_side?` (미리보기: ${j.previewed_side.toUpperCase()})`:' (신호 없음, 안내 메시지)')):('❌ 발송 실패: '+(j.error||'알 수 없는 오류')))}catch(e){alert('❌ 요청 실패: '+e)}finally{b.disabled=false;b.textContent=orig}};
 let lastSyncAt=Date.now();

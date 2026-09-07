@@ -186,6 +186,24 @@ def _selector_matches_node(selector: str, node: Tag) -> bool:
     return True
 
 
+def _selector_ancestor_classes(selector: str) -> List[str]:
+    """Classes required on ancestors (every token except the last) of a
+    descendant-combinator selector, e.g. for
+    '.coin-strategy__long.blue .coin-strategy__side' this returns
+    ['blue', 'coin-strategy__long'] - i.e. exactly the toggle/state classes
+    that had to be present on some ancestor for this rule to apply. This is
+    precise, structured evidence of *why* a signal activated (not just the
+    resulting color), useful for building a dataset from collected data."""
+    tokens = [t for t in selector.strip().split() if t]
+    if len(tokens) <= 1:
+        return []
+    classes: List[str] = []
+    for token in tokens[:-1]:
+        _, _, cls = _simple_selector_requirements(token)
+        classes.extend(sorted(cls))
+    return classes
+
+
 def _matching_backgrounds(soup: BeautifulSoup, node: Optional[Tag], with_selector: bool) -> List[str]:
     node = _label_node(node)
     if node is None:
@@ -201,6 +219,33 @@ def _matching_backgrounds(soup: BeautifulSoup, node: Optional[Tag], with_selecto
             for selector in selector_group.split(","):
                 if _selector_matches_node(selector, node):
                     results.append(f"css {selector.strip()} {{{bg}}}" if with_selector else bg)
+                    break
+    return results
+
+
+def _matching_backgrounds_structured(soup: BeautifulSoup, node: Optional[Tag]) -> List[Dict[str, Any]]:
+    """Same matching as _matching_backgrounds, but keeps the selector,
+    background declaration and required-ancestor-classes as separate,
+    structured fields instead of one combined display string."""
+    node = _label_node(node)
+    if node is None:
+        return []
+    results: List[Dict[str, Any]] = []
+    for style in soup.find_all("style"):
+        css = style.get_text(" ", strip=True)
+        for m in re.finditer(r"([^{}]+)\{([^{}]+)\}", css, re.I):
+            selector_group, declarations = m.group(1), m.group(2)
+            bg = _background_declarations(declarations)
+            if not bg:
+                continue
+            for selector in selector_group.split(","):
+                sel = selector.strip()
+                if _selector_matches_node(sel, node):
+                    results.append({
+                        "selector": sel,
+                        "declaration": bg,
+                        "ancestor_classes": _selector_ancestor_classes(sel),
+                    })
                     break
     return results
 
@@ -231,7 +276,18 @@ def _detect_color(side: str, visual: str) -> Optional[str]:
 
 
 def _signal_for(soup: BeautifulSoup, side: str) -> Dict[str, Any]:
-    best: Dict[str, Any] = {"active": False, "detected_color": None, "visual_evidence": "", "label_html": None, "matched_text": None}
+    best: Dict[str, Any] = {
+        "active": False, "detected_color": None, "visual_evidence": "", "label_html": None, "matched_text": None,
+        # Precise, structured entry-basis fields (kept separate from the
+        # human-readable visual_evidence string above so downstream data
+        # collection/analysis doesn't have to parse text back out of it).
+        "matched_css_selector": None,        # exact selector that produced the detected color, e.g. ".coin-strategy__long.blue .coin-strategy__side"
+        "matched_css_declaration": None,     # e.g. "background:#44C27B"
+        "ancestor_classes": [],              # toggle/state classes required on an ancestor for the rule to apply, e.g. ["blue"]
+        "own_inline_background": None,       # the label's own inline style background, if that's what decided the color
+        "label_tag": None,                   # e.g. "td"
+        "label_own_classes": [],             # classes on the label cell itself (not ancestors)
+    }
     seen = set()
     for raw_node in _find_side_nodes(soup, side):
         node = _label_node(raw_node)
@@ -248,13 +304,40 @@ def _signal_for(soup: BeautifulSoup, side: str) -> Dict[str, Any]:
         # mean the label cell's background is that color, so they must not be
         # able to flip a signal ON.
         own_bg = _own_style_background(node)
-        sheet_bgs = _stylesheet_backgrounds(soup, node)
+        structured_matches = _matching_backgrounds_structured(soup, node)
+        sheet_bgs = [m["declaration"] for m in structured_matches]
         background_only = ";".join(x for x in [own_bg, *sheet_bgs] if x)
         color = _detect_color(side, background_only)
+        # Identify exactly which single source (inline style, or which one
+        # matched CSS rule) actually produced the detected color, so the
+        # evidence points at one concrete cause rather than a blob of
+        # everything that was checked.
+        matched_selector = matched_declaration = None
+        ancestor_classes: List[str] = []
+        own_inline_background = None
+        if color:
+            if own_bg and _detect_color(side, own_bg) == color:
+                own_inline_background = own_bg
+            else:
+                for m in structured_matches:
+                    if _detect_color(side, m["declaration"]) == color:
+                        matched_selector = m["selector"]
+                        matched_declaration = m["declaration"]
+                        ancestor_classes = m["ancestor_classes"]
+                        break
+        node_classes = node.get("class", [])
+        if isinstance(node_classes, str):
+            node_classes = node_classes.split()
         candidate = {
             "active": bool(color), "detected_color": color,
             "visual_evidence": combined_visual, "label_html": str(node)[:3000],
             "matched_text": _node_text(node),
+            "matched_css_selector": matched_selector,
+            "matched_css_declaration": matched_declaration,
+            "ancestor_classes": ancestor_classes,
+            "own_inline_background": own_inline_background,
+            "label_tag": node.name,
+            "label_own_classes": [str(c) for c in node_classes if c],
         }
         if candidate["active"]:
             return candidate
@@ -355,6 +438,6 @@ def parse_page(html: str) -> Dict[str, Any]:
             "short": _signal_for(soup, "short"),
         },
         "entry_message": bool(re.search(r"진입\s*(?:해도\s*)?(?:좋|가능)|진입\s*추천|entry\s*(?:ok|signal|possible)", text, re.I)),
-        "parser_version": "3.5.2",
+        "parser_version": "3.6",
     }
     return result
