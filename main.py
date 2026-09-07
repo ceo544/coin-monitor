@@ -229,10 +229,15 @@ telegram_state: Dict[str, Any] = {
     "short_active_color": None,
     "long_activated_at": None,  # ISO timestamp of when it turned ON, cleared when it turns OFF, used to report how long it stayed ON
     "short_activated_at": None,
+    "long_near_entry": False,   # edge-trigger flags for the "진입 임박" proximity alert, so it fires once per approach rather than every 30s while price lingers nearby
+    "short_near_entry": False,
     "last_sent_at": None,
     "last_error": None,
     "sent_count": 0,
 }
+# How close current price must get to the 1st-stage (25%) entry price to
+# trigger a "진입 임박" (entry imminent) alert, in raw price units (USD for BTC).
+ENTRY_PROXIMITY_USD = float(os.getenv("ENTRY_PROXIMITY_USD", "100"))
 _state_lock = threading.Lock()
 
 
@@ -622,47 +627,25 @@ def _build_signal_message(
         f"현재가: {_fmt_num(current_price_raw)}",
     ]
 
-    def entry_block(title: str, entries: list, tps: list, sls: list) -> list:
-        if not entries:
-            return []
-        block = [f"<b>[{title} 진입가]</b>"]
-        stage_labels = ["25%", "40%", "60%", "100%", "예비"]
-        for idx, val in enumerate(entries[:5]):
-            tp = tps[idx] if idx < len(tps) else None
-            sl = sls[idx] if idx < len(sls) else None
-            stage = stage_labels[idx] if idx < len(stage_labels) else str(idx + 1)
-            piece = f"진입{idx+1}({stage}): {_fmt_num(val)}"
-            if tp is not None:
-                piece += f" · TP {_fmt_num(tp)}"
-            if sl is not None:
-                piece += f" · SL {_fmt_num(sl)}"
-            block.append(piece)
-        return block
-
-    # Always show BOTH Long and Short entry tables, regardless of which side
-    # triggered this notification, so the person doesn't have to check the
-    # dashboard separately to see the other side's levels.
-    lines.append("")
-    lines.extend(entry_block("LONG", rows.get("long") or [], rows.get("tpLong") or [], rows.get("slLong") or []))
-    lines.append("")
-    lines.extend(entry_block("SHORT", rows.get("short") or [], rows.get("tpShort") or [], rows.get("slShort") or []))
-    # Actual E-RANG evidence - the real cause of the ON flip.
-    evidence = _sig_evidence_text(parsed, side)
-    if evidence:
+    # Only the triggered side's 1st-stage (25%) entry - not all 5 stages,
+    # and not the other side's table.
+    side_label = "LONG" if side == "long" else "SHORT"
+    entries = rows.get(side) or []
+    tps = rows.get("tpLong" if side == "long" else "tpShort") or []
+    sls = rows.get("slLong" if side == "long" else "slShort") or []
+    if entries:
+        entry1 = entries[0]
+        tp1 = tps[0] if tps else None
+        sl1 = sls[0] if sls else None
+        piece = f"진입1(25%): {_fmt_num(entry1)}"
+        if tp1 is not None:
+            piece += f" · TP {_fmt_num(tp1)}"
+        if sl1 is not None:
+            piece += f" · SL {_fmt_num(sl1)}"
         lines.append("")
-        lines.append(f"📌 <b>E-RANG 실제 판정 근거</b>\n{evidence}")
-    # Binance indicator context - correlation only, never claimed as cause.
-    indicators = (binance_snapshot or {}).get("indicators") or {}
-    tf_bullets = []
-    for tf in ("15m", "1h"):
-        bullets = _narrative_for(indicators.get(tf) or {})
-        if bullets:
-            safe_bullets = [html.escape(b) for b in bullets]
-            tf_bullets.append(f"<b>{tf}</b>\n" + "\n".join(f"· {b}" for b in safe_bullets))
-    if tf_bullets:
-        lines.append("")
-        lines.append("📊 <b>Binance 지표 참고 (진입 시점, 참고용·확정 원인 아님)</b>")
-        lines.extend(tf_bullets)
+        lines.append(f"<b>[{side_label} 1차 진입가]</b>")
+        lines.append(piece)
+    lines.append("")
     lines.append(now_kst + " (KST)")
     if DASHBOARD_URL:
         lines.append(f'<a href="{html.escape(DASHBOARD_URL, quote=True)}">대시보드 열기</a>')
@@ -734,6 +717,48 @@ def _maybe_notify_telegram(
                 ))
             except Exception as exc:
                 log("TELEGRAM_ERROR", f"failed to build/send SHORT {'ON' if short_active else 'OFF'} message: {type(exc).__name__}: {exc}")
+
+
+def _maybe_notify_entry_proximity(parsed: Dict[str, Any], current_price_raw: Optional[str]) -> None:
+    """Sends a '진입 임박' (entry imminent) alert when the current price gets
+    within ENTRY_PROXIMITY_USD of the 1st-stage (25%) LONG or SHORT entry
+    price - independent of whether the E-RANG ON/OFF signal itself is
+    active, since the entry price levels are published regardless of that.
+    Edge-triggered (state kept in telegram_state) so it fires once when
+    price first comes within range, not every 30s while it lingers there;
+    it re-arms once price moves back out of range."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    current_price = _to_float_loose(current_price_raw)
+    if current_price is None:
+        return
+    rows = _row_map_from_parsed(parsed)
+    now_kst = datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S")
+    for side, entries_key, state_key, label, emoji in (
+        ("long", "long", "long_near_entry", "롱(LONG)", "🟦"),
+        ("short", "short", "short_near_entry", "숏(SHORT)", "🟥"),
+    ):
+        entries = rows.get(entries_key) or []
+        entry1 = _to_float_loose(entries[0]) if entries else None
+        if entry1 is None:
+            continue
+        is_near = abs(current_price - entry1) <= ENTRY_PROXIMITY_USD
+        with _state_lock:
+            was_near = telegram_state.get(state_key, False)
+            telegram_state[state_key] = is_near
+        if is_near and not was_near:
+            try:
+                msg = (
+                    f"{emoji} <b>E-RANG {label} 진입 임박</b>\n"
+                    f"현재가: {_fmt_num(current_price_raw)}\n"
+                    f"1차 진입가: {_fmt_num(entries[0])} (차이 {abs(current_price - entry1):.1f} 이내)\n"
+                    f"{now_kst} (KST)"
+                )
+                if DASHBOARD_URL:
+                    msg += f'\n<a href="{html.escape(DASHBOARD_URL, quote=True)}">대시보드 열기</a>'
+                send_telegram_message(msg)
+            except Exception as exc:
+                log("TELEGRAM_ERROR", f"failed to build/send {label} 진입임박 message: {type(exc).__name__}: {exc}")
 
 
 def collect_once() -> Dict[str, Any]:
@@ -845,6 +870,10 @@ def collect_once() -> Dict[str, Any]:
             )
         except Exception as exc:
             log("TELEGRAM_ERROR", f"notify failed: {type(exc).__name__}: {exc}")
+        try:
+            _maybe_notify_entry_proximity(parsed, current_price_raw)
+        except Exception as exc:
+            log("TELEGRAM_ERROR", f"entry-proximity notify failed: {type(exc).__name__}: {exc}")
     except Exception as exc:
         record["error"] = f"{type(exc).__name__}: {exc}"
         log("ERROR", record["error"])
