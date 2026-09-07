@@ -14,20 +14,11 @@ BITGET_API_KEY = os.getenv("BITGET_API_KEY", "").strip()
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "").strip()
 BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "").strip()
 BITGET_TIMEOUT = float(os.getenv("BITGET_TIMEOUT", "12"))
-BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")
-BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN", "USDT")
-# Bitget rejects the Classic Account "mix" endpoints with error 40085 for
-# accounts running in Unified Trading Account (UTA) mode - the account type
-# changes which URL segment ("mix" vs "uta") the same operations live under.
-# This is a best-effort guess at the UTA path segment since it can't be
-# verified against live docs from here; if it's wrong, Bitget will return a
-# different, equally specific error (404, or another {code, msg} pair) that
-# tells us how to correct it - one env var change away, no redeploy of code.
-BITGET_ACCOUNT_MODULE = os.getenv("BITGET_ACCOUNT_MODULE", "uta").strip().strip("/")
-
-# Same field names the uploaded dashboard used to spot PnL/side columns
-# across whatever shape Bitget's response happens to have.
-PNL_KEYS = ("unrealizedPL", "unrealizedPl", "pnl", "profit", "achievedProfits")
+# V3 Unified Trading Account API groups markets by "category" (e.g.
+# USDT-FUTURES), not v2's "productType". An optional symbol filter can be
+# set to scope fills/orders to one instrument; unset means "all symbols".
+BITGET_CATEGORY = os.getenv("BITGET_CATEGORY", "USDT-FUTURES")
+BITGET_SYMBOL = os.getenv("BITGET_SYMBOL", "").strip() or None
 
 
 def bitget_configured() -> bool:
@@ -42,7 +33,7 @@ def _build_query(params: Dict[str, Any]) -> str:
 
 
 def _sign(secret: str, message: str) -> str:
-    """Bitget v2 signing: base64(HMAC-SHA256(secret, timestamp+method+path+query+body))."""
+    """Bitget signing: base64(HMAC-SHA256(secret, timestamp+method+path+query+body))."""
     digest = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
     return base64.b64encode(digest).decode("utf-8")
 
@@ -64,14 +55,12 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
             "ACCESS-TIMESTAMP": timestamp,
             "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
             "Content-Type": "application/json",
-            "locale": "ko-KR",
+            "locale": "en-US",
         },
     )
-    # Bitget returns a JSON body with its own {code, msg} even on 4xx/5xx HTTP
-    # statuses - that body is the actual reason (bad signature, IP not
-    # whitelisted, wrong passphrase, invalid param, etc.). Parse it BEFORE
-    # raising on the HTTP status, otherwise raise_for_status() would throw
-    # a generic "400 Bad Request" and hide the real cause.
+    # Parse the JSON body (which carries Bitget's own {code, msg}) before
+    # raising on HTTP status, so a 4xx/5xx shows the real reason instead of
+    # a generic "400/404 Client Error".
     try:
         data = resp.json()
     except ValueError:
@@ -85,137 +74,116 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     return data.get("data")
 
 
-def fetch_positions() -> List[Dict[str, Any]]:
-    data = _get(
-        f"/api/v2/{BITGET_ACCOUNT_MODULE}/position/all-position",
-        {"productType": BITGET_PRODUCT_TYPE, "marginCoin": BITGET_MARGIN_COIN},
-    )
-    return data or []
-
-
-def fetch_pending_orders() -> List[Dict[str, Any]]:
-    data = _get(f"/api/v2/{BITGET_ACCOUNT_MODULE}/order/orders-pending", {"productType": BITGET_PRODUCT_TYPE})
+def fetch_account_assets() -> List[Dict[str, Any]]:
+    """Overall Unified Trading Account balance/equity snapshot: accountEquity,
+    usdtEquity, unrealisedPnl, usdtUnrealisedPnl, effEquity."""
+    data = _get("/api/v3/account/assets")
     if isinstance(data, dict):
-        return data.get("entrustedList") or []
+        return [data]
     return data or []
 
 
-def fetch_fills(limit: int = 50) -> List[Dict[str, Any]]:
-    data = _get(f"/api/v2/{BITGET_ACCOUNT_MODULE}/order/fills", {"productType": BITGET_PRODUCT_TYPE, "limit": limit})
+def fetch_fills(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Executed trades. Each fill has tradeSide ('open'/'close') and, for
+    closes, execPnl - the realized PnL for that specific close."""
+    params = {"category": BITGET_CATEGORY, "symbol": symbol or BITGET_SYMBOL}
+    data = _get("/api/v3/trade/fills", params)
     if isinstance(data, dict):
-        return data.get("fillList") or []
+        return data.get("fillList") or data.get("list") or []
     return data or []
 
 
-def fetch_account_list() -> List[Dict[str, Any]]:
-    """Futures account balance/equity per margin coin."""
-    data = _get(f"/api/v2/{BITGET_ACCOUNT_MODULE}/account/accounts", {"productType": BITGET_PRODUCT_TYPE})
-    return data or []
-
-
-def fetch_position_history(limit: int = 100) -> List[Dict[str, Any]]:
-    """Closed positions (each one a completed trade with realized PnL) -
-    used to compute win rate and realized PnL, since open positions alone
-    can't tell you whether past trades were winners or losers."""
-    data = _get(
-        f"/api/v2/{BITGET_ACCOUNT_MODULE}/position/history-position",
-        {"productType": BITGET_PRODUCT_TYPE, "pageSize": limit},
-    )
+def fetch_history_orders(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Historical futures orders (filled/cancelled/etc.) - order-level detail,
+    coarser than fills."""
+    params = {"category": BITGET_CATEGORY, "symbol": symbol or BITGET_SYMBOL}
+    data = _get("/api/v3/trade/history-orders", params)
     if isinstance(data, dict):
-        return data.get("list") or []
+        return data.get("orderList") or data.get("list") or []
     return data or []
 
 
-def _pnl_of(position: Dict[str, Any]) -> float:
-    for k in PNL_KEYS:
-        if k in position:
-            try:
-                return float(position[k])
-            except (TypeError, ValueError):
-                return 0.0
-    return 0.0
+def _account_summary(assets: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    """Pull the five documented fields straight off the first (only)
+    account-assets row - these field names are confirmed by Bitget's own
+    docs, no guessing/fallback needed here."""
+    def f(row: Dict[str, Any], key: str) -> Optional[float]:
+        if key not in row:
+            return None
+        try:
+            return float(row[key])
+        except (TypeError, ValueError):
+            return None
+
+    if not assets:
+        return {
+            "account_equity": None, "usdt_equity": None,
+            "unrealized_pnl": None, "usdt_unrealized_pnl": None,
+            "eff_equity": None,
+        }
+    row = assets[0]
+    return {
+        "account_equity": f(row, "accountEquity"),
+        "usdt_equity": f(row, "usdtEquity"),
+        "unrealized_pnl": f(row, "unrealisedPnl"),
+        "usdt_unrealized_pnl": f(row, "usdtUnrealisedPnl"),
+        "eff_equity": f(row, "effEquity"),
+    }
 
 
-# Field names vary across Bitget account/position-history response shapes;
-# try each in order rather than assuming one exact name.
-REALIZED_PNL_KEYS = ("netProfit", "pnl", "totalPnl", "realizedPL", "realisedPnl")
-EQUITY_KEYS = ("usdtEquity", "accountEquity", "equity", "usdtBalance")
-
-
-def _realized_pnl_of(closed_position: Dict[str, Any]) -> float:
-    for k in REALIZED_PNL_KEYS:
-        if k in closed_position:
-            try:
-                return float(closed_position[k])
-            except (TypeError, ValueError):
-                return 0.0
-    return 0.0
-
-
-def _equity_of(account: Dict[str, Any]) -> float:
-    for k in EQUITY_KEYS:
-        if k in account:
-            try:
-                return float(account[k])
-            except (TypeError, ValueError):
-                return 0.0
-    return 0.0
+def _realized_pnl_of_fill(fill: Dict[str, Any]) -> Optional[float]:
+    """Only closing fills realize PnL - opens by definition haven't closed
+    out a position yet, so they don't count as a win or a loss."""
+    if fill.get("tradeSide") != "close":
+        return None
+    try:
+        return float(fill.get("execPnl"))
+    except (TypeError, ValueError):
+        return None
 
 
 def fetch_summary() -> Dict[str, Any]:
-    """One combined snapshot for the dashboard's 'my Bitget position' card:
-    open positions, pending orders, recent fills, account balance, and a
-    win-rate/PnL readout built from closed-position history. Each piece is
-    fetched independently so one failing call (e.g. a transient rate limit,
-    or an endpoint whose exact response shape differs from what's assumed
-    here) doesn't blank out the others - it just reports its own error."""
+    """One combined snapshot for the dashboard's Bitget card: account
+    balance/equity, recent fills, recent order history, and a win-rate/PnL
+    readout built from closing fills' execPnl. Each piece is fetched
+    independently so one failing call doesn't blank out the others."""
     errors: Dict[str, str] = {}
-    positions: List[Dict[str, Any]] = []
-    orders: List[Dict[str, Any]] = []
+    assets: List[Dict[str, Any]] = []
     fills: List[Dict[str, Any]] = []
-    accounts: List[Dict[str, Any]] = []
-    closed_positions: List[Dict[str, Any]] = []
+    orders: List[Dict[str, Any]] = []
     try:
-        positions = fetch_positions()
+        assets = fetch_account_assets()
     except Exception as exc:
-        errors["positions"] = f"{type(exc).__name__}: {exc}"
-    try:
-        orders = fetch_pending_orders()
-    except Exception as exc:
-        errors["orders"] = f"{type(exc).__name__}: {exc}"
+        errors["assets"] = f"{type(exc).__name__}: {exc}"
     try:
         fills = fetch_fills()
     except Exception as exc:
         errors["fills"] = f"{type(exc).__name__}: {exc}"
     try:
-        accounts = fetch_account_list()
+        orders = fetch_history_orders()
     except Exception as exc:
-        errors["accounts"] = f"{type(exc).__name__}: {exc}"
-    try:
-        closed_positions = fetch_position_history()
-    except Exception as exc:
-        errors["position_history"] = f"{type(exc).__name__}: {exc}"
+        errors["history_orders"] = f"{type(exc).__name__}: {exc}"
 
-    unrealized_pnl = sum(_pnl_of(p) for p in positions)
-    total_equity = sum(_equity_of(a) for a in accounts)
-    realized_pnls = [_realized_pnl_of(p) for p in closed_positions]
-    wins = sum(1 for v in realized_pnls if v > 0)
-    losses = sum(1 for v in realized_pnls if v < 0)
-    decided = wins + losses  # trades that closed exactly break-even don't count either way
+    acct = _account_summary(assets)
+    unrealized_pnl = acct["usdt_unrealized_pnl"] if acct["usdt_unrealized_pnl"] is not None else acct["unrealized_pnl"]
+    close_pnls = [v for v in (_realized_pnl_of_fill(f) for f in fills) if v is not None]
+    wins = sum(1 for v in close_pnls if v > 0)
+    losses = sum(1 for v in close_pnls if v < 0)
+    decided = wins + losses  # exact-break-even closes don't count either way
     win_rate_pct = round(wins / decided * 100, 1) if decided else None
-    realized_pnl_total = sum(realized_pnls)
+    realized_pnl_total = sum(close_pnls)
 
     return {
-        "positions": positions,
-        "orders": orders,
         "fills": fills,
+        "orders": orders,
+        "account": acct,
+        "total_equity": acct["usdt_equity"] if acct["usdt_equity"] is not None else acct["account_equity"],
         "total_unrealized_pnl": unrealized_pnl,
-        "total_equity": total_equity if accounts else None,
         "win_rate_pct": win_rate_pct,
         "win_count": wins,
         "loss_count": losses,
-        "trade_count": len(closed_positions),
+        "trade_count": len(close_pnls),
         "realized_pnl_total": realized_pnl_total,
-        "combined_pnl": realized_pnl_total + unrealized_pnl,
+        "combined_pnl": realized_pnl_total + (unrealized_pnl or 0.0),
         "errors": errors or None,
     }

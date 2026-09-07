@@ -205,9 +205,9 @@ live_binance_state: Dict[str, Any] = {
 bitget_state: Dict[str, Any] = {
     "started": False,
     "configured": False,
-    "positions": [],
-    "orders": [],
     "fills": [],
+    "orders": [],
+    "account": {},
     "total_unrealized_pnl": None,
     "total_equity": None,
     "win_rate_pct": None,
@@ -980,9 +980,9 @@ def bitget_loop() -> None:
         try:
             summary = bitget_client.fetch_summary()
             with _state_lock:
-                bitget_state["positions"] = summary.get("positions") or []
-                bitget_state["orders"] = summary.get("orders") or []
                 bitget_state["fills"] = summary.get("fills") or []
+                bitget_state["orders"] = summary.get("orders") or []
+                bitget_state["account"] = summary.get("account") or {}
                 bitget_state["total_unrealized_pnl"] = summary.get("total_unrealized_pnl")
                 bitget_state["total_equity"] = summary.get("total_equity")
                 bitget_state["win_rate_pct"] = summary.get("win_rate_pct")
@@ -1313,7 +1313,7 @@ DASHBOARD_HTML = r"""
 "support_host": "https://www.tradingview.com"
 }
 </script></div></div>
-<div class="card s12"><div class="detailHead"><h2>내 Bitget 포지션 <span class="muted">(실계좌 · 읽기 전용)</span></h2><span class="hint" id="bgHint"></span></div><div class="metricTop metricTop6"><div class="metric"><b>오픈 포지션</b><strong id="bgPositions">-</strong></div><div class="metric"><b>미체결 주문</b><strong id="bgOrders">-</strong></div><div class="metric"><b>미실현손익 (USDT)</b><strong id="bgPnl">-</strong></div><div class="metric"><b>승률</b><strong id="bgWinRate">-</strong></div><div class="metric"><b>PNL (통합)</b><strong id="bgCombinedPnl">-</strong></div><div class="metric"><b>총 USDT (잔고)</b><strong id="bgEquity">-</strong></div></div><div class="ptabs"><button class="ptab active" data-ptab="positions">보유 포지션</button><button class="ptab" data-ptab="orders">미체결 주문</button><button class="ptab" data-ptab="fills">체결 내역</button></div><div id="ppanel-positions" class="ppanel active"><div class="muted">-</div></div><div id="ppanel-orders" class="ppanel"><div class="muted">-</div></div><div id="ppanel-fills" class="ppanel"><div class="muted">-</div></div><div class="foot"><span>ⓘ 가격/손익은 Bitget API 응답을 그대로 표시합니다. 승률/PNL(통합)은 청산된 포지션 이력 기준이며, 매매 판단 참고용입니다.</span><span id="bgUpdate"></span></div></div>
+<div class="card s12"><div class="detailHead"><h2>내 Bitget 계좌 <span class="muted">(통합계좌 · 실계좌 · 읽기 전용)</span></h2><span class="hint" id="bgHint"></span></div><div class="metricTop metricTop6"><div class="metric"><b>총자산 (Account Equity)</b><strong id="bgAccountEquity">-</strong></div><div class="metric"><b>USDT 잔고</b><strong id="bgEquity">-</strong></div><div class="metric"><b>미실현 PNL</b><strong id="bgPnl">-</strong></div><div class="metric"><b>유효자산 (Eff. Equity)</b><strong id="bgEffEquity">-</strong></div><div class="metric"><b>승률</b><strong id="bgWinRate">-</strong></div><div class="metric"><b>PNL (통합)</b><strong id="bgCombinedPnl">-</strong></div></div><div class="ptabs"><button class="ptab active" data-ptab="fills">체결 내역</button><button class="ptab" data-ptab="orders">주문 내역</button></div><div id="ppanel-fills" class="ppanel active"><div class="muted">-</div></div><div id="ppanel-orders" class="ppanel"><div class="muted">-</div></div><div class="foot"><span>ⓘ 가격/손익은 Bitget API 응답을 그대로 표시합니다. 승률/PNL(통합)은 청산(close) 체결의 실현손익 기준이며, 매매 판단 참고용입니다.</span><span id="bgUpdate"></span></div></div>
 <div class="card s6"><h2>E-RANG 진입가 <span class="muted">(현재 화면 기준)</span></h2><div class="tablewrap"><table><thead><tr><th>구분</th><th>진입 1<br>(25%)</th><th>진입 2<br>(40%)</th><th>진입 3<br>(60%)</th><th>진입 4<br>(100%)</th><th>진입 5<br>(예비)</th></tr></thead><tbody id="erangRows"></tbody></table></div></div>
 <div class="card s6"><h2>Binance 보조 지표 (BTCUSDT)</h2><div class="metricTop"><div class="metric"><b>현재가 (Last Price)</b><strong id="bLast">-</strong></div><div class="metric"><b>펀딩비 (Funding Rate)</b><strong id="funding">-</strong></div><div class="metric"><b>미결제약정 (Open Interest)</b><strong id="oi">-</strong></div><div class="metric"><b>24h 거래량</b><strong id="vol24">-</strong></div></div><div class="tabs"><button class="tab" data-tf="1m">1분</button><button class="tab" data-tf="5m">5분</button><button class="tab active" data-tf="15m">15분</button><button class="tab" data-tf="1h">1시간</button></div><div class="tablewrap"><table class="indtable"><thead><tr><th>지표</th><th>현재값</th><th>상태</th></tr></thead><tbody id="indicatorRows"></tbody></table></div><div class="foot"><span>ⓘ 최근 220개 캔들 데이터 기반 계산</span><span id="bUpdate"></span></div></div>
 <div class="card s6"><h2>현재가와 주요 진입가 거리 <span class="muted">(Long 기준)</span></h2><div id="distanceLong" class="dist"></div><h2 style="margin-top:16px">현재가와 주요 진입가 거리 <span class="muted">(Short 기준)</span></h2><div id="distanceShort" class="dist"></div></div>
@@ -1377,9 +1377,9 @@ function statusFor(name,val,ind){if(val==null)return '-';if(name==='RSI 14')retu
 function clsStatus(s){return s.includes('▲')?'statusUp':s.includes('▼')?'statusDown':'statusNeutral'}
 function renderIndicators(){let b=liveBinance&&Object.keys(liveBinance).length?liveBinance:(latest.binance||{}), ind=b.indicators?.[activeTF]||{}, mac=ind.macd||{}, bol=ind.bollinger20||{};let rows=[['현재가 (Close)',ind.close],['고가 (High)',ind.high],['저가 (Low)',ind.low],['거래량 (Volume)',ind.volume],['EMA 20',ind.ema20],['EMA 50',ind.ema50],['EMA 200',ind.ema200],['RSI 14',ind.rsi14],['MACD Line',mac.macd],['MACD Signal',mac.signal],['MACD Histogram',mac.histogram],['Bollinger 상단',bol.upper],['Bollinger 중단',bol.middle],['Bollinger 하단',bol.lower],['ATR 14',ind.atr14]];$('indicatorRows').innerHTML=rows.map(([name,val])=>{let st=statusFor(name,Number(val),ind);return `<tr><td>${name}</td><td>${n(val)}</td><td class="${clsStatus(st)}">${st}</td></tr>`}).join('');}
 function renderEvidence(){let p=latest.parsed||{},s=p.signals||{},L=s.long||{},S=s.short||{};let active=latest.short_signal?'SHORT':latest.long_signal?'LONG':'WAIT';$('evidence').innerHTML=`<strong class="${active==='SHORT'?'short':active==='LONG'?'long':'wait'}">● ${active==='WAIT'?'활성 신호 없음':active+' 활성화 감지'}</strong><br>• Long 감지색: ${L.detected_color||'-'}<br>• Short 감지색: ${S.detected_color||'-'}<br>• 판정 기준: E-RANG Long/Short 라벨 셀의 활성 스타일/클래스`}
-const BG_PRIORITY_KEYS=['symbol','symbolName','side','holdSide','orderType','size','total','openPriceAvg','price','priceAvg','markPrice','leverage'];
-const BG_PNL_KEYS=['unrealizedPL','unrealizedPl','pnl','profit','achievedProfits'];
-const BG_HIDE_KEYS=['userId','marginCoin','posMode','cTime','uTime'];
+const BG_PRIORITY_KEYS=['symbol','side','tradeSide','execPrice','execQty','execValue','execPnl','feeDetail','createdTime','orderId'];
+const BG_PNL_KEYS=['execpnl','unrealizedpl','unrealizedpl','pnl','profit'];
+const BG_HIDE_KEYS=['userId','marginCoin','posMode'];
 function bgLooksNumeric(v){return v!==''&&v!==null&&v!==undefined&&!Number.isNaN(Number(v))}
 function renderBitgetTable(container,rows,emptyMsg){
   if(!rows||rows.length===0){container.innerHTML=`<div class="muted" style="padding:20px 4px">${emptyMsg}</div>`;return}
@@ -1390,10 +1390,14 @@ function renderBitgetTable(container,rows,emptyMsg){
     out+='<tr>';
     ordered.forEach(k=>{
       let v=row[k];
-      let isPnl=BG_PNL_KEYS.some(p=>k.toLowerCase().includes(p.toLowerCase()));
-      if(k==='holdSide'||k==='side'){
-        let isLong=String(v).toLowerCase().includes('long')||String(v).toLowerCase()==='buy';
+      let isPnl=BG_PNL_KEYS.some(p=>k.toLowerCase().includes(p));
+      if(k==='side'||k==='tradeSide'){
+        let isLong=String(v).toLowerCase().includes('buy')||String(v).toLowerCase()==='open'||String(v).toLowerCase().includes('long');
         out+=`<td><span class="${isLong?'pside-long':'pside-short'}">${esc(v)}</span></td>`;
+      } else if(k==='createdTime'){
+        out+=`<td>${esc(kst(Number(v)))}</td>`;
+      } else if(k==='orderId'){
+        out+=`<td>${esc(v??'')}</td>`;
       } else if(bgLooksNumeric(v)){
         let cls=isPnl?(Number(v)>=0?'statusUp':'statusDown'):'';
         out+=`<td class="pnum ${cls}">${n(v)}</td>`;
@@ -1409,21 +1413,19 @@ function renderBitgetTable(container,rows,emptyMsg){
 function renderPositionMini(bg){
   let el=$('posMini');
   if(!bg||!bg.configured){el.innerHTML='<span class="muted">키 미설정</span>';return}
-  let positions=bg.positions||[];
+  let closes=(bg.fills||[]).filter(f=>f.tradeSide==='close');
   let rows='';
-  if(!positions.length){
-    rows='<span class="muted">포지션 없음</span>';
+  if(!closes.length){
+    rows='<span class="muted">최근 체결 없음</span>';
   } else {
     const MAX_ROWS=3;
-    rows=positions.slice(0,MAX_ROWS).map(p=>{
-      let side=(p.holdSide||p.side||'');
-      let isLong=String(side).toLowerCase().includes('long')||String(side).toLowerCase()==='buy';
-      let pnl=Number(p.unrealizedPL??p.unrealizedPl??p.pnl??p.profit??p.achievedProfits);
+    rows=closes.slice(0,MAX_ROWS).map(f=>{
+      let pnl=Number(f.execPnl);
       let pnlTxt=Number.isFinite(pnl)?(pnl>=0?'+':'')+n(pnl):'-';
       let pnlCls=Number.isFinite(pnl)?(pnl>=0?'statusUp':'statusDown'):'';
-      return `<div class="prow"><span class="${isLong?'long':'short'}">${esc(p.symbol||'-')}</span><b class="${pnlCls}">${pnlTxt}</b></div>`;
+      return `<div class="prow"><span class="${Number.isFinite(pnl)&&pnl>=0?'long':'short'}">${esc(f.symbol||'-')}</span><b class="${pnlCls}">${pnlTxt}</b></div>`;
     }).join('');
-    if(positions.length>MAX_ROWS)rows+=`<div class="muted">+${positions.length-MAX_ROWS}개 더</div>`;
+    if(closes.length>MAX_ROWS)rows+=`<div class="muted">+${closes.length-MAX_ROWS}건 더</div>`;
   }
   let winRate=bg.win_rate_pct,combined=Number(bg.combined_pnl),equity=Number(bg.total_equity);
   let combinedCls=Number.isFinite(combined)?(combined>=0?'statusUp':'statusDown'):'';
@@ -1433,15 +1435,15 @@ function renderPositionMini(bg){
 function renderBitget(bg){
   if(!bg||!bg.configured){
     $('bgHint').textContent='Bitget API 키 미설정';
-    $('bgPositions').textContent='-';$('bgOrders').textContent='-';$('bgPnl').textContent='-';
-    $('bgWinRate').textContent='-';$('bgCombinedPnl').textContent='-';$('bgEquity').textContent='-';
-    ['positions','orders','fills'].forEach(k=>$('ppanel-'+k).innerHTML='<div class="muted" style="padding:20px 4px">BITGET_API_KEY / BITGET_API_SECRET / BITGET_API_PASSPHRASE 환경변수를 설정하면 표시됩니다.</div>');
+    $('bgAccountEquity').textContent='-';$('bgEquity').textContent='-';$('bgPnl').textContent='-';$('bgEffEquity').textContent='-';
+    $('bgWinRate').textContent='-';$('bgCombinedPnl').textContent='-';
+    ['fills','orders'].forEach(k=>$('ppanel-'+k).innerHTML='<div class="muted" style="padding:20px 4px">BITGET_API_KEY / BITGET_API_SECRET / BITGET_API_PASSPHRASE 환경변수를 설정하면 표시됩니다.</div>');
     renderPositionMini(bg);
     return;
   }
-  let positions=bg.positions||[],orders=bg.orders||[],fills=bg.fills||[];
-  $('bgPositions').textContent=positions.length;
-  $('bgOrders').textContent=orders.length;
+  let fills=bg.fills||[],orders=bg.orders||[],acct=bg.account||{};
+  $('bgAccountEquity').textContent=Number.isFinite(Number(acct.account_equity))?n(acct.account_equity):'-';
+  $('bgEffEquity').textContent=Number.isFinite(Number(acct.eff_equity))?n(acct.eff_equity):'-';
   let pnl=Number(bg.total_unrealized_pnl);
   let pnlEl=$('bgPnl');
   pnlEl.textContent=Number.isFinite(pnl)?n(pnl):'-';
@@ -1453,9 +1455,8 @@ function renderBitget(bg){
   combinedEl.className='num '+(Number.isFinite(combined)?(combined>=0?'statusUp':'statusDown'):'');
   let equity=Number(bg.total_equity);
   $('bgEquity').textContent=Number.isFinite(equity)?n(equity):'-';
-  renderBitgetTable($('ppanel-positions'),positions,'보유 중인 포지션이 없습니다.');
-  renderBitgetTable($('ppanel-orders'),orders,'미체결 주문이 없습니다.');
   renderBitgetTable($('ppanel-fills'),fills,'체결 내역이 없습니다.');
+  renderBitgetTable($('ppanel-orders'),orders,'주문 내역이 없습니다.');
   $('bgHint').textContent=bg.last_error?('오류: '+JSON.stringify(bg.last_error)):'';
   $('bgUpdate').textContent='업데이트: '+kst(bg.updated_at);
   renderPositionMini(bg);

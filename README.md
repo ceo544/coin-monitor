@@ -75,6 +75,16 @@
   - **OFF**: 직전에 감지됐던 배경색이 무엇이었는지 + 기본색으로 복귀했다는 사실 + **몇 초/몇 분간 켜져 있다가 꺼졌는지(활성 유지 시간)**
 - Binance 지표 참고 섹션도 ON/OFF 각각 "진입 시점" / "해제 시점" 라벨을 붙여서 두 메시지 모두에 포함됩니다.
 
+## v3.26 Bitget Unified Trading Account V3 API로 전면 교체
+- v2 mix API(`/api/v2/mix/...`)와 그 추정 변형(`/api/v2/uta/...`)이 모두 실패해서, 사용자가 직접 확인해준 **실제 문서 기반 V3 통합계좌 API**로 완전히 다시 작성했습니다.
+- 엔드포인트: `GET /api/v3/account/assets` (계좌 자산), `GET /api/v3/trade/fills?category=USDT-FUTURES` (체결 내역), `GET /api/v3/trade/history-orders?category=USDT-FUTURES` (주문 내역).
+- **"오픈 포지션" 개념이 사라졌습니다** — V3 API에 실시간 포지션 목록 엔드포인트가 없어서(문서에 없음), 카드 이름을 "내 Bitget 계좌"로 바꾸고 지표를 재구성했습니다:
+  - 요약: 총자산(accountEquity) / USDT 잔고(usdtEquity) / 미실현 PNL(usdtUnrealisedPnl) / 유효자산(effEquity) / 승률 / PNL(통합)
+  - 탭: 체결 내역(fills) / 주문 내역(history-orders) — "보유 포지션" 탭은 제거
+  - 승률/실현손익은 체결 내역 중 `tradeSide=close`인 것들의 `execPnl`을 집계해서 계산합니다.
+  - 상단 미니 카드도 "최근 체결" 기준으로 바뀌었습니다.
+- 환경변수: `BITGET_CATEGORY`(기본 `USDT-FUTURES`), `BITGET_SYMBOL`(선택, 특정 심볼만 보고 싶을 때). `BITGET_ACCOUNT_MODULE`은 더 이상 쓰지 않습니다(V3는 mix/uta 구분이 없는 별도 API 트리라서).
+
 ## v3.25 통합계좌(UTA) 지원 + 에러 메시지 정확도 개선
 - **[40085] Unified Account mode 오류 수정 시도**: 비트겟이 "통합계좌(Unified Trading Account)" 모드인 계정에서 클래식(Classic) 전용 API(`/api/v2/mix/...`)를 호출하면 이 오류가 납니다. 엔드포인트 경로의 계좌 구간(`mix`)을 환경변수 `BITGET_ACCOUNT_MODULE`로 뺐고, 기본값을 `uta`로 바꿨습니다 (클래식 계좌를 쓰는 다른 배포는 `BITGET_ACCOUNT_MODULE=mix`로 되돌리면 됩니다).
   - ⚠️ **주의**: 통합계좌(UTA) API의 정확한 경로/파라미터는 실시간 문서로 검증하지 못한 상태의 최선의 추정입니다 (`/api/v2/uta/...`). 틀렸다면 다른 형태의 오류(404 또는 다른 code/msg)가 나올 텐데, 그 메시지를 알려주시면 경로를 다시 맞출 수 있습니다 — 코드가 아니라 환경변수만 바꾸면 되므로 재배포 없이 바로 테스트 가능합니다.
