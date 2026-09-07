@@ -85,6 +85,23 @@ class RealizedPnlOfFillTests(unittest.TestCase):
     def test_unparsable_pnl_returns_none(self):
         self.assertIsNone(bitget_client._realized_pnl_of_fill({"tradeSide": "close", "execPnl": "bad"}))
 
+    def test_real_close_short_value_is_recognized(self):
+        # Regression test: Bitget's actual tradeSide values are direction-
+        # qualified ('close_short', 'close_long', 'open_short', 'open_long'),
+        # not the plain 'close'/'open' this client originally assumed. An
+        # exact-match check silently dropped every real close fill's execPnl
+        # from the win-rate/realized-PnL totals.
+        self.assertEqual(bitget_client._realized_pnl_of_fill({"tradeSide": "close_short", "execPnl": "0.0149"}), 0.0149)
+
+    def test_real_close_long_value_is_recognized(self):
+        self.assertEqual(bitget_client._realized_pnl_of_fill({"tradeSide": "close_long", "execPnl": "12.5"}), 12.5)
+
+    def test_real_open_long_value_does_not_count_as_realized(self):
+        self.assertIsNone(bitget_client._realized_pnl_of_fill({"tradeSide": "open_long", "execPnl": "0"}))
+
+    def test_real_open_short_value_does_not_count_as_realized(self):
+        self.assertIsNone(bitget_client._realized_pnl_of_fill({"tradeSide": "open_short", "execPnl": "0"}))
+
 
 class FetchSummaryTests(unittest.TestCase):
     def test_summary_computes_win_rate_and_combined_pnl(self):
@@ -247,6 +264,17 @@ class ComputeOpenPositionsTests(unittest.TestCase):
         positions = bitget_client.compute_open_positions(fills)
         symbols = {p["symbol"]: p["side"] for p in positions}
         self.assertEqual(symbols, {"BTCUSDT": "long", "ETHUSDT": "short"})
+
+    def test_real_direction_qualified_tradeside_values_recognized(self):
+        # Regression test for the same open/close prefix bug, applied here.
+        fills = [
+            {"symbol": "BTCUSDT", "side": "sell", "tradeSide": "open_short", "execQty": "0.1", "execPrice": "100000", "createdTime": "1"},
+            {"symbol": "BTCUSDT", "side": "buy", "tradeSide": "close_short", "execQty": "0.04", "execPrice": "98000", "createdTime": "2"},
+        ]
+        positions = bitget_client.compute_open_positions(fills)
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["side"], "short")
+        self.assertAlmostEqual(positions[0]["qty"], 0.06)
 
 
     def test_fetch_current_positions_calls_v3_path(self):

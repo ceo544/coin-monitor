@@ -144,8 +144,14 @@ def _account_summary(assets: List[Dict[str, Any]]) -> Dict[str, Optional[float]]
 
 def _realized_pnl_of_fill(fill: Dict[str, Any]) -> Optional[float]:
     """Only closing fills realize PnL - opens by definition haven't closed
-    out a position yet, so they don't count as a win or a loss."""
-    if fill.get("tradeSide") != "close":
+    out a position yet, so they don't count as a win or a loss. Bitget's
+    real tradeSide values are 'open_long'/'open_short'/'close_long'/
+    'close_short' (direction-qualified), not plain 'open'/'close', so this
+    checks a prefix rather than exact equality - an exact-match check here
+    was the actual bug that made real close_long/close_short fills (and
+    their execPnl) silently vanish from the win-rate/realized-PnL totals."""
+    trade_side = str(fill.get("tradeSide") or "").lower()
+    if not trade_side.startswith("close"):
         return None
     try:
         return float(fill.get("execPnl"))
@@ -185,14 +191,16 @@ def compute_open_positions(fills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if qty <= 0:
             continue
         b = book.setdefault(symbol, {"long_qty": 0.0, "long_cost": 0.0, "short_qty": 0.0, "short_cost": 0.0})
-        if trade_side == "open":
+        # Real values are direction-qualified ('open_long', 'close_short',
+        # etc.) - match by prefix, not exact equality, same fix as above.
+        if trade_side.startswith("open"):
             if side == "buy":
                 b["long_cost"] += qty * price
                 b["long_qty"] += qty
             elif side == "sell":
                 b["short_cost"] += qty * price
                 b["short_qty"] += qty
-        elif trade_side == "close":
+        elif trade_side.startswith("close"):
             if side == "sell" and b["long_qty"] > 0:  # closing a long
                 reduce = min(qty, b["long_qty"])
                 b["long_cost"] *= (b["long_qty"] - reduce) / b["long_qty"]
