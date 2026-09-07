@@ -44,3 +44,15 @@
   올바른 순서의 조상에 실제로 매치되어야 배경색을 인정합니다.
 - 실제 사이트 마크업 구조를 재현한 회귀 테스트(`test_ancestor_toggle_class_required_for_activation`)를 추가해
   OFF/OFF, LONG만 ON, SHORT만 ON, BOTH ON 네 가지 경우를 모두 검증했습니다.
+
+## v3.13 텔레그램 알림
+- LONG 또는 SHORT 신호가 **OFF → ON으로 전환되는 순간**에만 텔레그램 메시지를 보냅니다 (30초마다 계속 ON이어도 스팸 발송하지 않음).
+- 메시지에는 판정된 방향(LONG/SHORT), 현재가(Binance 실시간가), 진입 1~5 가격과 TP/SL, 감지된 배경색, KST 시각이 포함됩니다.
+- 배포 직후(재시작 직후) 첫 수집 사이클에서는 알림을 보내지 않습니다 — 재시작 전부터 이미 ON이었던 상태를 "새로 발생"으로 잘못 알리는 것을 막기 위함입니다. DB에 저장된 마지막 관측치를 기준으로 이전 상태를 복원합니다.
+- 필요한 환경변수:
+  - `TELEGRAM_BOT_TOKEN` — BotFather에서 발급받은 봇 토큰
+  - `TELEGRAM_CHAT_ID` — 메시지를 받을 채팅방/사용자 ID
+  - (선택) `TELEGRAM_NOTIFY_OFF=false` — 기본값은 `true`라서 ON→OFF로 꺼질 때도 1회 알림이 갑니다. ON 될 때만 받고 싶으면 `false`로 설정하세요.
+  - (선택) `DASHBOARD_URL` — 메시지 마지막 줄에 대시보드 링크를 붙이고 싶으면 설정
+- `POST /api/telegram-test` — 신호 발생을 기다리지 않고 텔레그램 설정이 정상인지 바로 확인할 수 있는 테스트 발송 엔드포인트
+- `/api/status`의 `telegram` 필드에서 활성화 여부, 마지막 발송 시각/오류, 누적 발송 수를 확인할 수 있습니다.

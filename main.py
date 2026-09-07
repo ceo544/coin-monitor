@@ -5,11 +5,13 @@ import hashlib
 import io
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 import psycopg
 import requests
@@ -43,6 +45,13 @@ BACKOFF_SECONDS = float(os.getenv("BACKOFF_SECONDS", "30"))
 # signal that can't be obtained anywhere else.
 LIVE_PRICE_INTERVAL = float(os.getenv("LIVE_PRICE_INTERVAL_SECONDS", "2"))
 BINANCE_SNAPSHOT_INTERVAL = float(os.getenv("BINANCE_SNAPSHOT_INTERVAL_SECONDS", "3"))
+# Telegram alert on Long/Short signal turning ON (edge-triggered: fires once
+# when it flips from OFF to ON, not on every 30s poll while it stays ON).
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_NOTIFY_OFF = os.getenv("TELEGRAM_NOTIFY_OFF", "true").lower() not in {"0", "false", "no", "off"}
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "").strip()
+KST = ZoneInfo("Asia/Seoul")
 
 app = Flask(__name__)
 
@@ -78,6 +87,14 @@ live_binance_state: Dict[str, Any] = {
     "snapshot": {},
     "updated_at": None,
     "last_error": None,
+}
+telegram_state: Dict[str, Any] = {
+    "enabled": False,  # set once at boot after checking token/chat id
+    "last_long_signal": None,   # None = unknown yet (e.g. right after boot)
+    "last_short_signal": None,
+    "last_sent_at": None,
+    "last_error": None,
+    "sent_count": 0,
 }
 _state_lock = threading.Lock()
 
@@ -190,6 +207,128 @@ def insert_observation(record: Dict[str, Any]) -> int:
     return int(saved_id)
 
 
+def _row_map_from_parsed(parsed: Dict[str, Any]) -> Dict[str, list]:
+    """Python port of the dashboard's client-side rowMap() so Telegram alerts
+    can include the same Long/TP/SL/Short entry-price rows shown on screen."""
+    out: Dict[str, list] = {}
+    for row in parsed.get("table_rows") or []:
+        text = (row.get("text") or "").strip()
+        nums = row.get("numbers_raw") or []
+        if re.match(r"^Long\b", text, re.I):
+            out["long"] = nums[:5]
+        elif re.match(r"^Short\b", text, re.I):
+            out["short"] = nums[:5]
+        elif re.match(r"^TP\b", text, re.I):
+            if "tpLong" not in out:
+                out["tpLong"] = nums[:5]
+            else:
+                out["tpShort"] = nums[:5]
+        elif re.match(r"^SL\b", text, re.I):
+            if "slLong" not in out:
+                out["slLong"] = nums[:5]
+            else:
+                out["slShort"] = nums[:5]
+    sides = parsed.get("sides") or {}
+    out.setdefault("long", (sides.get("long") or {}).get("entry_prices_guess") or [])
+    out.setdefault("short", (sides.get("short") or {}).get("entry_prices_guess") or [])
+    return out
+
+
+def send_telegram_message(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            with _state_lock:
+                telegram_state["last_sent_at"] = datetime.now(timezone.utc).isoformat()
+                telegram_state["last_error"] = None
+                telegram_state["sent_count"] += 1
+            log("TELEGRAM", "notification sent")
+        else:
+            err = f"HTTP {resp.status_code}: {resp.text[:300]}"
+            with _state_lock:
+                telegram_state["last_error"] = err
+            log("TELEGRAM_ERROR", err)
+    except Exception as exc:
+        err = f"{type(exc).__name__}: {exc}"
+        with _state_lock:
+            telegram_state["last_error"] = err
+        log("TELEGRAM_ERROR", err)
+
+
+def _fmt_num(value: Any) -> str:
+    try:
+        return f"{float(str(value).replace(',', '')):,.1f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _build_signal_message(side: str, turned_on: bool, parsed: Dict[str, Any], current_price_raw: Optional[str], color: Optional[str]) -> str:
+    rows = _row_map_from_parsed(parsed)
+    key = "long" if side == "long" else "short"
+    tp_key = "tpLong" if side == "long" else "tpShort"
+    sl_key = "slLong" if side == "long" else "slShort"
+    entries = rows.get(key) or []
+    tps = rows.get(tp_key) or []
+    sls = rows.get(sl_key) or []
+    label_kr = "롱(LONG)" if side == "long" else "숏(SHORT)"
+    emoji = "🟦" if side == "long" else "🟥"
+    state_kr = "진입 신호 발생" if turned_on else "신호 해제"
+    now_kst = datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        f"{emoji} <b>E-RANG {label_kr} {state_kr}</b>",
+        f"현재가: {_fmt_num(current_price_raw)}",
+    ]
+    if entries:
+        stage_labels = ["25%", "40%", "60%", "100%", "예비"]
+        for idx, val in enumerate(entries[:5]):
+            tp = tps[idx] if idx < len(tps) else None
+            sl = sls[idx] if idx < len(sls) else None
+            stage = stage_labels[idx] if idx < len(stage_labels) else str(idx + 1)
+            piece = f"진입{idx+1}({stage}): {_fmt_num(val)}"
+            if tp is not None:
+                piece += f" · TP {_fmt_num(tp)}"
+            if sl is not None:
+                piece += f" · SL {_fmt_num(sl)}"
+            lines.append(piece)
+    if color:
+        lines.append(f"감지 배경색: {color}")
+    lines.append(now_kst + " (KST)")
+    if DASHBOARD_URL:
+        lines.append(f'<a href="{DASHBOARD_URL}">대시보드 열기</a>')
+    return "\n".join(lines)
+
+
+def _maybe_notify_telegram(parsed: Dict[str, Any], long_active: bool, short_active: bool, current_price_raw: Optional[str], long_color: Optional[str], short_color: Optional[str]) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    with _state_lock:
+        prev_long = telegram_state["last_long_signal"]
+        prev_short = telegram_state["last_short_signal"]
+        telegram_state["last_long_signal"] = long_active
+        telegram_state["last_short_signal"] = short_active
+    # Only fire on a real transition, and never on the very first cycle after
+    # boot (prev is None) - otherwise every restart would re-announce
+    # whatever state happened to already be true.
+    if prev_long is not None and long_active != prev_long:
+        if long_active or TELEGRAM_NOTIFY_OFF:
+            send_telegram_message(_build_signal_message("long", long_active, parsed, current_price_raw, long_color))
+    if prev_short is not None and short_active != prev_short:
+        if short_active or TELEGRAM_NOTIFY_OFF:
+            send_telegram_message(_build_signal_message("short", short_active, parsed, current_price_raw, short_color))
+
+
 def collect_once() -> Dict[str, Any]:
     observed_at = datetime.now(timezone.utc)
     with _state_lock:
@@ -252,6 +391,17 @@ def collect_once() -> Dict[str, Any]:
                 "content_sha256": sha,
             }
         )
+        try:
+            _maybe_notify_telegram(
+                parsed,
+                bool(long_sig.get("active")),
+                bool(short_sig.get("active")),
+                current_price_raw,
+                long_sig.get("detected_color"),
+                short_sig.get("detected_color"),
+            )
+        except Exception as exc:
+            log("TELEGRAM_ERROR", f"notify failed: {type(exc).__name__}: {exc}")
     except Exception as exc:
         record["error"] = f"{type(exc).__name__}: {exc}"
         log("ERROR", record["error"])
@@ -441,6 +591,7 @@ def api_status() -> Response:
         state = dict(collector_state)
         live_price = dict(live_price_state)
         live_binance = dict(live_binance_state)
+        telegram = dict(telegram_state)
     return jsonify(
         {
             "service": "coin-monitor",
@@ -450,6 +601,7 @@ def api_status() -> Response:
             "collector": state,
             "live_price": live_price,
             "live_binance": live_binance,
+            "telegram": telegram,
             "db": summary,
         }
     )
@@ -551,6 +703,17 @@ def api_collect_now() -> Response:
     return jsonify({"ok": record.get("success"), "id": record.get("id"), "error": record.get("error")})
 
 
+@app.post("/api/telegram-test")
+def api_telegram_test() -> Response:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return jsonify({"ok": False, "error": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set"}), 400
+    now_kst = datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S")
+    send_telegram_message(f"✅ Coin Monitor 테스트 메시지\n{now_kst} (KST)\n텔레그램 알림 설정이 정상 동작합니다.")
+    with _state_lock:
+        err = telegram_state.get("last_error")
+    return jsonify({"ok": err is None, "error": err})
+
+
 @app.get("/export.csv")
 def export_csv() -> Response:
     out = io.StringIO()
@@ -591,7 +754,7 @@ def dashboard() -> str:
 DASHBOARD_HTML = r"""
 <!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coin Monitor</title>
 <style>
-:root{--bg:#07101f;--panel:#0e1b31;--panel2:#101f38;--line:#243b5f;--text:#f4f7ff;--muted:#8fa7c9;--blue:#38a5ff;--red:#ff5364;--green:#35e29a;--yellow:#ffc83d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,#102442 0,#07101f 45%);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1540px;margin:auto;padding:24px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.top h1{margin:0;font-size:30px}.sub,.muted{color:var(--muted)}.sub{margin-top:5px}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.btn{border:1px solid var(--line);background:#152540;color:#fff;padding:11px 15px;border-radius:11px;text-decoration:none;font-weight:800;cursor:pointer}.live{color:var(--green);font-weight:900}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{background:linear-gradient(145deg,rgba(16,31,56,.98),rgba(10,24,44,.98));border:1px solid var(--line);border-radius:17px;padding:18px;box-shadow:0 14px 32px #0004;min-width:0}.s2{grid-column:span 2}.s3{grid-column:span 3}.s4{grid-column:span 4}.s6{grid-column:span 6}.s8{grid-column:span 8}.s12{grid-column:span 12}.label{font-size:13px;color:#a9bfdf;font-weight:800}.big{font-size:29px;font-weight:950;margin-top:7px}.hero{display:flex;align-items:center;gap:22px;min-height:110px}.heroSignal{font-size:42px;font-weight:1000}.short{color:var(--red)}.long{color:var(--blue)}.wait{color:var(--yellow)}.ok{color:var(--green)}h2{font-size:18px;margin:0 0 14px}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:680px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}th{background:#132947;color:#c7dcfa;font-size:12px}.rowlong.on td:first-child{font-weight:950;color:var(--blue)}.rowshort.on td:first-child{background:#ef3340;color:#fff;font-weight:950}.entryrow{display:grid;grid-template-columns:82px repeat(5,1fr);gap:8px;align-items:stretch;margin-bottom:10px}.sideLabel{display:flex;align-items:center;font-size:20px;font-weight:950}.entry{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:10px;min-width:0}.entry b{font-size:12px;color:#9fb8db;display:block}.entry strong{font-size:17px;display:block;margin-top:5px;white-space:nowrap}.dist{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.dist .entry strong{font-size:20px}.tabs{display:flex;gap:7px;margin:12px 0}.tab{flex:1;border:1px solid var(--line);background:#102746;color:#c8daf4;padding:9px;border-radius:9px;font-weight:850;cursor:pointer}.tab.active{background:#168cff;color:white}.metricTop{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:12px}.metric b{display:block;color:#9fb8db;font-size:12px}.metric strong{display:block;font-size:19px;margin-top:6px}.indtable{min-width:0}.indtable td:nth-child(2){font-weight:800}.statusUp{color:var(--green)}.statusDown{color:var(--red)}.statusNeutral{color:#dbe7f8}.evidence{line-height:1.7}.evidence strong{font-size:18px}.foot{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:13px;gap:12px}.nowrap{white-space:nowrap}.clickrow{cursor:pointer}.clickrow:hover{background:#132947}.analysisGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.analysisBox{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:14px}.analysisBox h3{margin:0 0 10px;font-size:17px}.chips{display:flex;gap:7px;flex-wrap:wrap}.chip{background:#102746;border:1px solid var(--line);border-radius:999px;padding:6px 9px;font-size:12px}.detailHead{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}.hint{font-size:12px;color:var(--muted)}.reasonCell{text-align:left;white-space:normal;min-width:220px;max-width:320px}.reasonMini{font-size:11px;line-height:1.45;margin-bottom:5px;padding:5px 7px;border-radius:7px;background:#0a172b;border:1px solid var(--line)}.reasonMini:last-child{margin-bottom:0}.reasonMini.long{color:#bcdcff;border-color:#2563eb55}.reasonMini.short{color:#ffd0d6;border-color:#ef334055}.reasonMini b{font-weight:900}
+:root{--bg:#07101f;--panel:#0e1b31;--panel2:#101f38;--line:#243b5f;--text:#f4f7ff;--muted:#8fa7c9;--blue:#38a5ff;--red:#ff5364;--green:#35e29a;--yellow:#ffc83d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,#102442 0,#07101f 45%);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1540px;margin:auto;padding:24px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.top h1{margin:0;font-size:30px}.sub,.muted{color:var(--muted)}.sub{margin-top:5px}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.btn{border:1px solid var(--line);background:#152540;color:#fff;padding:11px 15px;border-radius:11px;text-decoration:none;font-weight:800;cursor:pointer}.live{color:var(--green);font-weight:900}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{background:linear-gradient(145deg,rgba(16,31,56,.98),rgba(10,24,44,.98));border:1px solid var(--line);border-radius:17px;padding:18px;box-shadow:0 14px 32px #0004;min-width:0}.s2{grid-column:span 2}.s3{grid-column:span 3}.s4{grid-column:span 4}.s6{grid-column:span 6}.s8{grid-column:span 8}.s12{grid-column:span 12}.label{font-size:13px;color:#a9bfdf;font-weight:800}.big{font-size:29px;font-weight:950;margin-top:7px}.hero{display:flex;align-items:center;gap:22px;min-height:110px}.heroSignal{font-size:42px;font-weight:1000}.short{color:var(--red)}.long{color:var(--blue)}.wait{color:var(--yellow)}.ok{color:var(--green)}h2{font-size:18px;margin:0 0 14px}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:680px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}th{background:#132947;color:#c7dcfa;font-size:12px}.rowlong.on td:first-child{font-weight:950;color:var(--blue)}.rowshort.on td:first-child{background:#ef3340;color:#fff;font-weight:950}.entryrow{display:grid;grid-template-columns:82px repeat(5,1fr);gap:8px;align-items:stretch;margin-bottom:10px}.sideLabel{display:flex;align-items:center;font-size:20px;font-weight:950}.entry{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:10px;min-width:0}.entry b{font-size:12px;color:#9fb8db;display:block}.entry strong{font-size:17px;display:block;margin-top:5px;white-space:nowrap}.dist{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.dist .entry strong{font-size:20px}.tabs{display:flex;gap:7px;margin:12px 0}.tab{flex:1;border:1px solid var(--line);background:#102746;color:#c8daf4;padding:9px;border-radius:9px;font-weight:850;cursor:pointer}.tab.active{background:#168cff;color:white}.metricTop{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:12px}.metric b{display:block;color:#9fb8db;font-size:12px}.metric strong{display:block;font-size:19px;margin-top:6px}.indtable{min-width:0}.indtable td:nth-child(2){font-weight:800}.statusUp{color:var(--green)}.statusDown{color:var(--red)}.statusNeutral{color:#dbe7f8}.evidence{line-height:1.7}.evidence strong{font-size:18px}.foot{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:13px;gap:12px}.nowrap{white-space:nowrap}.clickrow{cursor:pointer}.clickrow:hover{background:#132947}.analysisGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.analysisBox{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:14px}.analysisBox h3{margin:0 0 10px;font-size:17px}.chips{display:flex;gap:7px;flex-wrap:wrap}.chip{background:#102746;border:1px solid var(--line);border-radius:999px;padding:6px 9px;font-size:12px}.detailHead{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}.hint{font-size:12px;color:var(--muted)}.reasonCell{text-align:left;white-space:normal;min-width:220px;max-width:320px}.reasonMini{font-size:11px;line-height:1.45;margin-bottom:5px;padding:5px 7px;border-radius:7px;background:#0a172b;border:1px solid var(--line)}.reasonMini:last-child{margin-bottom:0}.reasonMini.long{color:#bcdcff;border-color:#2563eb55}.reasonMini.short{color:#ffd0d6;border-color:#ef334055}.reasonMini b{font-weight:900}.reasonList{margin:9px 0 0;padding-left:18px;font-size:12px;color:#c7dcfa;line-height:1.6}.reasonList li{margin-bottom:3px}.reasonSummary{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:6px}.reasonSummary b{display:block;margin-bottom:6px;font-size:13px;color:#dbe7f8}
 @media(max-width:1050px){.s2,.s3,.s4,.s6,.s8{grid-column:span 12}.metricTop{grid-template-columns:1fr 1fr}.two{grid-template-columns:1fr}.entryrow{grid-template-columns:70px repeat(5,130px);overflow-x:auto}.dist{grid-template-columns:repeat(5,140px);overflow-x:auto}}@media(max-width:600px){.wrap{padding:12px}.top{flex-direction:column}.metricTop{grid-template-columns:1fr 1fr}.heroSignal{font-size:34px}}
 </style></head><body><div class="wrap">
 <div class="top"><div><h1>Coin Monitor</h1><div class="sub">e-rang coin.php 1분 수집 + LONG/SHORT 색상 신호 + Binance 보조 데이터</div></div><div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collect" class="btn">강제 수집</button><span id="live" class="live">● 정상 수집 중</span><span id="lastSync" class="muted"></span><span id="lastTop" class="muted"></span></div></div>
@@ -637,7 +800,28 @@ function clsStatus(s){return s.includes('▲')?'statusUp':s.includes('▼')?'sta
 function renderIndicators(){let b=liveBinance&&Object.keys(liveBinance).length?liveBinance:(latest.binance||{}), ind=b.indicators?.[activeTF]||{}, mac=ind.macd||{}, bol=ind.bollinger20||{};let rows=[['현재가 (Close)',ind.close],['고가 (High)',ind.high],['저가 (Low)',ind.low],['거래량 (Volume)',ind.volume],['EMA 20',ind.ema20],['EMA 50',ind.ema50],['EMA 200',ind.ema200],['RSI 14',ind.rsi14],['MACD Line',mac.macd],['MACD Signal',mac.signal],['MACD Histogram',mac.histogram],['Bollinger 상단',bol.upper],['Bollinger 중단',bol.middle],['Bollinger 하단',bol.lower],['ATR 14',ind.atr14]];$('indicatorRows').innerHTML=rows.map(([name,val])=>{let st=statusFor(name,Number(val),ind);return `<tr><td>${name}</td><td>${n(val)}</td><td class="${clsStatus(st)}">${st}</td></tr>`}).join('');}
 function renderEvidence(){let p=latest.parsed||{},s=p.signals||{},L=s.long||{},S=s.short||{};let active=latest.short_signal?'SHORT':latest.long_signal?'LONG':'WAIT';$('evidence').innerHTML=`<strong class="${active==='SHORT'?'short':active==='LONG'?'long':'wait'}">● ${active==='WAIT'?'활성 신호 없음':active+' 활성화 감지'}</strong><br>• Long 감지색: ${L.detected_color||'-'}<br>• Short 감지색: ${S.detected_color||'-'}<br>• 판정 기준: E-RANG Long/Short 라벨 셀의 활성 스타일/클래스`}
 function eventTF(r,tf){return r?.binance?.indicators?.[tf]||{}}
-function renderEventDetail(r){if(!r)return;let sig=r.short_signal&&!r.long_signal?'SHORT':r.long_signal&&!r.short_signal?'LONG':r.short_signal&&r.long_signal?'BOTH':'WAIT';let cards=['1m','5m','15m','1h'].map(tf=>{let i=eventTF(r,tf),m=i.macd||{},b=i.bollinger20||{};return `<div class="analysisBox"><h3>${tf} <span class="${sig==='SHORT'?'short':sig==='LONG'?'long':'wait'}">${sig}</span></h3><div class="chips"><span class="chip">RSI ${n(i.rsi14)}</span><span class="chip">EMA20 ${n(i.ema20)}</span><span class="chip">EMA50 ${n(i.ema50)}</span><span class="chip">EMA200 ${n(i.ema200)}</span><span class="chip">MACD Hist ${n(m.histogram)}</span><span class="chip">ATR ${n(i.atr14)}</span><span class="chip">BB 상 ${n(b.upper)}</span><span class="chip">BB 중 ${n(b.middle)}</span><span class="chip">BB 하 ${n(b.lower)}</span></div></div>`}).join('');$('eventDetail').innerHTML=`<div style="margin-bottom:12px"><strong>ID ${r.id} · ${kst(r.observed_at)} · BTC ${n(r.current_price||r.current_price_raw)}</strong> · Funding ${r.binance?.premium_index?.lastFundingRate??'-'} · OI ${n(r.binance?.open_interest?.openInterest)}</div><div class="analysisGrid">${cards}</div>`}
+function narrativeFor(ind){
+  if(!ind||!Object.keys(ind).length)return [];
+  let m=ind.macd||{}, b=ind.bollinger20||{}, bullets=[];
+  let rsi=Number(ind.rsi14);
+  if(Number.isFinite(rsi)){
+    if(rsi<=30)bullets.push(`RSI ${n(rsi)} · 과매도권`);
+    else if(rsi>=70)bullets.push(`RSI ${n(rsi)} · 과매수권`);
+    else bullets.push(`RSI ${n(rsi)} · 중립 구간`);
+  }
+  let hist=Number(m.histogram);
+  if(Number.isFinite(hist))bullets.push(`MACD 히스토그램 ${n(hist)} · ${hist>=0?'상승 모멘텀':'하락 모멘텀'}`);
+  let close=Number(ind.close), ema20=Number(ind.ema20), ema50=Number(ind.ema50);
+  if(Number.isFinite(close)&&Number.isFinite(ema20))bullets.push(`종가가 EMA20(${n(ema20)}) ${close>=ema20?'상회':'하회'}`);
+  if(Number.isFinite(ema20)&&Number.isFinite(ema50))bullets.push(`EMA20 ${ema20>=ema50?'≥':'<'} EMA50 · ${ema20>=ema50?'단기 상승 배열':'단기 하락 배열'}`);
+  if(Number.isFinite(close)&&Number.isFinite(b.upper)&&Number.isFinite(b.lower)&&(b.upper-b.lower)>0){
+    let pos=(close-b.lower)/(b.upper-b.lower);
+    if(pos<=0.15)bullets.push('볼린저밴드 하단 근접 · 되돌림 반등 구간 가능성');
+    else if(pos>=0.85)bullets.push('볼린저밴드 상단 근접 · 과열·되돌림 하락 구간 가능성');
+  }
+  return bullets;
+}
+function renderEventDetail(r){if(!r)return;let sig=r.short_signal&&!r.long_signal?'SHORT':r.long_signal&&!r.short_signal?'LONG':r.short_signal&&r.long_signal?'BOTH':'WAIT';let cards=['1m','5m','15m','1h'].map(tf=>{let i=eventTF(r,tf),m=i.macd||{},b=i.bollinger20||{},reasons=narrativeFor(i);return `<div class="analysisBox"><h3>${tf} <span class="${sig==='SHORT'?'short':sig==='LONG'?'long':'wait'}">${sig}</span></h3><div class="chips"><span class="chip">RSI ${n(i.rsi14)}</span><span class="chip">EMA20 ${n(i.ema20)}</span><span class="chip">EMA50 ${n(i.ema50)}</span><span class="chip">EMA200 ${n(i.ema200)}</span><span class="chip">MACD Hist ${n(m.histogram)}</span><span class="chip">ATR ${n(i.atr14)}</span><span class="chip">BB 상 ${n(b.upper)}</span><span class="chip">BB 중 ${n(b.middle)}</span><span class="chip">BB 하 ${n(b.lower)}</span></div>${reasons.length?`<ul class="reasonList">${reasons.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:''}</div>`}).join('');let erangReasons=[r.long_signal?sigReason(r,'long'):'',r.short_signal?sigReason(r,'short'):''].filter(Boolean);let erangBlock=(r.long_signal||r.short_signal)?`<div class="reasonSummary"><b>E-RANG 실제 판정 근거</b>${r.long_signal?`<div class="reasonMini long"><b>LONG</b> ${esc(sigReason(r,'long'))}</div>`:''}${r.short_signal?`<div class="reasonMini short"><b>SHORT</b> ${esc(sigReason(r,'short'))}</div>`:''}</div>`:'';$('eventDetail').innerHTML=`<div style="margin-bottom:12px"><strong>ID ${r.id} · ${kst(r.observed_at)} · BTC ${n(r.current_price||r.current_price_raw)}</strong> · Funding ${r.binance?.premium_index?.lastFundingRate??'-'} · OI ${n(r.binance?.open_interest?.openInterest)}</div>${erangBlock}<div class="hint" style="margin:10px 0">※ 아래는 이 시점의 Binance 보조지표 상태를 정리한 참고용 관측입니다. E-RANG의 실제 ON 판정은 위 라벨 배경색 기준이며, 아래 지표 조합이 ON의 확정 원인이라는 뜻은 아닙니다.</div><div class="analysisGrid">${cards}</div>`}
 function renderAnalysis(a){let sm=a?.summary||{};$('analysisSummary').innerHTML=['LONG','SHORT'].map(side=>{let g=sm[side]||{},t=g.timeframes?.['15m']||{};return `<div class="analysisBox"><h3 class="${side==='LONG'?'long':'short'}">${side} ON · ${g.count||0}건</h3><div class="chips"><span class="chip">15m 평균 RSI ${n(t.avg_rsi14)}</span><span class="chip">15m 평균 MACD Hist ${n(t.avg_macd_histogram)}</span><span class="chip">MACD Hist 양수 ${t.macd_hist_positive_pct??'-'}%</span><span class="chip">현재가 &gt; EMA20 ${t.price_above_ema20_pct??'-'}%</span><span class="chip">평균 ATR ${n(t.avg_atr14)}</span><span class="chip">평균 Funding ${n(g.avg_funding_rate)}</span></div><div class="hint" style="margin-top:10px">1m/5m/15m/1h 상세는 ON 발생 행을 클릭해서 확인</div></div>`}).join('')}
 async function refresh(){try{let [sr,hr,ar]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/history?limit=80',{cache:'no-store'}),fetch('/api/signal-analysis?limit=200',{cache:'no-store'})]),s=await sr.json(),h=await hr.json(),a=await ar.json(),db=s.db||{};renderAnalysis(a);latest=db.latest||{};let sig=latest.short_signal&&!latest.long_signal?'SHORT':latest.long_signal&&!latest.short_signal?'LONG':latest.short_signal&&latest.long_signal?'BOTH':'WAIT';$('heroSignal').textContent=sig;$('heroSignal').className='heroSignal '+(sig==='SHORT'?'short':sig==='LONG'?'long':'wait');$('signalBits').textContent=`LONG ${latest.long_signal?'ON':'OFF'} / SHORT ${latest.short_signal?'ON':'OFF'}`;let lp=s.live_price||{},livePriceNum=Number(lp.price);$('price').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?n(livePriceNum):n(latest.current_price||latest.current_price_raw);$('priceDelta').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?('Binance 실시간 · '+kst(lp.updated_at)):'E-RANG (Binance 실시간가 대기중)';$('collectState').textContent=latest.success?'정상':'오류';$('counts').textContent=`성공 ${n(db.successful||0)} / 실패 ${n(db.failed||0)}`;$('db').textContent=db.database_ok?'Postgres OK':'Postgres 오류';$('server').textContent=`collector ${(s.collector||{}).running?'running':'idle'}`;$('lastTop').textContent='마지막 수집: '+kst(latest.observed_at);renderErang(latest.parsed||{},livePriceNum);let lb=s.live_binance?.snapshot||{};liveBinance=Object.keys(lb).length?lb:(latest.binance||{});let b=liveBinance;$('bLast').textContent=n(b.ticker_24h?.lastPrice);$('funding').textContent=b.premium_index?.lastFundingRate??'-';$('oi').textContent=n(b.open_interest?.openInterest);$('vol24').textContent=n(b.ticker_24h?.volume);$('bUpdate').textContent='업데이트: '+kst(s.live_binance?.updated_at||latest.observed_at);renderIndicators();renderEvidence();$('history').innerHTML=(h.items||[]).map((r,idx)=>{let i=eventTF(r,'15m'),mh=i.macd?.histogram,rel=Number(i.close)>Number(i.ema20)?'상회':Number(i.close)<Number(i.ema20)?'하회':'-';return `<tr class="clickrow" data-idx="${idx}"><td>${r.id}</td><td>${kst(r.observed_at)}</td><td>${n(r.current_price||r.current_price_raw)}</td><td class="${r.long_signal?'long':''}">${r.long_signal?'ON':'OFF'}</td><td class="${r.short_signal?'short':''}">${r.short_signal?'ON':'OFF'}</td><td class="reasonCell">${historyReasonCell(r)}</td><td>${n(i.rsi14)}</td><td class="${Number(mh)>=0?'statusUp':'statusDown'}">${n(mh)}</td><td>${rel}</td><td>${r.http_status||'-'}</td></tr>`}).join('');document.querySelectorAll('.clickrow').forEach(tr=>tr.onclick=()=>renderEventDetail((h.items||[])[Number(tr.dataset.idx)]));let firstOn=(h.items||[]).find(r=>r.long_signal||r.short_signal);if(firstOn)renderEventDetail(firstOn);$('live').textContent='● 실시간 동기화 중';$('live').className='live';lastSyncAt=Date.now();$('lastSync').textContent='방금 갱신'}catch(e){$('live').textContent='● UI 오류 (재시도 중)';$('live').className='short'}}
 document.querySelectorAll('.tab').forEach(x=>x.onclick=()=>{document.querySelectorAll('.tab').forEach(y=>y.classList.remove('active'));x.classList.add('active');activeTF=x.dataset.tf;renderIndicators()});$('collect').onclick=async()=>{await fetch('/api/collect-now',{method:'POST',cache:'no-store'});refresh()};
@@ -656,6 +840,20 @@ if __name__ == "__main__":
         init_db()
     except Exception as exc:
         log("DB_ERROR", f"initial schema failed: {type(exc).__name__}: {exc}")
+    with _state_lock:
+        telegram_state["enabled"] = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    if telegram_state["enabled"]:
+        try:
+            summary = db_summary()
+            latest = summary.get("latest") or {}
+            with _state_lock:
+                telegram_state["last_long_signal"] = latest.get("long_signal")
+                telegram_state["last_short_signal"] = latest.get("short_signal")
+            log("TELEGRAM_BOOT", f"seeded prev state long={latest.get('long_signal')} short={latest.get('short_signal')}")
+        except Exception as exc:
+            log("TELEGRAM_ERROR", f"failed to seed previous signal state: {type(exc).__name__}: {exc}")
+    else:
+        log("TELEGRAM_BOOT", "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set, notifications disabled")
     start_collector_once()
     start_live_price_once()
     start_binance_snapshot_once()
