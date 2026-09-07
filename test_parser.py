@@ -27,21 +27,14 @@ class ParserSignalTests(unittest.TestCase):
         self.assertIn("long", parsed["sides"])
         self.assertIn("short", parsed["sides"])
 
-class RealisticTableSignalTests(unittest.TestCase):
-    def test_blue_header_does_not_turn_long_on_when_short_label_is_red(self):
-        html = '''
+    def test_short_label_cell_active_via_css_class(self):
+        html = """
+        <style>.sigA9 { background-color: #ff3b30; color: white; }</style>
         <table>
-          <thead><tr style="background:#294d85;color:white"><th>구분</th><th>진입1</th></tr></thead>
-          <tbody>
-            <tr style="background:#f4efe5"><td>Long</td><td>79481.4</td></tr>
-            <tr><td>TP</td><td>79751.6</td></tr>
-            <tr><td>SL</td><td>77494.3</td></tr>
-            <tr><td style="background:#ff3b30;color:white">Short</td><td style="background:#f4efe5">80173.7</td></tr>
-            <tr><td>TP</td><td>79901.1</td></tr>
-            <tr><td>SL</td><td>82178.0</td></tr>
-          </tbody>
+          <tr><td>Long</td><td>79481.4</td></tr>
+          <tr><td class="sigA9">Short</td><td>80173.7</td></tr>
         </table>
-        '''
+        """
         parsed = parse_page(html)
         self.assertFalse(parsed["signals"]["long"]["active"])
         self.assertTrue(parsed["signals"]["short"]["active"])

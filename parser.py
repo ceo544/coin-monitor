@@ -106,6 +106,27 @@ def _css_colors(visual: str) -> List[tuple[int, int, int, str]]:
     return colors
 
 
+def _stylesheet_context(soup: BeautifulSoup, node: Optional[Tag]) -> str:
+    if node is None:
+        return ""
+    classes = node.get("class", [])
+    if isinstance(classes, str):
+        classes = classes.split()
+    node_id = node.get("id")
+    selectors = [f".{c}" for c in classes if c]
+    if node_id:
+        selectors.append(f"#{node_id}")
+    if not selectors:
+        return ""
+    evidence = []
+    for style in soup.find_all("style"):
+        css = style.get_text(" ", strip=True)
+        for selector in selectors:
+            for m in re.finditer(r"([^{}]*" + re.escape(selector) + r"[^{}]*)\{([^{}]+)\}", css, re.I):
+                evidence.append(f"css {m.group(1).strip()} {{{m.group(2).strip()}}}")
+    return " | ".join(evidence)
+
+
 def _detect_color(side: str, visual: str) -> Optional[str]:
     low = visual.lower().replace(" ", "")
     hints = LONG_COLOR_HINTS if side == "long" else SHORT_COLOR_HINTS
@@ -130,14 +151,19 @@ def _signal_for(soup: BeautifulSoup, side: str) -> Dict[str, Any]:
         "matched_text": None,
     }
     for node in _find_side_nodes(soup, side):
+        # Prefer the exact Long/Short label element. Include CSS rules that target
+        # that element's class/id, because the rendered background may come from
+        # a stylesheet instead of an inline style.
         visual = _visual_context(node)
-        color = _detect_color(side, visual)
+        css_visual = _stylesheet_context(soup, node)
+        combined_visual = " | ".join(x for x in (visual, css_visual) if x)
+        color = _detect_color(side, combined_visual)
         active = bool(color)
         text = _node_text(node)
         candidate = {
             "active": active,
             "detected_color": color,
-            "visual_evidence": visual,
+            "visual_evidence": combined_visual,
             "label_html": str(node)[:3000],
             "matched_text": text,
         }
@@ -240,6 +266,6 @@ def parse_page(html: str) -> Dict[str, Any]:
             "short": _signal_for(soup, "short"),
         },
         "entry_message": bool(re.search(r"진입\s*(?:해도\s*)?(?:좋|가능)|진입\s*추천|entry\s*(?:ok|signal|possible)", text, re.I)),
-        "parser_version": "2.0.0",
+        "parser_version": "3.0.0",
     }
     return result
