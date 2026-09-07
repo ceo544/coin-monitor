@@ -59,10 +59,21 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
             "locale": "ko-KR",
         },
     )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") and data.get("code") != "00000":
-        raise RuntimeError(f"[{data.get('code')}] {data.get('msg') or 'Bitget API error'}")
+    # Bitget returns a JSON body with its own {code, msg} even on 4xx/5xx HTTP
+    # statuses - that body is the actual reason (bad signature, IP not
+    # whitelisted, wrong passphrase, invalid param, etc.). Parse it BEFORE
+    # raising on the HTTP status, otherwise raise_for_status() would throw
+    # a generic "400 Bad Request" and hide the real cause.
+    try:
+        data = resp.json()
+    except ValueError:
+        resp.raise_for_status()
+        raise RuntimeError(f"Bitget returned a non-JSON response (HTTP {resp.status_code}): {resp.text[:300]}")
+    code = data.get("code")
+    if code and code != "00000":
+        raise RuntimeError(f"[{code}] {data.get('msg') or 'Bitget API error'} (HTTP {resp.status_code})")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code} with no Bitget error code: {data}")
     return data.get("data")
 
 
