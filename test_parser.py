@@ -27,6 +27,24 @@ class ParserSignalTests(unittest.TestCase):
         self.assertIn("long", parsed["sides"])
         self.assertIn("short", parsed["sides"])
 
+    def test_current_price_ignores_nearby_leverage_like_small_number(self):
+        # Regression test: a real observed bug where a Telegram alert showed
+        # "현재가: 10.0" next to ~79,000 entry prices, because the page had a
+        # small number (e.g. leverage "10.0x") sitting closer to the "현재가"
+        # label in the visible text than the actual BTC price.
+        html = (
+            '<div>현재가 10.0배 레버리지 설정</div>'
+            '<div>BTCUSDT 78999.1</div>'
+            '<div>Long 78500.0 78000.0</div><div>Short 80000.0</div>'
+        )
+        parsed = parse_page(html)
+        self.assertEqual(parsed["current_price_raw"], "78999.1")
+
+    def test_current_price_falls_back_to_large_number_when_all_nearby_matches_are_tiny(self):
+        html = '<div>현재가 10x</div><div>그 외 텍스트</div><div>82345.6 어딘가에</div>'
+        parsed = parse_page(html)
+        self.assertEqual(parsed["current_price_raw"], "82345.6")
+
     def test_short_label_cell_active_via_css_class(self):
         html = """
         <style>.sigA9 { background-color: #ff3b30; color: white; }</style>

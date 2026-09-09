@@ -403,6 +403,14 @@ def _extract_rows(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     return rows[:80]
 
 
+# A real BTC price is always in the thousands+; if the regex's nearest-number
+# match to "현재가"/"BTCUSDT" comes back tiny (e.g. it actually grabbed a
+# leverage value like "10.0x" or a percentage sitting near that label), that
+# candidate must be rejected rather than trusted, or a signal message can end
+# up saying "현재가: 10.0" next to ~79,000 entry prices.
+_MIN_PLAUSIBLE_BTC_PRICE = 100.0
+
+
 def _current_price_from_text(text: str) -> Optional[str]:
     patterns = [
         rf"(?:현재가|Current\s*Price|BTCUSDT|BTC\s*USDT)[^0-9\-]{{0,80}}({NUM_RE})",
@@ -411,7 +419,12 @@ def _current_price_from_text(text: str) -> Optional[str]:
     for pat in patterns:
         m = re.search(pat, text, re.I)
         if m:
-            return _clean_num(m.group(1))
+            candidate = _clean_num(m.group(1))
+            try:
+                if candidate is not None and abs(float(candidate.replace(",", ""))) >= _MIN_PLAUSIBLE_BTC_PRICE:
+                    return candidate
+            except (ValueError, AttributeError):
+                pass
     nums = _numbers(text)
     # BTC price is usually the first large 5+ digit number when labels are absent.
     for n in nums:

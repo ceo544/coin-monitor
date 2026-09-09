@@ -25,6 +25,27 @@ def bitget_configured() -> bool:
     return bool(BITGET_API_KEY and BITGET_API_SECRET and BITGET_API_PASSPHRASE)
 
 
+def configure(
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
+    api_passphrase: Optional[str] = None,
+    category: Optional[str] = None,
+) -> None:
+    """Updates credentials/category at runtime (e.g. from the desktop app's
+    Settings page) without needing to restart the process - unlike the
+    original env-var-at-import-time setup, a local install's user will
+    routinely enter these after first launch rather than before it."""
+    global BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE, BITGET_CATEGORY
+    if api_key is not None:
+        BITGET_API_KEY = api_key.strip()
+    if api_secret is not None:
+        BITGET_API_SECRET = api_secret.strip()
+    if api_passphrase is not None:
+        BITGET_API_PASSPHRASE = api_passphrase.strip()
+    if category:
+        BITGET_CATEGORY = category.strip()
+
+
 def _build_query(params: Dict[str, Any]) -> str:
     items = [(k, v) for k, v in params.items() if v not in (None, "")]
     if not items:
