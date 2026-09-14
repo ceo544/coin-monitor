@@ -27,6 +27,51 @@ def fetch_last_price() -> Dict[str, Any]:
     return {"symbol": data.get("symbol", SYMBOL), "price": data.get("price")}
 
 
+def fetch_order_book_imbalance(depth_limit: int = 50) -> Dict[str, Any]:
+    """Sums bid vs ask volume within the top `depth_limit` price levels of
+    the live order book - a positive imbalance means more resting buy
+    orders than sell orders sitting near the current price (buy-side
+    pressure), and vice versa. This is a point-in-time snapshot (order
+    books move fast), useful as one more feature alongside the slower
+    kline-based indicators, not a standalone signal."""
+    try:
+        data = _get_json("/fapi/v1/depth", {"symbol": SYMBOL, "limit": depth_limit})
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    bids = data.get("bids") or []
+    asks = data.get("asks") or []
+    try:
+        bid_volume = sum(float(b[1]) for b in bids)
+        ask_volume = sum(float(a[1]) for a in asks)
+    except (TypeError, ValueError, IndexError):
+        return {"error": "malformed depth response"}
+    total = bid_volume + ask_volume
+    imbalance = (bid_volume - ask_volume) / total if total else None
+    best_bid = float(bids[0][0]) if bids else None
+    best_ask = float(asks[0][0]) if asks else None
+    return {
+        "bid_volume": bid_volume,
+        "ask_volume": ask_volume,
+        "imbalance": imbalance,  # -1 (all sell pressure) .. +1 (all buy pressure)
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread": (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None,
+    }
+
+
+def fetch_funding_rate_history(limit: int = 8) -> list[Dict[str, Any]]:
+    """Last `limit` funding rate settlements (funding happens every 8h, so
+    8 records = ~2.7 days). Combined with the repeated 30s snapshots this
+    app already takes, this gives both the recent trend (from this call)
+    and a continuously-growing longer history (from observations
+    accumulating over time)."""
+    try:
+        data = _get_json("/fapi/v1/fundingRate", {"symbol": SYMBOL, "limit": limit})
+    except Exception as exc:
+        return [{"error": f"{type(exc).__name__}: {exc}"}]
+    return data if isinstance(data, list) else []
+
+
 def collect_binance_snapshot() -> Dict[str, Any]:
     snapshot: Dict[str, Any] = {"symbol": SYMBOL}
     errors: Dict[str, str] = {}
@@ -40,6 +85,8 @@ def collect_binance_snapshot() -> Dict[str, Any]:
             snapshot[key] = _get_json(path, params)
         except Exception as exc:
             errors[key] = f"{type(exc).__name__}: {exc}"
+    snapshot["order_book"] = fetch_order_book_imbalance()
+    snapshot["funding_rate_history"] = fetch_funding_rate_history()
     intervals = os.getenv("BINANCE_INTERVALS", "1m,5m,15m,1h").split(",")
     snapshot["klines"] = {}
     snapshot["indicators"] = {}

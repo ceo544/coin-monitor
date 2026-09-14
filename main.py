@@ -2389,6 +2389,89 @@ def api_auto_trade_kill_switch() -> Response:
     return jsonify({"ok": True, "auto_trade_enabled": False, "cancel_result": cancel_result})
 
 
+CSV_INDICATOR_INTERVALS = ["1m", "5m", "15m", "1h"]
+CSV_INDICATOR_FIELDS = [
+    "close", "ema20", "ema50", "ema200", "rsi14", "atr14",
+    "macd", "macd_signal", "macd_hist",
+    "bb_upper", "bb_middle", "bb_lower",
+    "stoch_k", "stoch_d", "adx", "plus_di", "minus_di", "cci", "vwap", "taker_buy_ratio",
+    "ichimoku_tenkan", "ichimoku_kijun", "ichimoku_senkou_a", "ichimoku_senkou_b",
+    "ichimoku_chikou", "ichimoku_cloud_top", "ichimoku_cloud_bottom", "ichimoku_price_vs_cloud",
+]
+
+
+def _flatten_indicator_row(ind: Dict[str, Any]) -> Dict[str, Any]:
+    macd_d = ind.get("macd") or {}
+    bb_d = ind.get("bollinger20") or {}
+    stoch_d = ind.get("stochastic") or {}
+    adx_d = ind.get("adx14") or {}
+    taker_d = ind.get("taker_flow") or {}
+    ichi_d = ind.get("ichimoku") or {}
+    return {
+        "close": ind.get("close"), "ema20": ind.get("ema20"), "ema50": ind.get("ema50"), "ema200": ind.get("ema200"),
+        "rsi14": ind.get("rsi14"), "atr14": ind.get("atr14"),
+        "macd": macd_d.get("macd"), "macd_signal": macd_d.get("signal"), "macd_hist": macd_d.get("histogram"),
+        "bb_upper": bb_d.get("upper"), "bb_middle": bb_d.get("middle"), "bb_lower": bb_d.get("lower"),
+        "stoch_k": stoch_d.get("k"), "stoch_d": stoch_d.get("d"),
+        "adx": adx_d.get("adx"), "plus_di": adx_d.get("plus_di"), "minus_di": adx_d.get("minus_di"),
+        "cci": ind.get("cci20"), "vwap": ind.get("vwap"), "taker_buy_ratio": taker_d.get("taker_buy_ratio"),
+        "ichimoku_tenkan": ichi_d.get("tenkan_sen"), "ichimoku_kijun": ichi_d.get("kijun_sen"),
+        "ichimoku_senkou_a": ichi_d.get("senkou_span_a"), "ichimoku_senkou_b": ichi_d.get("senkou_span_b"),
+        "ichimoku_chikou": ichi_d.get("chikou_span"),
+        "ichimoku_cloud_top": ichi_d.get("cloud_top"), "ichimoku_cloud_bottom": ichi_d.get("cloud_bottom"),
+        "ichimoku_price_vs_cloud": ichi_d.get("price_vs_cloud"),
+    }
+
+
+def _flatten_binance_for_csv(binance_json_text: Optional[str]) -> Dict[str, Any]:
+    """Turns one row's nested binance_json blob into flat column_name ->
+    value pairs (per-interval indicators + order book + funding), so the
+    exported CSV can be analyzed directly (e.g. loaded into pandas) without
+    parsing JSON per cell."""
+    out: Dict[str, Any] = {}
+    try:
+        data = json.loads(binance_json_text) if binance_json_text else {}
+    except (TypeError, ValueError):
+        data = {}
+    indicators = data.get("indicators") or {}
+    for interval in CSV_INDICATOR_INTERVALS:
+        flat = _flatten_indicator_row(indicators.get(interval) or {})
+        for field in CSV_INDICATOR_FIELDS:
+            out[f"{interval}_{field}"] = flat.get(field)
+    ob = data.get("order_book") or {}
+    out["order_book_bid_volume"] = ob.get("bid_volume")
+    out["order_book_ask_volume"] = ob.get("ask_volume")
+    out["order_book_imbalance"] = ob.get("imbalance")
+    out["order_book_spread"] = ob.get("spread")
+    premium = data.get("premium_index") or {}
+    out["funding_rate_latest"] = premium.get("lastFundingRate")
+    oi = data.get("open_interest") or {}
+    out["open_interest"] = oi.get("openInterest")
+    return out
+
+
+def _flatten_entries_for_csv(parsed_json_text: Optional[str]) -> Dict[str, Any]:
+    """1st-stage (25%) E-RANG entry/TP/SL for both sides, as flat columns -
+    the same values the Telegram/auto-trade triggers already key off of."""
+    try:
+        parsed = json.loads(parsed_json_text) if parsed_json_text else {}
+    except (TypeError, ValueError):
+        parsed = {}
+    rows = _row_map_from_parsed(parsed) if parsed else {}
+    def first(key: str) -> Any:
+        vals = rows.get(key) or []
+        return vals[0] if vals else None
+    return {
+        "long_entry1": first("long"), "long_tp1": first("tpLong"), "long_sl1": first("slLong"),
+        "short_entry1": first("short"), "short_tp1": first("tpShort"), "short_sl1": first("slShort"),
+    }
+
+
+CSV_INDICATOR_COLUMNS = [f"{iv}_{field}" for iv in CSV_INDICATOR_INTERVALS for field in CSV_INDICATOR_FIELDS]
+CSV_MARKET_COLUMNS = ["order_book_bid_volume", "order_book_ask_volume", "order_book_imbalance", "order_book_spread", "funding_rate_latest", "open_interest"]
+CSV_ENTRY_COLUMNS = ["long_entry1", "long_tp1", "long_sl1", "short_entry1", "short_tp1", "short_sl1"]
+
+
 @app.get("/export.csv")
 def export_csv() -> Response:
     out = io.StringIO()
@@ -2404,6 +2487,15 @@ def export_csv() -> Response:
         "long_label_classes", "long_own_inline_background",
         "short_matched_selector", "short_matched_declaration", "short_ancestor_classes",
         "short_label_classes", "short_own_inline_background",
+        # E-RANG's own 1st-stage entry/TP/SL, flattened (v3.52).
+        *CSV_ENTRY_COLUMNS,
+        # Binance order book / funding / open interest, flattened (v3.52).
+        *CSV_MARKET_COLUMNS,
+        # Full technical-indicator set per timeframe, flattened (v3.52) -
+        # this is the main payload for building an independent long/short
+        # model: EMA/RSI/ATR/MACD/Bollinger/Stochastic/ADX/CCI/VWAP/taker-flow
+        # for each of 1m/5m/15m/1h, one column per (interval, field) pair.
+        *CSV_INDICATOR_COLUMNS,
         "content_sha256", "error", "parsed_json", "binance_json",
     ])
     with db_cursor() as (conn, cur):
@@ -2420,11 +2512,16 @@ def export_csv() -> Response:
             """
         )
         for row in cur:
+            entries = _flatten_entries_for_csv(row[23])
+            market = _flatten_binance_for_csv(row[24])
             writer.writerow([
                 row[0], row[1], row[2], row[3], row[4], row[5],
                 row[6], row[7], row[8], row[9], row[10],
                 row[11], row[12], row[13], row[14], row[15],
                 row[16], row[17], row[18], row[19], row[20],
+                *[entries.get(c) for c in CSV_ENTRY_COLUMNS],
+                *[market.get(c) for c in CSV_MARKET_COLUMNS],
+                *[market.get(c) for c in CSV_INDICATOR_COLUMNS],
                 row[21], row[22],
                 row[23] or "{}",
                 row[24] or "{}",
