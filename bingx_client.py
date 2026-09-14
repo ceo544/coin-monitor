@@ -10,18 +10,25 @@ from typing import Any, Dict, List, Optional
 import requests
 
 BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
+# Module-level defaults, kept for backward compatibility with single-user
+# desktop/env-var setups. In the multi-user app, every function below is
+# called with explicit api_key/api_secret for the current user instead.
 BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
 BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
 BINGX_TIMEOUT = float(os.getenv("BINGX_TIMEOUT", "12"))
 BINGX_RECV_WINDOW = os.getenv("BINGX_RECV_WINDOW", "5000")
 
 
-def bingx_configured() -> bool:
-    return bool(BINGX_API_KEY and BINGX_API_SECRET)
+def bingx_configured(api_key: Optional[str] = None, api_secret: Optional[str] = None) -> bool:
+    key = api_key if api_key is not None else BINGX_API_KEY
+    secret = api_secret if api_secret is not None else BINGX_API_SECRET
+    return bool(key and secret)
 
 
 def configure(api_key: Optional[str] = None, api_secret: Optional[str] = None) -> None:
-    """Updates credentials at runtime (from the Settings page) without a restart."""
+    """Updates the module-level default credentials (single-user/desktop use).
+    Multi-user callers should pass api_key/api_secret directly to each
+    function instead of calling this."""
     global BINGX_API_KEY, BINGX_API_SECRET
     if api_key is not None:
         BINGX_API_KEY = api_key.strip()
@@ -29,7 +36,7 @@ def configure(api_key: Optional[str] = None, api_secret: Optional[str] = None) -
         BINGX_API_SECRET = api_secret.strip()
 
 
-def _sign(params: Dict[str, Any]) -> str:
+def _sign(secret: str, params: Dict[str, Any]) -> str:
     """BingX (like Binance-style futures APIs) signs the alphabetically-sorted
     query string with HMAC-SHA256, hex-encoded. NOTE: this is the standard
     convention for this API family, matched against the docs provided, but
@@ -37,19 +44,28 @@ def _sign(params: Dict[str, Any]) -> str:
     ORDER (endpoint [20] in the docs) or a tiny real order first before
     trusting this with real size."""
     qs = "&".join(f"{k}={params[k]}" for k in sorted(params.keys()))
-    return hmac.new(BINGX_API_SECRET.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.new(secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _request(method: str, path: str, params: Optional[Dict[str, Any]] = None, signed: bool = True) -> Any:
+def _request(
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    signed: bool = True,
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
+) -> Any:
+    key = (api_key if api_key is not None else BINGX_API_KEY) or ""
+    secret = (api_secret if api_secret is not None else BINGX_API_SECRET) or ""
     params = {k: v for k, v in (params or {}).items() if v is not None}
     headers = {}
     if signed:
-        if not bingx_configured():
-            raise RuntimeError("BINGX_API_KEY / BINGX_API_SECRET not set")
+        if not (key and secret):
+            raise RuntimeError("BingX API key/secret not set")
         params["timestamp"] = str(int(time.time() * 1000))
         params.setdefault("recvWindow", BINGX_RECV_WINDOW)
-        params["signature"] = _sign(params)
-        headers["X-BX-APIKEY"] = BINGX_API_KEY
+        params["signature"] = _sign(secret, params)
+        headers["X-BX-APIKEY"] = key
     url = BINGX_BASE_URL + path
     if method == "GET":
         resp = requests.get(url, params=params, headers=headers, timeout=BINGX_TIMEOUT)
@@ -86,8 +102,8 @@ def fetch_current_price(symbol: str) -> Optional[float]:
 
 # --- Account / positions (signed, read-only) ---------------------------------
 
-def fetch_balance() -> List[Dict[str, Any]]:
-    data = _request("GET", "/openApi/swap/v3/user/balance")
+def fetch_balance(api_key: Optional[str] = None, api_secret: Optional[str] = None) -> List[Dict[str, Any]]:
+    data = _request("GET", "/openApi/swap/v3/user/balance", api_key=api_key, api_secret=api_secret)
     if isinstance(data, dict):
         # Some BingX responses wrap the balance list/object under "balance".
         inner = data.get("balance")
@@ -99,56 +115,75 @@ def fetch_balance() -> List[Dict[str, Any]]:
     return data or []
 
 
-def fetch_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-    data = _request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
+def fetch_positions(
+    symbol: Optional[str] = None, api_key: Optional[str] = None, api_secret: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    data = _request("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol}, api_key=api_key, api_secret=api_secret)
     return data or []
 
 
-def fetch_open_orders(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-    data = _request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
+def fetch_open_orders(
+    symbol: Optional[str] = None, api_key: Optional[str] = None, api_secret: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    data = _request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol}, api_key=api_key, api_secret=api_secret)
     if isinstance(data, dict):
         return data.get("orders") or []
     return data or []
 
 
-def fetch_order_history(symbol: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
-    data = _request("GET", "/openApi/swap/v2/trade/allOrders", {"symbol": symbol, "limit": limit})
+def fetch_order_history(
+    symbol: Optional[str] = None, limit: int = 100,
+    api_key: Optional[str] = None, api_secret: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    data = _request(
+        "GET", "/openApi/swap/v2/trade/allOrders", {"symbol": symbol, "limit": limit},
+        api_key=api_key, api_secret=api_secret,
+    )
     if isinstance(data, dict):
         return data.get("orders") or []
     return data or []
 
 
-def fetch_fills(symbol: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
-    data = _request("GET", "/openApi/swap/v2/trade/fillHistory", {"symbol": symbol, "limit": limit})
+def fetch_fills(
+    symbol: Optional[str] = None, limit: int = 100,
+    api_key: Optional[str] = None, api_secret: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    data = _request(
+        "GET", "/openApi/swap/v2/trade/fillHistory", {"symbol": symbol, "limit": limit},
+        api_key=api_key, api_secret=api_secret,
+    )
     if isinstance(data, dict):
         return data.get("fill_orders") or data.get("fills") or []
     return data or []
 
 
-def fetch_leverage(symbol: str) -> Dict[str, Any]:
-    return _request("GET", "/openApi/swap/v2/trade/leverage", {"symbol": symbol}) or {}
+def fetch_leverage(symbol: str, api_key: Optional[str] = None, api_secret: Optional[str] = None) -> Dict[str, Any]:
+    return _request("GET", "/openApi/swap/v2/trade/leverage", {"symbol": symbol}, api_key=api_key, api_secret=api_secret) or {}
 
 
-def fetch_position_mode() -> Dict[str, Any]:
+def fetch_position_mode(api_key: Optional[str] = None, api_secret: Optional[str] = None) -> Dict[str, Any]:
     """dualSidePosition: true = Hedge Mode (LONG and SHORT can be open at the
     same time, required for the positionSide=LONG/SHORT order style this
     client uses), false = One-Way Mode."""
-    return _request("GET", "/openApi/swap/v1/positionSide/dual") or {}
+    return _request("GET", "/openApi/swap/v1/positionSide/dual", api_key=api_key, api_secret=api_secret) or {}
 
 
 # --- Trading (signed, WRITES REAL ORDERS - handle with care) -----------------
 
-def set_leverage(symbol: str, side: str, leverage: int) -> Dict[str, Any]:
+def set_leverage(
+    symbol: str, side: str, leverage: int,
+    api_key: Optional[str] = None, api_secret: Optional[str] = None,
+) -> Dict[str, Any]:
     """side: 'LONG' or 'SHORT' (matches positionSide)."""
     return _request("POST", "/openApi/swap/v2/trade/leverage", {
         "symbol": symbol, "side": side, "leverage": leverage,
-    }) or {}
+    }, api_key=api_key, api_secret=api_secret) or {}
 
 
-def set_position_mode(hedge_mode: bool) -> Dict[str, Any]:
+def set_position_mode(hedge_mode: bool, api_key: Optional[str] = None, api_secret: Optional[str] = None) -> Dict[str, Any]:
     return _request("POST", "/openApi/swap/v1/positionSide/dual", {
         "dualSidePosition": "true" if hedge_mode else "false",
-    }) or {}
+    }, api_key=api_key, api_secret=api_secret) or {}
 
 
 def _tp_sl_payload(stop_price: float, is_take_profit: bool) -> str:
@@ -173,6 +208,8 @@ def create_order(
     take_profit_price: Optional[float] = None,
     stop_loss_price: Optional[float] = None,
     client_order_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Places a real order. LIMIT orders require `price`. take_profit_price/
     stop_loss_price, if given, are attached to the same order so the exchange
@@ -195,10 +232,10 @@ def create_order(
         params["stopLoss"] = _tp_sl_payload(stop_loss_price, is_take_profit=False)
     if client_order_id:
         params["clientOrderId"] = client_order_id
-    return _request("POST", "/openApi/swap/v2/trade/order", params) or {}
+    return _request("POST", "/openApi/swap/v2/trade/order", params, api_key=api_key, api_secret=api_secret) or {}
 
 
-def test_order(**kwargs: Any) -> Dict[str, Any]:
+def test_order(api_key: Optional[str] = None, api_secret: Optional[str] = None, **kwargs: Any) -> Dict[str, Any]:
     """Same params as create_order, but validated by BingX WITHOUT actually
     placing it - use this to sanity-check params (min quantity, precision,
     etc.) before ever sending a real order."""
@@ -215,26 +252,29 @@ def test_order(**kwargs: Any) -> Dict[str, Any]:
     if order_type == "LIMIT" and price is not None:
         params["price"] = price
         params["timeInForce"] = "GTC"
-    return _request("POST", "/openApi/swap/v2/trade/order/test", params) or {}
+    return _request("POST", "/openApi/swap/v2/trade/order/test", params, api_key=api_key, api_secret=api_secret) or {}
 
 
-def cancel_order(symbol: str, order_id: Optional[str] = None, client_order_id: Optional[str] = None) -> Dict[str, Any]:
+def cancel_order(
+    symbol: str, order_id: Optional[str] = None, client_order_id: Optional[str] = None,
+    api_key: Optional[str] = None, api_secret: Optional[str] = None,
+) -> Dict[str, Any]:
     if not order_id and not client_order_id:
         raise ValueError("cancel_order needs order_id or client_order_id")
     return _request("DELETE", "/openApi/swap/v2/trade/order", {
         "symbol": symbol, "orderId": order_id, "clientOrderId": client_order_id,
-    }) or {}
+    }, api_key=api_key, api_secret=api_secret) or {}
 
 
-def cancel_all_open_orders(symbol: str) -> Dict[str, Any]:
+def cancel_all_open_orders(symbol: str, api_key: Optional[str] = None, api_secret: Optional[str] = None) -> Dict[str, Any]:
     """Emergency-stop helper: cancels every open (unfilled) order for a
     symbol in one call."""
-    orders = fetch_open_orders(symbol)
+    orders = fetch_open_orders(symbol, api_key=api_key, api_secret=api_secret)
     results = []
     for o in orders:
         try:
             oid = o.get("orderId")
-            results.append(cancel_order(symbol, order_id=oid))
+            results.append(cancel_order(symbol, order_id=oid, api_key=api_key, api_secret=api_secret))
         except Exception as exc:
             results.append({"error": f"{type(exc).__name__}: {exc}", "orderId": o.get("orderId")})
     return {"cancelled": len(results), "results": results}

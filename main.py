@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, Response, jsonify, redirect, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from parser import parse_page
 from signal_analysis import signal_snapshot, summarize_signal_records
@@ -74,6 +75,11 @@ APP_VERSION = "3.40.0"
 # as a fallback for anyone who prefers them (e.g. an advanced Railway setup),
 # but the Settings page is the primary way to configure a desktop install.
 TARGET_URL = os.getenv("TARGET_URL", "https://e-rang.kr/api/coin.php")
+# E-RANG (ADrang) started requiring a logged-in session to see coin.php's
+# data - these credentials are used to log in once and keep a persistent
+# session (cookie jar), rather than scraping anonymously.
+ERANG_USERNAME = os.getenv("ERANG_USERNAME", "").strip()
+ERANG_PASSWORD = os.getenv("ERANG_PASSWORD", "")
 INTERVAL = max(1, int(os.getenv("INTERVAL_SECONDS", "30")))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
 USER_AGENT = os.getenv("USER_AGENT", "CoinMonitor/2.0 (+public-page-observation)")
@@ -97,29 +103,12 @@ BINANCE_SNAPSHOT_INTERVAL = float(os.getenv("BINANCE_SNAPSHOT_INTERVAL_SECONDS",
 BITGET_POLL_INTERVAL = float(os.getenv("BITGET_POLL_INTERVAL_SECONDS", "5"))
 # Telegram alert on Long/Short signal turning ON (edge-triggered: fires once
 # when it flips from OFF to ON, not on every 30s poll while it stays ON).
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TELEGRAM_NOTIFY_OFF = os.getenv("TELEGRAM_NOTIFY_OFF", "true").lower() not in {"0", "false", "no", "off"}
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "").strip()
-# Auto-trading (BingX) defaults - overridden by apply_settings() from the
-# Settings page. AUTO_TRADE_ENABLED defaults to False and AUTO_TRADE_DRY_RUN
-# defaults to True so nothing trades for real until someone explicitly opts
-# in on both counts.
-AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "false").lower() not in {"0", "false", "no", "off"}
-AUTO_TRADE_DRY_RUN = os.getenv("AUTO_TRADE_DRY_RUN", "true").lower() not in {"0", "false", "no", "off"}
-AUTO_TRADE_SYMBOL = os.getenv("AUTO_TRADE_SYMBOL", "BTC-USDT")
-AUTO_TRADE_LEVERAGE = int(os.getenv("AUTO_TRADE_LEVERAGE", "5"))
-AUTO_TRADE_MARGIN_USDT = float(os.getenv("AUTO_TRADE_MARGIN_USDT", "50"))
-AUTO_TRADE_MAX_DAILY_TRADES = int(os.getenv("AUTO_TRADE_MAX_DAILY_TRADES", "10"))
-AUTO_TRADE_MAX_DAILY_LOSS_USDT = float(os.getenv("AUTO_TRADE_MAX_DAILY_LOSS_USDT", "100"))
+# Telegram/exchange/auto-trade settings are now per-user (see
+# USER_SETTINGS_SCHEMA below) rather than single global values - each
+# logged-in user has their own copy in the user_settings table.
 GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip().strip("/")
 KST = ZoneInfo("Asia/Seoul")
 
-# Simple single-user login so the dashboard/API/CSV export aren't publicly
-# viewable. Defaults match what was requested, but should be changed via the
-# in-app Settings page for a real install rather than left as-is.
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "1Q2w3e4r5t!!")
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "").strip()
 
 app = Flask(__name__)
@@ -128,14 +117,14 @@ app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 
 # Paths reachable without logging in. /healthz stays public for platform
 # health checks (e.g. a Railway healthcheckPath) that can't submit a login.
-PUBLIC_PATHS = {"/login", "/healthz"}
+PUBLIC_PATHS = {"/login", "/register", "/healthz"}
 
 
 @app.before_request
 def _require_login() -> Any:
     if request.path in PUBLIC_PATHS:
         return None
-    if session.get("authenticated"):
+    if session.get("user_id"):
         return None
     if request.path.startswith("/api/") or request.path == "/export.csv":
         return jsonify({"ok": False, "error": "login required"}), 401
@@ -155,6 +144,8 @@ input:focus{outline:2px solid var(--blue)}
 button{width:100%;padding:12px;border-radius:10px;border:none;background:var(--blue);color:#04101f;font-weight:900;font-size:15px;cursor:pointer}
 button:hover{filter:brightness(1.08)}
 .error{color:var(--red);font-size:13px;margin:-10px 0 16px}
+.altlink{text-align:center;margin-top:16px;font-size:13px;color:var(--muted)}
+.altlink a{color:var(--blue);text-decoration:none;font-weight:700}
 </style></head><body>
 <div class="card">
 <h1>Coin Monitor</h1>
@@ -168,6 +159,41 @@ button:hover{filter:brightness(1.08)}
 <input id="p" name="password" type="password" autocomplete="current-password" required>
 <button type="submit">로그인</button>
 </form>
+<div class="altlink">계정이 없으신가요? <a href="/register">회원가입</a></div>
+</div>
+</body></html>
+"""
+
+REGISTER_HTML = r"""
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coin Monitor · 회원가입</title>
+<style>
+:root{--bg:#07101f;--panel:#0e1b31;--line:#243b5f;--text:#f4f7ff;--muted:#8fa7c9;--blue:#38a5ff;--red:#ff5364}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(circle at 20% 0,#102442 0,#07101f 45%);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+.card{background:linear-gradient(145deg,rgba(16,31,56,.98),rgba(10,24,44,.98));border:1px solid var(--line);border-radius:17px;padding:32px;box-shadow:0 14px 32px #0006;width:100%;max-width:360px}
+h1{margin:0 0 6px;font-size:22px}.sub{color:var(--muted);font-size:13px;margin-bottom:22px}
+label{display:block;font-size:13px;color:#a9bfdf;font-weight:700;margin-bottom:6px}
+input{width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:#0a172b;color:var(--text);font-size:15px;margin-bottom:16px}
+input:focus{outline:2px solid var(--blue)}
+button{width:100%;padding:12px;border-radius:10px;border:none;background:var(--blue);color:#04101f;font-weight:900;font-size:15px;cursor:pointer}
+button:hover{filter:brightness(1.08)}
+.error{color:var(--red);font-size:13px;margin:-10px 0 16px}
+.altlink{text-align:center;margin-top:16px;font-size:13px;color:var(--muted)}
+.altlink a{color:var(--blue);text-decoration:none;font-weight:700}
+</style></head><body>
+<div class="card">
+<h1>회원가입</h1>
+<div class="sub">본인만의 아이디로 텔레그램·API 키·자동매매 설정을 따로 저장합니다.</div>
+{ERROR_HTML}
+<form method="post" action="/register">
+<label for="u">아이디</label>
+<input id="u" name="username" autocomplete="username" required autofocus minlength="3" maxlength="32">
+<label for="p">비밀번호</label>
+<input id="p" name="password" type="password" autocomplete="new-password" required minlength="6">
+<label for="p2">비밀번호 확인</label>
+<input id="p2" name="password2" type="password" autocomplete="new-password" required minlength="6">
+<button type="submit">가입하기</button>
+</form>
+<div class="altlink">이미 계정이 있으신가요? <a href="/login">로그인</a></div>
 </div>
 </body></html>
 """
@@ -187,14 +213,47 @@ def login_submit() -> Response:
     next_path = request.form.get("next") or "/"
     if not next_path.startswith("/"):
         next_path = "/"
-    # Constant-time comparison to avoid leaking password length/prefix via timing.
-    valid = hmac.compare_digest(username, ADMIN_USERNAME) and hmac.compare_digest(password, ADMIN_PASSWORD)
+    user = get_user_by_username(username)
+    # Always run check_password_hash even on a missing user (against a dummy
+    # hash) so a nonexistent-username response takes the same time as a
+    # wrong-password one - avoids leaking which usernames exist via timing.
+    valid = user is not None and check_password_hash(user["password_hash"], password)
     if valid:
         session.clear()
-        session["authenticated"] = True
+        session["user_id"] = user["id"]
+        session["username"] = user["username"]
         session.permanent = True
         return redirect(next_path)
     return redirect(url_for("login_page", error="1", next=next_path))
+
+
+@app.get("/register")
+def register_page() -> str:
+    error = request.args.get("error")
+    error_html = f'<div class="error">{html.escape(error)}</div>' if error else ""
+    return REGISTER_HTML.replace("{ERROR_HTML}", error_html)
+
+
+@app.post("/register")
+def register_submit() -> Response:
+    username = (request.form.get("username") or "").strip()
+    password = request.form.get("password") or ""
+    password2 = request.form.get("password2") or ""
+    if len(username) < 3 or len(username) > 32 or not re.match(r"^[A-Za-z0-9_.-]+$", username):
+        return redirect(url_for("register_page", error="아이디는 3~32자, 영문/숫자/._-만 사용할 수 있습니다."))
+    if len(password) < 6:
+        return redirect(url_for("register_page", error="비밀번호는 6자 이상이어야 합니다."))
+    if password != password2:
+        return redirect(url_for("register_page", error="비밀번호가 서로 다릅니다."))
+    if get_user_by_username(username) is not None:
+        return redirect(url_for("register_page", error="이미 사용 중인 아이디입니다."))
+    user_id = create_user(username, password)
+    session.clear()
+    session["user_id"] = user_id
+    session["username"] = username
+    session.permanent = True
+    log("AUTH", f"new user registered: {username} (id={user_id})")
+    return redirect("/")
 
 
 @app.get("/logout")
@@ -226,18 +285,17 @@ a.btn{color:var(--muted);text-decoration:none;font-size:13px}
 .saved{background:rgba(53,226,154,.12);border:1px solid #35e29a55;color:var(--green);padding:10px 14px;border-radius:10px;font-size:13px;margin-bottom:16px}
 </style></head><body><div class="wrap">
 <h1>설정</h1>
-<div class="sub">여기서 바꾼 값은 저장 즉시 적용됩니다 (재시작 불필요).</div>
+<div class="sub">{USERNAME}님으로 로그인됨 · 여기서 바꾼 값은 저장 즉시 적용됩니다 (재시작 불필요). · <a class="btn" href="/logout" style="text-decoration:underline">로그아웃</a></div>
 {SAVED_HTML}
 <form method="post" action="/settings">
-<div class="card"><h2>로그인 계정</h2>{FIELDS_ACCOUNT}</div>
-<div class="card"><h2>E-RANG 수집 / 진입 임박 알림</h2>{FIELDS_COLLECT}</div>
-<div class="card"><h2>텔레그램 알림</h2>{FIELDS_TELEGRAM}</div>
-<div class="card"><h2>Bitget API (읽기 전용 키 권장)</h2>{FIELDS_BITGET}</div>
-<div class="card"><h2>업데이트 확인</h2><div class="hint" style="margin-top:-6px">현재 버전: {APP_VERSION} · GitHub 저장소를 입력하면 새 버전이 나왔을 때 대시보드에 알림이 뜹니다 (자동 다운로드/설치는 안 합니다 - 링크만 보여드립니다).</div>{FIELDS_UPDATE}</div>
-<div class="card" style="border-color:#ff536355"><h2 style="color:#ff8a94">⚠️ 자동매매 (BingX · 실제 주문이 나갈 수 있습니다)</h2><div class="hint" style="margin-top:-6px">드라이런(모의) 모드를 꺼야만 실제 주문이 나갑니다. 처음엔 드라이런 상태로 며칠 로그를 확인해보시길 권장합니다.</div>{FIELDS_AUTOTRADE}</div>
+<div class="card"><h2>E-RANG 수집 / 진입 임박 알림 <span class="hint" style="margin:0">(모든 회원 공통)</span></h2>{FIELDS_COLLECT}</div>
+<div class="card"><h2>텔레그램 알림 <span class="hint" style="margin:0">(내 계정 전용)</span></h2>{FIELDS_TELEGRAM}</div>
+<div class="card"><h2>Bitget API (읽기 전용 키 권장) <span class="hint" style="margin:0">(내 계정 전용)</span></h2>{FIELDS_BITGET}</div>
+<div class="card"><h2>업데이트 확인 <span class="hint" style="margin:0">(모든 회원 공통)</span></h2><div class="hint" style="margin-top:-6px">현재 버전: {APP_VERSION} · GitHub 저장소를 입력하면 새 버전이 나왔을 때 대시보드에 알림이 뜹니다 (자동 다운로드/설치는 안 합니다 - 링크만 보여드립니다).</div>{FIELDS_UPDATE}</div>
+<div class="card" style="border-color:#ff536355"><h2 style="color:#ff8a94">⚠️ 자동매매 (BingX · 실제 주문이 나갈 수 있습니다) <span class="hint" style="margin:0">(내 계정 전용)</span></h2><div class="hint" style="margin-top:-6px">드라이런(모의) 모드를 꺼야만 실제 주문이 나갑니다. 처음엔 드라이런 상태로 며칠 로그를 확인해보시길 권장합니다.</div>{FIELDS_AUTOTRADE}</div>
 <div class="actions"><button type="submit">저장</button><a class="btn" href="/">← 대시보드로</a></div>
 </form>
-<div class="card" style="border-color:#ff536355;margin-top:16px"><h2 style="color:#ff8a94">🛑 긴급 정지</h2><div class="hint" style="margin-top:-6px">자동매매를 즉시 끄고, BingX에 걸려있는 미체결 주문을 전부 취소합니다. (이미 체결된 포지션 자체는 자동으로 청산하지 않습니다 - TP/SL이 계속 관리합니다.)</div><button type="button" id="killSwitchBtn" style="background:#ff5364;color:#1a0508">지금 즉시 정지</button></div>
+<div class="card" style="border-color:#ff536355;margin-top:16px"><h2 style="color:#ff8a94">🛑 긴급 정지</h2><div class="hint" style="margin-top:-6px">내 자동매매를 즉시 끄고, 내 BingX에 걸려있는 미체결 주문을 전부 취소합니다. (이미 체결된 포지션 자체는 자동으로 청산하지 않습니다 - TP/SL이 계속 관리합니다.)</div><button type="button" id="killSwitchBtn" style="background:#ff5364;color:#1a0508">지금 즉시 정지</button></div>
 <script>
 document.getElementById('killSwitchBtn').onclick = async () => {
   if (!confirm('자동매매를 즉시 끄고 미체결 주문을 전부 취소합니다. 계속할까요?')) return;
@@ -259,8 +317,7 @@ document.getElementById('killSwitchBtn').onclick = async () => {
 """
 
 
-def _settings_field_html(key: str, label: str, input_type: str, secret: bool) -> str:
-    current = get_setting(key)
+def _settings_field_html(key: str, label: str, input_type: str, secret: bool, current: str) -> str:
     if input_type == "checkbox":
         checked = "checked" if str(current).lower() not in {"0", "false", "no", "off", ""} else ""
         return (
@@ -277,10 +334,10 @@ def _settings_field_html(key: str, label: str, input_type: str, secret: bool) ->
 
 @app.get("/settings")
 def settings_page() -> str:
+    user_id = session["user_id"]
     groups = {
-        "FIELDS_ACCOUNT": {"ADMIN_USERNAME", "ADMIN_PASSWORD"},
-        "FIELDS_COLLECT": {"TARGET_URL", "INTERVAL_SECONDS", "ENTRY_PROXIMITY_USD", "DASHBOARD_URL"},
-        "FIELDS_TELEGRAM": {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_NOTIFY_OFF"},
+        "FIELDS_COLLECT": {"TARGET_URL", "ERANG_USERNAME", "ERANG_PASSWORD", "INTERVAL_SECONDS", "ENTRY_PROXIMITY_USD"},
+        "FIELDS_TELEGRAM": {"DASHBOARD_URL", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_NOTIFY_OFF"},
         "FIELDS_BITGET": {"BITGET_API_KEY", "BITGET_API_SECRET", "BITGET_API_PASSPHRASE", "BITGET_CATEGORY"},
         "FIELDS_AUTOTRADE": {
             "AUTO_TRADE_ENABLED", "AUTO_TRADE_DRY_RUN", "AUTO_TRADE_SYMBOL", "AUTO_TRADE_LEVERAGE",
@@ -289,15 +346,18 @@ def settings_page() -> str:
         },
         "FIELDS_UPDATE": {"GITHUB_REPO"},
     }
+    global_keys = {k for k, _l, _t, _d, _s in GLOBAL_SETTINGS_SCHEMA}
     rendered = {g: "" for g in groups}
     for key, label, input_type, _default, secret in SETTINGS_SCHEMA:
+        current = get_setting(key) if key in global_keys else get_user_setting(user_id, key)
         for group, keys in groups.items():
             if key in keys:
-                rendered[group] += _settings_field_html(key, label, input_type, secret)
+                rendered[group] += _settings_field_html(key, label, input_type, secret, current)
     saved_html = '<div class="saved">저장했습니다.</div>' if request.args.get("saved") else ""
     out = SETTINGS_PAGE_HTML
     out = out.replace("{SAVED_HTML}", saved_html)
     out = out.replace("{APP_VERSION}", html.escape(APP_VERSION))
+    out = out.replace("{USERNAME}", html.escape(session.get("username", "")))
     for group, content in rendered.items():
         out = out.replace("{" + group + "}", content)
     return out
@@ -305,16 +365,24 @@ def settings_page() -> str:
 
 @app.post("/settings")
 def settings_submit() -> Response:
+    user_id = session["user_id"]
+    global_keys = {k for k, _l, _t, _d, _s in GLOBAL_SETTINGS_SCHEMA}
     for key, _label, input_type, _default, secret in SETTINGS_SCHEMA:
         if input_type == "checkbox":
-            save_setting(key, "true" if request.form.get(key) else "false")
+            value = "true" if request.form.get(key) else "false"
+            if key in global_keys:
+                save_setting(key, value)
+            else:
+                save_user_setting(user_id, key, value)
             continue
         value = request.form.get(key, "")
         if secret and not value:
             continue  # blank secret field means "keep the existing value", not "clear it"
-        save_setting(key, value)
+        if key in global_keys:
+            save_setting(key, value)
+        else:
+            save_user_setting(user_id, key, value)
     apply_settings()
-    start_bitget_loop_once()  # in case Bitget keys were just entered for the first time
     try:
         check_for_update()
     except Exception:
@@ -366,39 +434,97 @@ live_binance_state: Dict[str, Any] = {
     "updated_at": None,
     "last_error": None,
 }
-bitget_state: Dict[str, Any] = {
-    "started": False,
-    "configured": False,
-    "positions": [],
-    "fills": [],
-    "orders": [],
-    "account": {},
-    "total_unrealized_pnl": None,
-    "live_open_positions_pnl": None,
-    "total_equity": None,
-    "win_rate_pct": None,
-    "win_count": 0,
-    "loss_count": 0,
-    "trade_count": 0,
-    "realized_pnl_total": None,
-    "combined_pnl": None,
-    "updated_at": None,
-    "last_error": None,
-}
-telegram_state: Dict[str, Any] = {
-    "enabled": False,  # set once at boot after checking token/chat id
-    "last_long_signal": None,   # None = unknown yet (e.g. right after boot)
-    "last_short_signal": None,
-    "long_active_color": None,   # last known "on" color, kept even after it turns off, so the OFF message can reference what it was
-    "short_active_color": None,
-    "long_activated_at": None,  # ISO timestamp of when it turned ON, cleared when it turns OFF, used to report how long it stayed ON
-    "short_activated_at": None,
-    "long_near_entry": False,   # edge-trigger flags for the "진입 임박" proximity alert, so it fires once per approach rather than every 30s while price lingers nearby
-    "short_near_entry": False,
-    "last_sent_at": None,
-    "last_error": None,
-    "sent_count": 0,
-}
+bitget_states: Dict[int, Dict[str, Any]] = {}
+
+
+def _default_bitget_state() -> Dict[str, Any]:
+    return {
+        "configured": False,
+        "positions": [], "fills": [], "orders": [], "account": {},
+        "total_unrealized_pnl": None, "live_open_positions_pnl": None, "total_equity": None,
+        "win_rate_pct": None, "win_count": 0, "loss_count": 0, "trade_count": 0,
+        "realized_pnl_total": None, "combined_pnl": None,
+        "updated_at": None, "last_error": None,
+        "_last_fetch_monotonic": None,
+    }
+
+
+def get_bitget_state_for_user(user_id: int, force: bool = False) -> Dict[str, Any]:
+    """Bitget data is fetched on-demand for whichever user is viewing the
+    dashboard (each user has their own Bitget keys), throttled to at most
+    once per BITGET_POLL_INTERVAL seconds so rapid dashboard polling (every
+    1s) doesn't turn into rapid-fire real Bitget API calls."""
+    state = bitget_states.setdefault(user_id, _default_bitget_state())
+    settings = get_all_user_settings(user_id)
+    api_key = settings["BITGET_API_KEY"]
+    api_secret = settings["BITGET_API_SECRET"]
+    api_passphrase = settings["BITGET_API_PASSPHRASE"]
+    category = settings["BITGET_CATEGORY"] or "USDT-FUTURES"
+    configured = bool(bitget_client and bitget_client.bitget_configured(api_key, api_secret, api_passphrase))
+    state["configured"] = configured
+    if not configured:
+        return state
+    now = time.monotonic()
+    last_fetch = state.get("_last_fetch_monotonic")
+    if not force and last_fetch is not None and (now - last_fetch) < BITGET_POLL_INTERVAL:
+        return state
+    try:
+        summary = bitget_client.fetch_summary(
+            api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase, category=category,
+        )
+        state["fills"] = summary.get("fills") or []
+        state["orders"] = summary.get("orders") or []
+        state["account"] = summary.get("account") or {}
+        state["positions"] = summary.get("positions") or []
+        state["total_unrealized_pnl"] = summary.get("total_unrealized_pnl")
+        state["live_open_positions_pnl"] = summary.get("live_open_positions_pnl")
+        state["total_equity"] = summary.get("total_equity")
+        state["win_rate_pct"] = summary.get("win_rate_pct")
+        state["win_count"] = summary.get("win_count") or 0
+        state["loss_count"] = summary.get("loss_count") or 0
+        state["trade_count"] = summary.get("trade_count") or 0
+        state["realized_pnl_total"] = summary.get("realized_pnl_total")
+        state["combined_pnl"] = summary.get("combined_pnl")
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        state["last_error"] = summary.get("errors") or None
+    except Exception as exc:
+        state["last_error"] = f"{type(exc).__name__}: {exc}"
+        log("BITGET_ERROR", f"user {user_id}: {state['last_error']}")
+    state["_last_fetch_monotonic"] = now
+    return state
+
+
+def _public_bitget_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in state.items() if not k.startswith("_")}
+
+
+def _new_telegram_state() -> Dict[str, Any]:
+    return {
+        "enabled": False,  # set from this user's own Telegram token/chat id
+        "last_long_signal": None,   # None = unknown yet (e.g. right after boot/first check for this user)
+        "last_short_signal": None,
+        "long_active_color": None,   # last known "on" color, kept even after it turns off, so the OFF message can reference what it was
+        "short_active_color": None,
+        "long_activated_at": None,  # ISO timestamp of when it turned ON, cleared when it turns OFF, used to report how long it stayed ON
+        "short_activated_at": None,
+        "long_near_entry": False,   # edge-trigger flags for the "진입 임박" proximity alert, so it fires once per approach rather than every 30s while price lingers nearby
+        "short_near_entry": False,
+        "last_sent_at": None,
+        "last_error": None,
+        "sent_count": 0,
+    }
+
+
+# Per-user Telegram edge-trigger state, keyed by user_id - each user's ON/OFF
+# tracking and "진입 임박" proximity flags are independent of everyone else's.
+telegram_states: Dict[int, Dict[str, Any]] = {}
+
+
+def _get_telegram_state(user_id: int) -> Dict[str, Any]:
+    if user_id not in telegram_states:
+        telegram_states[user_id] = _new_telegram_state()
+    return telegram_states[user_id]
+
 # How close current price must get to the 1st-stage (25%) entry price to
 # trigger a "진입 임박" (entry imminent) alert, in raw price units (USD for BTC).
 ENTRY_PROXIMITY_USD = float(os.getenv("ENTRY_PROXIMITY_USD", "100"))
@@ -474,8 +600,30 @@ def init_db() -> None:
         cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT,
+                PRIMARY KEY (user_id, key),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS auto_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 side TEXT NOT NULL,
                 action TEXT NOT NULL,
@@ -493,23 +641,76 @@ def init_db() -> None:
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_auto_trades_created_at ON auto_trades(created_at DESC)")
+        # Backward-compatible migration for pre-multi-user databases that
+        # already have an auto_trades table without user_id - must run
+        # BEFORE the index below, which references that column.
+        try:
+            cur.execute("ALTER TABLE auto_trades ADD COLUMN user_id INTEGER")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_auto_trades_user ON auto_trades(user_id, created_at DESC)")
     log("DB", "schema ready")
+    _seed_first_admin_user()
+
+
+def _seed_first_admin_user() -> None:
+    """On a brand-new database (or one upgraded from the old single-admin
+    version), auto-creates a first user from ADMIN_USERNAME/ADMIN_PASSWORD
+    (env vars, or the documented defaults) so nobody who already has this
+    app running loses access when it upgrades to multi-user accounts."""
+    with db_cursor() as (conn, cur):
+        cur.execute("SELECT COUNT(*) FROM users")
+        if cur.fetchone()[0] > 0:
+            return
+        username = os.getenv("ADMIN_USERNAME", "admin")
+        password = os.getenv("ADMIN_PASSWORD", "1Q2w3e4r5t!!")
+        cur.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, generate_password_hash(password)),
+        )
+        new_id = cur.lastrowid
+        log("BOOT", f"seeded first user '{username}' (id={new_id}) - log in with this, then register more accounts from /register")
+        # Carry over any legacy global settings (from the single-admin era)
+        # into this first user's own per-user settings, so upgrading doesn't
+        # wipe out an existing Telegram/Bitget/BingX/auto-trade setup.
+        legacy_keys = [
+            "DASHBOARD_URL", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_NOTIFY_OFF",
+            "BITGET_API_KEY", "BITGET_API_SECRET", "BITGET_API_PASSPHRASE", "BITGET_CATEGORY",
+            "AUTO_TRADE_ENABLED", "AUTO_TRADE_DRY_RUN", "AUTO_TRADE_SYMBOL", "AUTO_TRADE_LEVERAGE",
+            "AUTO_TRADE_MARGIN_USDT", "AUTO_TRADE_MAX_DAILY_TRADES", "AUTO_TRADE_MAX_DAILY_LOSS_USDT",
+            "BINGX_API_KEY", "BINGX_API_SECRET",
+        ]
+        cur.execute(f"SELECT key, value FROM settings WHERE key IN ({','.join('?' * len(legacy_keys))})", legacy_keys)
+        for key, value in cur.fetchall():
+            cur.execute(
+                "INSERT INTO user_settings(user_id, key, value) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value",
+                (new_id, key, value),
+            )
 
 
 # ---------------------------------------------------------------------------
-# Settings: a simple key/value store in SQLite, edited from the in-app
-# Settings page (/settings) rather than environment variables - the primary
-# configuration path for a desktop install. Each entry here is
-# (key, label, input_type, default, secret). "secret" fields render as
-# type="password" and are masked (not pre-filled) in the form for anyone
-# glancing at the screen, but ARE still submitted/saved normally.
+# Settings are split into two scopes:
+#  - GLOBAL_SETTINGS_SCHEMA: one shared value for the whole app (the E-RANG
+#    collector itself is a single shared background loop - it doesn't make
+#    sense per-user).
+#  - USER_SETTINGS_SCHEMA: each logged-in user has their own copy (Telegram
+#    token/chat, exchange API keys, auto-trade config) stored in
+#    user_settings, keyed by user_id.
+# Each entry is (key, label, input_type, default, secret). "secret" fields
+# render as type="password" and are masked (not pre-filled) in the form, but
+# ARE still submitted/saved normally.
 # ---------------------------------------------------------------------------
-SETTINGS_SCHEMA = [
-    ("ADMIN_USERNAME", "관리자 아이디", "text", "admin", False),
-    ("ADMIN_PASSWORD", "관리자 비밀번호", "password", "1Q2w3e4r5t!!", True),
+GLOBAL_SETTINGS_SCHEMA = [
     ("TARGET_URL", "E-RANG 조회 주소", "text", "https://e-rang.kr/api/coin.php", False),
+    ("ERANG_USERNAME", "E-RANG(ADrang) 로그인 아이디", "text", "", False),
+    ("ERANG_PASSWORD", "E-RANG(ADrang) 로그인 비밀번호", "password", "", True),
     ("INTERVAL_SECONDS", "수집 주기 (초)", "number", "30", False),
     ("ENTRY_PROXIMITY_USD", "진입 임박 알림 기준 (달러)", "number", "100", False),
+    ("GITHUB_REPO", "새 버전 확인용 GitHub 저장소 (예: yourname/coin-monitor)", "text", "", False),
+]
+
+USER_SETTINGS_SCHEMA = [
     ("DASHBOARD_URL", "대시보드 링크 (텔레그램 메시지에 포함, 선택)", "text", "", False),
     ("TELEGRAM_BOT_TOKEN", "텔레그램 봇 토큰", "text", "", True),
     ("TELEGRAM_CHAT_ID", "텔레그램 채팅 ID", "text", "", False),
@@ -528,9 +729,10 @@ SETTINGS_SCHEMA = [
     ("AUTO_TRADE_MAX_DAILY_LOSS_USDT", "일일 최대 손실 한도 (USDT, 초과시 자동정지)", "number", "100", False),
     ("BINGX_API_KEY", "BingX API Key", "text", "", True),
     ("BINGX_API_SECRET", "BingX API Secret", "password", "", True),
-    # --- App updates -----------------------------------------------------
-    ("GITHUB_REPO", "새 버전 확인용 GitHub 저장소 (예: yourname/coin-monitor)", "text", "", False),
 ]
+# Backward-compat alias - some helper code still refers to "SETTINGS_SCHEMA"
+# meaning "every field that can show up in a form".
+SETTINGS_SCHEMA = GLOBAL_SETTINGS_SCHEMA + USER_SETTINGS_SCHEMA
 
 _settings_cache: Dict[str, str] = {}
 
@@ -546,13 +748,18 @@ def load_settings_cache() -> None:
         _settings_cache = {}
 
 
-def get_setting(key: str) -> str:
-    if key in _settings_cache:
-        return _settings_cache[key]
+def _default_for(key: str) -> str:
     for schema_key, _label, _type, default, _secret in SETTINGS_SCHEMA:
         if schema_key == key:
             return default
     return ""
+
+
+def get_setting(key: str) -> str:
+    """Global setting (shared by the whole app - the E-RANG collector config)."""
+    if key in _settings_cache:
+        return _settings_cache[key]
+    return _default_for(key)
 
 
 def save_setting(key: str, value: str) -> None:
@@ -565,20 +772,91 @@ def save_setting(key: str, value: str) -> None:
     _settings_cache[key] = value
 
 
+def get_user_setting(user_id: int, key: str) -> str:
+    """Per-user setting (Telegram/exchange keys/auto-trade config)."""
+    try:
+        with db_cursor() as (conn, cur):
+            cur.execute("SELECT value FROM user_settings WHERE user_id = ? AND key = ?", (user_id, key))
+            row = cur.fetchone()
+            if row is not None and row["value"] is not None:
+                return row["value"]
+    except Exception as exc:
+        log("SETTINGS_ERROR", f"failed to read user_setting {key} for user {user_id}: {type(exc).__name__}: {exc}")
+    return _default_for(key)
+
+
+def save_user_setting(user_id: int, key: str, value: str) -> None:
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "INSERT INTO user_settings(user_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value",
+            (user_id, key, value),
+        )
+
+
+def get_all_user_settings(user_id: int) -> Dict[str, str]:
+    """All of one user's settings as a dict, with defaults filled in for
+    anything they haven't saved yet - used by the background Telegram/
+    auto-trade loops so they don't have to do a DB round-trip per field."""
+    values = {key: default for key, _label, _type, default, _secret in USER_SETTINGS_SCHEMA}
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            f"SELECT key, value FROM user_settings WHERE user_id = ? AND key IN "
+            f"({','.join('?' * len(USER_SETTINGS_SCHEMA))})",
+            (user_id, *[k for k, _l, _t, _d, _s in USER_SETTINGS_SCHEMA]),
+        )
+        for row in cur.fetchall():
+            if row["value"] is not None:
+                values[row["key"]] = row["value"]
+    return values
+
+
+def list_user_ids() -> list[int]:
+    with db_cursor() as (conn, cur):
+        cur.execute("SELECT id FROM users ORDER BY id")
+        return [row["id"] for row in cur.fetchall()]
+
+
+def get_user_by_username(username: str) -> Optional[sqlite3.Row]:
+    with db_cursor() as (conn, cur):
+        cur.execute("SELECT id, username, password_hash FROM users WHERE username = ?", (username,))
+        return cur.fetchone()
+
+
+def get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
+    with db_cursor() as (conn, cur):
+        cur.execute("SELECT id, username FROM users WHERE id = ?", (user_id,))
+        return cur.fetchone()
+
+
+def create_user(username: str, password: str) -> int:
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, generate_password_hash(password)),
+        )
+        return int(cur.lastrowid)
+
+
 def apply_settings() -> None:
-    """Refreshes every module-level config constant from the settings store
-    (falling back to each field's default). Called once at boot after
-    init_db(), and again after every successful Settings-page save, so
-    changes take effect immediately without restarting the app."""
-    global ADMIN_USERNAME, ADMIN_PASSWORD, TARGET_URL, INTERVAL, ENTRY_PROXIMITY_USD
-    global DASHBOARD_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_NOTIFY_OFF
-    global FLASK_SECRET_KEY
-    global AUTO_TRADE_ENABLED, AUTO_TRADE_DRY_RUN, AUTO_TRADE_SYMBOL, AUTO_TRADE_LEVERAGE
-    global AUTO_TRADE_MARGIN_USDT, AUTO_TRADE_MAX_DAILY_TRADES, AUTO_TRADE_MAX_DAILY_LOSS_USDT
-    global GITHUB_REPO
-    ADMIN_USERNAME = get_setting("ADMIN_USERNAME") or "admin"
-    ADMIN_PASSWORD = get_setting("ADMIN_PASSWORD") or "1Q2w3e4r5t!!"
+    """Refreshes the GLOBAL config constants from the settings store (falling
+    back to each field's default). Called once at boot after init_db(), and
+    again after every global-settings save. Per-user settings (Telegram,
+    exchange keys, auto-trade config) are NOT module globals anymore - they
+    vary per user, so the background loops fetch them fresh per user via
+    get_all_user_settings()."""
+    global TARGET_URL, INTERVAL, ENTRY_PROXIMITY_USD, GITHUB_REPO, FLASK_SECRET_KEY
+    global ERANG_USERNAME, ERANG_PASSWORD
     TARGET_URL = get_setting("TARGET_URL") or "https://e-rang.kr/api/coin.php"
+    new_erang_username = (get_setting("ERANG_USERNAME") or "").strip()
+    new_erang_password = get_setting("ERANG_PASSWORD") or ""
+    if new_erang_username != ERANG_USERNAME or new_erang_password != ERANG_PASSWORD:
+        # Credentials changed (e.g. just entered/updated in Settings) -
+        # drop the cached session so the very next fetch logs in fresh
+        # rather than keep reusing a session tied to the OLD account.
+        _reset_erang_session()
+    ERANG_USERNAME = new_erang_username
+    ERANG_PASSWORD = new_erang_password
     try:
         INTERVAL = max(1, int(get_setting("INTERVAL_SECONDS") or 30))
     except (TypeError, ValueError):
@@ -587,51 +865,7 @@ def apply_settings() -> None:
         ENTRY_PROXIMITY_USD = float(get_setting("ENTRY_PROXIMITY_USD") or 100)
     except (TypeError, ValueError):
         ENTRY_PROXIMITY_USD = 100.0
-    DASHBOARD_URL = (get_setting("DASHBOARD_URL") or "").strip()
-    TELEGRAM_BOT_TOKEN = (get_setting("TELEGRAM_BOT_TOKEN") or "").strip()
-    TELEGRAM_CHAT_ID = (get_setting("TELEGRAM_CHAT_ID") or "").strip()
-    TELEGRAM_NOTIFY_OFF = str(get_setting("TELEGRAM_NOTIFY_OFF") or "true").lower() not in {"0", "false", "no", "off", ""}
-    with _state_lock:
-        telegram_state["enabled"] = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
-    if bitget_client is not None:
-        try:
-            bitget_client.configure(
-                api_key=get_setting("BITGET_API_KEY"),
-                api_secret=get_setting("BITGET_API_SECRET"),
-                api_passphrase=get_setting("BITGET_API_PASSPHRASE"),
-                category=get_setting("BITGET_CATEGORY") or "USDT-FUTURES",
-            )
-        except Exception as exc:
-            log("SETTINGS_ERROR", f"bitget_client.configure failed: {type(exc).__name__}: {exc}")
-    # --- Auto-trading (real money - every value here matters) ---------------
-    AUTO_TRADE_ENABLED = str(get_setting("AUTO_TRADE_ENABLED") or "false").lower() not in {"0", "false", "no", "off", ""}
-    AUTO_TRADE_DRY_RUN = str(get_setting("AUTO_TRADE_DRY_RUN") or "true").lower() not in {"0", "false", "no", "off", ""}
-    AUTO_TRADE_SYMBOL = (get_setting("AUTO_TRADE_SYMBOL") or "BTC-USDT").strip()
-    try:
-        AUTO_TRADE_LEVERAGE = max(1, int(get_setting("AUTO_TRADE_LEVERAGE") or 5))
-    except (TypeError, ValueError):
-        AUTO_TRADE_LEVERAGE = 5
-    try:
-        AUTO_TRADE_MARGIN_USDT = max(0.0, float(get_setting("AUTO_TRADE_MARGIN_USDT") or 50))
-    except (TypeError, ValueError):
-        AUTO_TRADE_MARGIN_USDT = 50.0
-    try:
-        AUTO_TRADE_MAX_DAILY_TRADES = max(0, int(get_setting("AUTO_TRADE_MAX_DAILY_TRADES") or 10))
-    except (TypeError, ValueError):
-        AUTO_TRADE_MAX_DAILY_TRADES = 10
-    try:
-        AUTO_TRADE_MAX_DAILY_LOSS_USDT = max(0.0, float(get_setting("AUTO_TRADE_MAX_DAILY_LOSS_USDT") or 100))
-    except (TypeError, ValueError):
-        AUTO_TRADE_MAX_DAILY_LOSS_USDT = 100.0
     GITHUB_REPO = (get_setting("GITHUB_REPO") or "").strip().strip("/")
-    if bingx_client is not None:
-        try:
-            bingx_client.configure(
-                api_key=get_setting("BINGX_API_KEY"),
-                api_secret=get_setting("BINGX_API_SECRET"),
-            )
-        except Exception as exc:
-            log("SETTINGS_ERROR", f"bingx_client.configure failed: {type(exc).__name__}: {exc}")
     # Persist a stable Flask secret key across restarts once one exists, so
     # people don't get logged out every time the app is relaunched - unlike
     # a cloud redeploy, a desktop app restarts constantly (every time it's
@@ -738,14 +972,86 @@ def _decimal_from_raw(raw: Optional[str]) -> Optional[Decimal]:
         return None
 
 
+_erang_session: Optional[requests.Session] = None
+_erang_session_lock = threading.Lock()
+
+
+def _reset_erang_session() -> None:
+    """Drops the cached logged-in session so the next fetch logs in fresh -
+    called when credentials change, or when a fetch detects it's been
+    logged out (session expired)."""
+    global _erang_session
+    with _erang_session_lock:
+        _erang_session = None
+
+
+def _erang_login(session: requests.Session) -> bool:
+    """Logs into e-rang.kr (branded 'ADrang') using the documented login
+    form at /libs/member/process.php - the site started requiring a logged
+    -in session to see coin.php's real data, so an anonymous GET no longer
+    works. Returns True if login looks like it succeeded."""
+    if not ERANG_USERNAME or not ERANG_PASSWORD:
+        log("ERANG_LOGIN", "ERANG_USERNAME/ERANG_PASSWORD not set - cannot log in, will keep trying anonymous fetches")
+        return False
+    try:
+        resp = session.post(
+            "https://e-rang.kr/libs/member/process.php",
+            data={
+                "shop_action": "member_login",
+                "gubun": "customer",
+                "retUrl": "https://e-rang.kr/m/",
+                "IdSaveChk": "1",
+                "member_id": ERANG_USERNAME,
+                "member_pw": ERANG_PASSWORD,
+            },
+            headers={"User-Agent": USER_AGENT, "Referer": "https://e-rang.kr/libs/member/process.php"},
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+        )
+        # This site doesn't return a clean JSON success/failure - the most
+        # reliable signal is whether the login FORM shows up again in the
+        # response (still-logged-out) vs. it doesn't (logged in).
+        if resp.status_code < 400 and 'name="member_pw"' not in resp.text:
+            log("ERANG_LOGIN", f"login looks successful (user: {ERANG_USERNAME})")
+            return True
+        log("ERANG_LOGIN", f"login form still present after POST - likely wrong ID/PW (HTTP {resp.status_code})")
+        return False
+    except Exception as exc:
+        log("ERANG_LOGIN_ERROR", f"{type(exc).__name__}: {exc}")
+        return False
+
+
+def _get_erang_session() -> requests.Session:
+    global _erang_session
+    with _erang_session_lock:
+        if _erang_session is None:
+            _erang_session = requests.Session()
+            _erang_login(_erang_session)
+        return _erang_session
+
+
 def fetch_target() -> tuple[int, str]:
     log("FETCH", f"GET {TARGET_URL}")
-    response = requests.get(
+    session = _get_erang_session()
+    response = session.get(
         TARGET_URL,
         timeout=REQUEST_TIMEOUT,
         headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,*/*"},
     )
     log("HTTP", f"{response.status_code} {response.reason}; {len(response.content)} bytes")
+    # If the session has expired (or login never succeeded), coin.php
+    # redirects to/renders a login prompt instead of real data. Detect that,
+    # log back in once, and retry the fetch a single time before giving up -
+    # avoids permanently getting stuck logged-out until the next restart.
+    if 'name="member_pw"' in response.text or 'mq=login' in response.url:
+        log("ERANG_LOGIN", "session appears logged out - re-authenticating and retrying once")
+        if _erang_login(session):
+            response = session.get(
+                TARGET_URL,
+                timeout=REQUEST_TIMEOUT,
+                headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,*/*"},
+            )
+            log("HTTP", f"(retry) {response.status_code} {response.reason}; {len(response.content)} bytes")
     response.raise_for_status()
     html = response.text
     if len(html.encode("utf-8", "replace")) > MAX_HTML_BYTES:
@@ -829,15 +1135,16 @@ def _row_map_from_parsed(parsed: Dict[str, Any]) -> Dict[str, list]:
     return out
 
 
-def send_telegram_message(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def send_telegram_message(text: str, bot_token: str, chat_id: str, user_id: Optional[int] = None) -> None:
+    if not bot_token or not chat_id:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    state = _get_telegram_state(user_id) if user_id is not None else None
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     try:
         resp = requests.post(
             url,
             json={
-                "chat_id": TELEGRAM_CHAT_ID,
+                "chat_id": chat_id,
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
@@ -845,20 +1152,23 @@ def send_telegram_message(text: str) -> None:
             timeout=10,
         )
         if resp.status_code == 200:
-            with _state_lock:
-                telegram_state["last_sent_at"] = datetime.now(timezone.utc).isoformat()
-                telegram_state["last_error"] = None
-                telegram_state["sent_count"] += 1
-            log("TELEGRAM", "notification sent")
+            if state is not None:
+                with _state_lock:
+                    state["last_sent_at"] = datetime.now(timezone.utc).isoformat()
+                    state["last_error"] = None
+                    state["sent_count"] += 1
+            log("TELEGRAM", f"notification sent (user_id={user_id})")
         else:
             err = f"HTTP {resp.status_code}: {resp.text[:300]}"
-            with _state_lock:
-                telegram_state["last_error"] = err
+            if state is not None:
+                with _state_lock:
+                    state["last_error"] = err
             log("TELEGRAM_ERROR", err)
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
-        with _state_lock:
-            telegram_state["last_error"] = err
+        if state is not None:
+            with _state_lock:
+                state["last_error"] = err
         log("TELEGRAM_ERROR", err)
 
 
@@ -1039,6 +1349,7 @@ def _build_signal_message(
     binance_snapshot: Optional[Dict[str, Any]] = None,
     prev_color: Optional[str] = None,
     duration_text: Optional[str] = None,
+    dashboard_url: str = "",
 ) -> str:
     label_kr = "롱(LONG)" if side == "long" else "숏(SHORT)"
     emoji = "🟦" if side == "long" else "🟥"
@@ -1049,8 +1360,8 @@ def _build_signal_message(
         # and when it happened. No entry tables, no evidence detail, no
         # indicators: the dashboard already has all of that if it's needed.
         lines = [f"{emoji} <b>E-RANG {label_kr} 신호해제</b>", now_kst + " (KST)"]
-        if DASHBOARD_URL:
-            lines.append(f'<a href="{html.escape(DASHBOARD_URL, quote=True)}">대시보드 열기</a>')
+        if dashboard_url:
+            lines.append(f'<a href="{html.escape(dashboard_url, quote=True)}">대시보드 열기</a>')
         return "\n".join(lines)
 
     rows = _row_map_from_parsed(parsed)
@@ -1079,12 +1390,16 @@ def _build_signal_message(
         lines.append(piece)
     lines.append("")
     lines.append(now_kst + " (KST)")
-    if DASHBOARD_URL:
-        lines.append(f'<a href="{html.escape(DASHBOARD_URL, quote=True)}">대시보드 열기</a>')
+    if dashboard_url:
+        lines.append(f'<a href="{html.escape(dashboard_url, quote=True)}">대시보드 열기</a>')
     return "\n".join(lines)
 
 
 def _maybe_notify_telegram(
+    user_id: int,
+    bot_token: str,
+    chat_id: str,
+    notify_off: bool,
     parsed: Dict[str, Any],
     long_active: bool,
     short_active: bool,
@@ -1092,9 +1407,11 @@ def _maybe_notify_telegram(
     long_color: Optional[str],
     short_color: Optional[str],
     binance_snapshot: Optional[Dict[str, Any]] = None,
+    dashboard_url: str = "",
 ) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not bot_token or not chat_id:
         return
+    telegram_state = _get_telegram_state(user_id)
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
     with _state_lock:
@@ -1130,37 +1447,41 @@ def _maybe_notify_telegram(
     # cycle, and vice versa - every real transition gets its own send attempt
     # no matter what happened to the other side.
     if prev_long is not None and long_active != prev_long:
-        if long_active or TELEGRAM_NOTIFY_OFF:
+        if long_active or notify_off:
             try:
                 duration = None if long_active else _format_duration(long_activated_at, now_dt)
                 send_telegram_message(_build_signal_message(
                     "long", long_active, parsed, current_price_raw, long_color, binance_snapshot,
-                    prev_color=long_prev_color, duration_text=duration,
-                ))
+                    prev_color=long_prev_color, duration_text=duration, dashboard_url=dashboard_url,
+                ), bot_token, chat_id, user_id)
             except Exception as exc:
-                log("TELEGRAM_ERROR", f"failed to build/send LONG {'ON' if long_active else 'OFF'} message: {type(exc).__name__}: {exc}")
+                log("TELEGRAM_ERROR", f"failed to build/send LONG {'ON' if long_active else 'OFF'} message for user {user_id}: {type(exc).__name__}: {exc}")
     if prev_short is not None and short_active != prev_short:
-        if short_active or TELEGRAM_NOTIFY_OFF:
+        if short_active or notify_off:
             try:
                 duration = None if short_active else _format_duration(short_activated_at, now_dt)
                 send_telegram_message(_build_signal_message(
                     "short", short_active, parsed, current_price_raw, short_color, binance_snapshot,
-                    prev_color=short_prev_color, duration_text=duration,
-                ))
+                    prev_color=short_prev_color, duration_text=duration, dashboard_url=dashboard_url,
+                ), bot_token, chat_id, user_id)
             except Exception as exc:
-                log("TELEGRAM_ERROR", f"failed to build/send SHORT {'ON' if short_active else 'OFF'} message: {type(exc).__name__}: {exc}")
+                log("TELEGRAM_ERROR", f"failed to build/send SHORT {'ON' if short_active else 'OFF'} message for user {user_id}: {type(exc).__name__}: {exc}")
 
 
-def _maybe_notify_entry_proximity(parsed: Dict[str, Any], current_price_raw: Optional[str]) -> None:
+def _maybe_notify_entry_proximity(
+    user_id: int, bot_token: str, chat_id: str, dashboard_url: str,
+    parsed: Dict[str, Any], current_price_raw: Optional[str],
+) -> None:
     """Sends a '진입 임박' (entry imminent) alert when the current price gets
     within ENTRY_PROXIMITY_USD of the 1st-stage (25%) entry price for a side
     whose E-RANG signal is currently ON. If that side isn't ON, its
     proximity state resets so a later approach (once it turns ON) still
-    fires fresh. Edge-triggered (state kept in telegram_state) so it fires
-    once when price first comes within range, not every 30s while it
-    lingers there; it re-arms once price moves back out of range."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    fires fresh. Edge-triggered (state kept per-user) so it fires once when
+    price first comes within range, not every 30s while it lingers there;
+    it re-arms once price moves back out of range."""
+    if not bot_token or not chat_id:
         return
+    telegram_state = _get_telegram_state(user_id)
     current_price = _to_float_loose(current_price_raw)
     if current_price is None:
         return
@@ -1192,11 +1513,11 @@ def _maybe_notify_entry_proximity(parsed: Dict[str, Any], current_price_raw: Opt
                     f"1차 진입가: {_fmt_num(entries[0])} (차이 {abs(current_price - entry1):.1f} 이내)\n"
                     f"{now_kst} (KST)"
                 )
-                if DASHBOARD_URL:
-                    msg += f'\n<a href="{html.escape(DASHBOARD_URL, quote=True)}">대시보드 열기</a>'
-                send_telegram_message(msg)
+                if dashboard_url:
+                    msg += f'\n<a href="{html.escape(dashboard_url, quote=True)}">대시보드 열기</a>'
+                send_telegram_message(msg, bot_token, chat_id, user_id)
             except Exception as exc:
-                log("TELEGRAM_ERROR", f"failed to build/send {label} 진입임박 message: {type(exc).__name__}: {exc}")
+                log("TELEGRAM_ERROR", f"failed to build/send {label} 진입임박 message for user {user_id}: {type(exc).__name__}: {exc}")
 
 
 # =============================================================================
@@ -1204,26 +1525,34 @@ def _maybe_notify_entry_proximity(parsed: Dict[str, Any], current_price_raw: Opt
 # not in dry-run mode. Every decision (trade or skip) is logged to the
 # auto_trades table for audit. Defaults are deliberately conservative:
 # AUTO_TRADE_ENABLED=False and AUTO_TRADE_DRY_RUN=True until someone opts in
-# to both explicitly via the Settings page.
+# to both explicitly via the Settings page. Everything here is per-user -
+# each user's own settings/credentials/edge-trigger state, since each
+# registered account trades independently with their own BingX keys.
 # =============================================================================
-AUTO_TRADE_STATE: Dict[str, Any] = {
-    "long_prev_active": None,   # None = unknown yet (e.g. right after boot) - mirrors telegram_state's edge-trigger pattern
-    "short_prev_active": None,
-}
+auto_trade_states: Dict[int, Dict[str, Any]] = {}
 
 
-def _auto_trade_log(side: str, action: str, **kwargs: Any) -> None:
+def _get_auto_trade_state(user_id: int) -> Dict[str, Any]:
+    if user_id not in auto_trade_states:
+        auto_trade_states[user_id] = {
+            "long_prev_active": None,   # None = unknown yet (e.g. right after boot) - mirrors telegram_state's edge-trigger pattern
+            "short_prev_active": None,
+        }
+    return auto_trade_states[user_id]
+
+
+def _auto_trade_log(user_id: int, side: str, action: str, **kwargs: Any) -> None:
     try:
         with db_cursor() as (conn, cur):
             cur.execute(
                 """
-                INSERT INTO auto_trades (side, action, symbol, entry_price, quantity, leverage,
+                INSERT INTO auto_trades (user_id, side, action, symbol, entry_price, quantity, leverage,
                                           take_profit, stop_loss, order_id, dry_run, detail, error)
-                VALUES (:side, :action, :symbol, :entry_price, :quantity, :leverage,
+                VALUES (:user_id, :side, :action, :symbol, :entry_price, :quantity, :leverage,
                         :take_profit, :stop_loss, :order_id, :dry_run, :detail, :error)
                 """,
                 {
-                    "side": side, "action": action,
+                    "user_id": user_id, "side": side, "action": action,
                     "symbol": kwargs.get("symbol"),
                     "entry_price": str(kwargs["entry_price"]) if kwargs.get("entry_price") is not None else None,
                     "quantity": str(kwargs["quantity"]) if kwargs.get("quantity") is not None else None,
@@ -1240,26 +1569,29 @@ def _auto_trade_log(side: str, action: str, **kwargs: Any) -> None:
         log("AUTO_TRADE_ERROR", f"failed to write auto_trades log row: {type(exc).__name__}: {exc}")
 
 
-def _count_today_trades() -> int:
+def _count_today_trades(user_id: int) -> int:
     try:
         with db_cursor() as (conn, cur):
-            cur.execute("SELECT COUNT(*) FROM auto_trades WHERE action='order_placed' AND date(created_at) = date('now')")
+            cur.execute(
+                "SELECT COUNT(*) FROM auto_trades WHERE user_id = ? AND action='order_placed' AND date(created_at) = date('now')",
+                (user_id,),
+            )
             return int(cur.fetchone()[0] or 0)
     except Exception:
         return 0
 
 
-def _today_realized_pnl_usdt(symbol: str) -> float:
+def _today_realized_pnl_usdt(symbol: str, api_key: str, api_secret: str) -> float:
     """Sums today's realizedPnl from BingX fill history. Returns 0.0 (i.e.
     "no loss detected") if this can't be determined - see the fail-closed
     duplicate-position check below for why that's NOT the safe default in
     general; here it's acceptable because a failed PnL check only affects
     the loss-limit guard, not whether an order gets placed at all, and the
     daily *trade count* limit still provides a hard ceiling regardless."""
-    if bingx_client is None or not bingx_client.bingx_configured():
+    if bingx_client is None or not bingx_client.bingx_configured(api_key, api_secret):
         return 0.0
     try:
-        fills = bingx_client.fetch_fills(symbol=symbol, limit=200)
+        fills = bingx_client.fetch_fills(symbol=symbol, limit=200, api_key=api_key, api_secret=api_secret)
     except Exception as exc:
         log("AUTO_TRADE_ERROR", f"could not fetch fills for daily PnL check: {exc}")
         return 0.0
@@ -1278,7 +1610,7 @@ def _today_realized_pnl_usdt(symbol: str) -> float:
     return total
 
 
-def _has_open_position(symbol: str, side: str) -> Optional[bool]:
+def _has_open_position(symbol: str, side: str, api_key: str, api_secret: str) -> Optional[bool]:
     """True/False if the live position check succeeded, or None if it
     failed - callers must treat None as "skip the trade to be safe" (a
     failed check is exactly the situation where placing an unverified
@@ -1287,7 +1619,7 @@ def _has_open_position(symbol: str, side: str) -> Optional[bool]:
     if bingx_client is None:
         return None
     try:
-        positions = bingx_client.fetch_positions(symbol)
+        positions = bingx_client.fetch_positions(symbol, api_key=api_key, api_secret=api_secret)
     except Exception as exc:
         log("AUTO_TRADE_ERROR", f"position check failed, skipping trade to be safe: {exc}")
         return None
@@ -1302,62 +1634,70 @@ def _has_open_position(symbol: str, side: str) -> Optional[bool]:
     return False
 
 
-def _execute_auto_trade(side: str, rows: Dict[str, list]) -> None:
-    symbol = AUTO_TRADE_SYMBOL
+def _execute_auto_trade(user_id: int, side: str, rows: Dict[str, list], settings: Dict[str, str]) -> None:
+    symbol = settings["AUTO_TRADE_SYMBOL"]
+    dry_run = str(settings["AUTO_TRADE_DRY_RUN"]).lower() not in {"0", "false", "no", "off", ""}
+    leverage = int(float(settings["AUTO_TRADE_LEVERAGE"] or 5))
+    margin_usdt = float(settings["AUTO_TRADE_MARGIN_USDT"] or 50)
+    max_daily_trades = int(float(settings["AUTO_TRADE_MAX_DAILY_TRADES"] or 10))
+    max_daily_loss_usdt = float(settings["AUTO_TRADE_MAX_DAILY_LOSS_USDT"] or 100)
+    api_key = settings["BINGX_API_KEY"]
+    api_secret = settings["BINGX_API_SECRET"]
+
     entries = rows.get(side) or []
     tps = rows.get("tpLong" if side == "long" else "tpShort") or []
     sls = rows.get("slLong" if side == "long" else "slShort") or []
     if not entries:
-        _auto_trade_log(side, "skipped_no_entry_data", symbol=symbol, dry_run=AUTO_TRADE_DRY_RUN, detail="E-RANG 진입가 데이터 없음")
+        _auto_trade_log(user_id, side, "skipped_no_entry_data", symbol=symbol, dry_run=dry_run, detail="E-RANG 진입가 데이터 없음")
         return
     entry_price = _to_float_loose(entries[0])
     tp_price = _to_float_loose(tps[0]) if tps else None
     sl_price = _to_float_loose(sls[0]) if sls else None
     if entry_price is None or entry_price <= 0:
-        _auto_trade_log(side, "skipped_bad_entry_price", symbol=symbol, dry_run=AUTO_TRADE_DRY_RUN, detail=f"entry_price={entries[0]!r}")
+        _auto_trade_log(user_id, side, "skipped_bad_entry_price", symbol=symbol, dry_run=dry_run, detail=f"entry_price={entries[0]!r}")
         return
 
-    has_position = _has_open_position(symbol, side)
+    has_position = _has_open_position(symbol, side, api_key, api_secret)
     if has_position is None or has_position:
         _auto_trade_log(
-            side, "skipped_duplicate", symbol=symbol, entry_price=entry_price, dry_run=AUTO_TRADE_DRY_RUN,
+            user_id, side, "skipped_duplicate", symbol=symbol, entry_price=entry_price, dry_run=dry_run,
             detail="이미 열려있는 포지션으로 판단됨" if has_position else "포지션 확인 실패로 안전하게 건너뜀",
         )
         return
 
-    today_count = _count_today_trades()
-    if today_count >= AUTO_TRADE_MAX_DAILY_TRADES:
+    today_count = _count_today_trades(user_id)
+    if today_count >= max_daily_trades:
         _auto_trade_log(
-            side, "skipped_daily_trade_limit", symbol=symbol, entry_price=entry_price, dry_run=AUTO_TRADE_DRY_RUN,
-            detail=f"오늘 진입 {today_count}회로 한도({AUTO_TRADE_MAX_DAILY_TRADES}회) 도달",
+            user_id, side, "skipped_daily_trade_limit", symbol=symbol, entry_price=entry_price, dry_run=dry_run,
+            detail=f"오늘 진입 {today_count}회로 한도({max_daily_trades}회) 도달",
         )
         return
 
-    today_pnl = _today_realized_pnl_usdt(symbol)
-    if today_pnl <= -abs(AUTO_TRADE_MAX_DAILY_LOSS_USDT):
+    today_pnl = _today_realized_pnl_usdt(symbol, api_key, api_secret)
+    if today_pnl <= -abs(max_daily_loss_usdt):
         _auto_trade_log(
-            side, "skipped_daily_loss_limit", symbol=symbol, entry_price=entry_price, dry_run=AUTO_TRADE_DRY_RUN,
-            detail=f"오늘 실현손익 {today_pnl:.2f} USDT로 한도(-{AUTO_TRADE_MAX_DAILY_LOSS_USDT:.2f}) 초과",
+            user_id, side, "skipped_daily_loss_limit", symbol=symbol, entry_price=entry_price, dry_run=dry_run,
+            detail=f"오늘 실현손익 {today_pnl:.2f} USDT로 한도(-{max_daily_loss_usdt:.2f}) 초과",
         )
         return
 
-    notional = AUTO_TRADE_MARGIN_USDT * AUTO_TRADE_LEVERAGE
+    notional = margin_usdt * leverage
     quantity = round(notional / entry_price, 6)
     if quantity <= 0:
-        _auto_trade_log(side, "skipped_bad_quantity", symbol=symbol, entry_price=entry_price, dry_run=AUTO_TRADE_DRY_RUN)
+        _auto_trade_log(user_id, side, "skipped_bad_quantity", symbol=symbol, entry_price=entry_price, dry_run=dry_run)
         return
 
-    if AUTO_TRADE_DRY_RUN:
+    if dry_run:
         _auto_trade_log(
-            side, "dry_run", symbol=symbol, entry_price=entry_price, quantity=quantity,
-            leverage=AUTO_TRADE_LEVERAGE, take_profit=tp_price, stop_loss=sl_price, dry_run=True,
+            user_id, side, "dry_run", symbol=symbol, entry_price=entry_price, quantity=quantity,
+            leverage=leverage, take_profit=tp_price, stop_loss=sl_price, dry_run=True,
             detail="드라이런 모드 - 실제 주문 없음",
         )
-        log("AUTO_TRADE", f"[DRY RUN] would {side.upper()} {symbol} qty={quantity} @ {entry_price} TP={tp_price} SL={sl_price}")
+        log("AUTO_TRADE", f"[DRY RUN] user={user_id} would {side.upper()} {symbol} qty={quantity} @ {entry_price} TP={tp_price} SL={sl_price}")
         return
 
     try:
-        bingx_client.set_leverage(symbol, "LONG" if side == "long" else "SHORT", int(AUTO_TRADE_LEVERAGE))
+        bingx_client.set_leverage(symbol, "LONG" if side == "long" else "SHORT", leverage, api_key=api_key, api_secret=api_secret)
     except Exception as exc:
         log("AUTO_TRADE_ERROR", f"set_leverage failed (continuing anyway): {exc}")
 
@@ -1371,56 +1711,77 @@ def _execute_auto_trade(side: str, rows: Dict[str, list]) -> None:
             price=entry_price,
             take_profit_price=tp_price,
             stop_loss_price=sl_price,
+            api_key=api_key, api_secret=api_secret,
         )
         order_id = str((order or {}).get("orderId") or (order or {}).get("order", {}).get("orderId") or "")
         _auto_trade_log(
-            side, "order_placed", symbol=symbol, entry_price=entry_price, quantity=quantity,
-            leverage=AUTO_TRADE_LEVERAGE, take_profit=tp_price, stop_loss=sl_price, order_id=order_id,
+            user_id, side, "order_placed", symbol=symbol, entry_price=entry_price, quantity=quantity,
+            leverage=leverage, take_profit=tp_price, stop_loss=sl_price, order_id=order_id,
             dry_run=False, detail=json.dumps(order, ensure_ascii=False)[:1000] if order else None,
         )
-        log("AUTO_TRADE", f"order placed: {side.upper()} {symbol} qty={quantity} @ {entry_price} orderId={order_id}")
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        log("AUTO_TRADE", f"order placed: user={user_id} {side.upper()} {symbol} qty={quantity} @ {entry_price} orderId={order_id}")
+        bot_token, chat_id = settings["TELEGRAM_BOT_TOKEN"], settings["TELEGRAM_CHAT_ID"]
+        if bot_token and chat_id:
             try:
                 emoji = "🟦" if side == "long" else "🟥"
                 msg = (
                     f"{emoji} <b>자동매매 진입</b>\n{html.escape(symbol)} {side.upper()} {quantity} @ {_fmt_num(entry_price)}\n"
                     f"TP {_fmt_num(tp_price) if tp_price else '-'} · SL {_fmt_num(sl_price) if sl_price else '-'}"
                 )
-                send_telegram_message(msg)
+                send_telegram_message(msg, bot_token, chat_id, user_id)
             except Exception:
                 pass
     except Exception as exc:
         _auto_trade_log(
-            side, "order_failed", symbol=symbol, entry_price=entry_price, quantity=quantity,
-            leverage=AUTO_TRADE_LEVERAGE, take_profit=tp_price, stop_loss=sl_price,
+            user_id, side, "order_failed", symbol=symbol, entry_price=entry_price, quantity=quantity,
+            leverage=leverage, take_profit=tp_price, stop_loss=sl_price,
             dry_run=False, error=f"{type(exc).__name__}: {exc}",
         )
-        log("AUTO_TRADE_ERROR", f"order failed: {type(exc).__name__}: {exc}")
+        log("AUTO_TRADE_ERROR", f"order failed for user {user_id}: {type(exc).__name__}: {exc}")
 
 
-def _maybe_auto_trade(parsed: Dict[str, Any], long_active: bool, short_active: bool) -> None:
+def _maybe_auto_trade_for_user(user_id: int, parsed: Dict[str, Any], long_active: bool, short_active: bool) -> None:
     """Edge-triggered exactly like the Telegram ON alert: fires once when a
-    side flips from OFF to ON, not on every poll while it stays ON. Skips
-    entirely (including the state update) unless AUTO_TRADE_ENABLED and the
-    BingX client are both actually available."""
-    if not AUTO_TRADE_ENABLED or bingx_client is None:
+    side flips from OFF to ON, not on every poll while it stays ON, for ONE
+    specific user's own settings/credentials."""
+    if bingx_client is None:
         return
+    settings = get_all_user_settings(user_id)
+    enabled = str(settings["AUTO_TRADE_ENABLED"]).lower() not in {"0", "false", "no", "off", ""}
+    if not enabled:
+        return
+    state = _get_auto_trade_state(user_id)
     with _state_lock:
-        prev_long = AUTO_TRADE_STATE.get("long_prev_active")
-        prev_short = AUTO_TRADE_STATE.get("short_prev_active")
-        AUTO_TRADE_STATE["long_prev_active"] = long_active
-        AUTO_TRADE_STATE["short_prev_active"] = short_active
+        prev_long = state.get("long_prev_active")
+        prev_short = state.get("short_prev_active")
+        state["long_prev_active"] = long_active
+        state["short_prev_active"] = short_active
     rows = _row_map_from_parsed(parsed)
     if prev_long is not None and long_active and not prev_long:
         try:
-            _execute_auto_trade("long", rows)
+            _execute_auto_trade(user_id, "long", rows, settings)
         except Exception as exc:
-            log("AUTO_TRADE_ERROR", f"unhandled error executing LONG auto-trade: {type(exc).__name__}: {exc}")
+            log("AUTO_TRADE_ERROR", f"unhandled error executing LONG auto-trade for user {user_id}: {type(exc).__name__}: {exc}")
     if prev_short is not None and short_active and not prev_short:
         try:
-            _execute_auto_trade("short", rows)
+            _execute_auto_trade(user_id, "short", rows, settings)
         except Exception as exc:
-            log("AUTO_TRADE_ERROR", f"unhandled error executing SHORT auto-trade: {type(exc).__name__}: {exc}")
+            log("AUTO_TRADE_ERROR", f"unhandled error executing SHORT auto-trade for user {user_id}: {type(exc).__name__}: {exc}")
+
+
+def _maybe_auto_trade_all_users(parsed: Dict[str, Any], long_active: bool, short_active: bool) -> None:
+    """Runs the auto-trade check for every registered user - each trades (or
+    doesn't) independently based on their own settings."""
+    try:
+        user_ids = list_user_ids()
+    except Exception as exc:
+        log("AUTO_TRADE_ERROR", f"could not list users: {type(exc).__name__}: {exc}")
+        return
+    for user_id in user_ids:
+        try:
+            _maybe_auto_trade_for_user(user_id, parsed, long_active, short_active)
+        except Exception as exc:
+            log("AUTO_TRADE_ERROR", f"unhandled error for user {user_id}: {type(exc).__name__}: {exc}")
 
 
 def collect_once() -> Dict[str, Any]:
@@ -1521,23 +1882,37 @@ def collect_once() -> Dict[str, Any]:
             }
         )
         try:
-            _maybe_notify_telegram(
-                parsed,
-                bool(long_sig.get("active")),
-                bool(short_sig.get("active")),
-                current_price_raw,
-                long_sig.get("detected_color"),
-                short_sig.get("detected_color"),
-                binance_json,
-            )
+            user_ids = list_user_ids()
         except Exception as exc:
-            log("TELEGRAM_ERROR", f"notify failed: {type(exc).__name__}: {exc}")
+            user_ids = []
+            log("TELEGRAM_ERROR", f"could not list users for notify: {type(exc).__name__}: {exc}")
+        for uid in user_ids:
+            try:
+                usettings = get_all_user_settings(uid)
+                _maybe_notify_telegram(
+                    uid,
+                    usettings["TELEGRAM_BOT_TOKEN"], usettings["TELEGRAM_CHAT_ID"],
+                    str(usettings["TELEGRAM_NOTIFY_OFF"]).lower() not in {"0", "false", "no", "off", ""},
+                    parsed,
+                    bool(long_sig.get("active")),
+                    bool(short_sig.get("active")),
+                    current_price_raw,
+                    long_sig.get("detected_color"),
+                    short_sig.get("detected_color"),
+                    binance_json,
+                    dashboard_url=usettings["DASHBOARD_URL"],
+                )
+            except Exception as exc:
+                log("TELEGRAM_ERROR", f"notify failed for user {uid}: {type(exc).__name__}: {exc}")
+            try:
+                _maybe_notify_entry_proximity(
+                    uid, usettings["TELEGRAM_BOT_TOKEN"], usettings["TELEGRAM_CHAT_ID"], usettings["DASHBOARD_URL"],
+                    parsed, current_price_raw,
+                )
+            except Exception as exc:
+                log("TELEGRAM_ERROR", f"entry-proximity notify failed for user {uid}: {type(exc).__name__}: {exc}")
         try:
-            _maybe_notify_entry_proximity(parsed, current_price_raw)
-        except Exception as exc:
-            log("TELEGRAM_ERROR", f"entry-proximity notify failed: {type(exc).__name__}: {exc}")
-        try:
-            _maybe_auto_trade(parsed, bool(long_sig.get("active")), bool(short_sig.get("active")))
+            _maybe_auto_trade_all_users(parsed, bool(long_sig.get("active")), bool(short_sig.get("active")))
         except Exception as exc:
             log("AUTO_TRADE_ERROR", f"auto-trade check failed: {type(exc).__name__}: {exc}")
     except Exception as exc:
@@ -1670,48 +2045,6 @@ def current_binance_snapshot() -> Dict[str, Any]:
         return dict(live_binance_state.get("snapshot") or {})
 
 
-def bitget_loop() -> None:
-    log("BITGET_BOOT", f"Bitget position loop started interval={BITGET_POLL_INTERVAL}s")
-    while True:
-        started = time.monotonic()
-        try:
-            summary = bitget_client.fetch_summary()
-            with _state_lock:
-                bitget_state["fills"] = summary.get("fills") or []
-                bitget_state["orders"] = summary.get("orders") or []
-                bitget_state["account"] = summary.get("account") or {}
-                bitget_state["positions"] = summary.get("positions") or []
-                bitget_state["total_unrealized_pnl"] = summary.get("total_unrealized_pnl")
-                bitget_state["live_open_positions_pnl"] = summary.get("live_open_positions_pnl")
-                bitget_state["total_equity"] = summary.get("total_equity")
-                bitget_state["win_rate_pct"] = summary.get("win_rate_pct")
-                bitget_state["win_count"] = summary.get("win_count") or 0
-                bitget_state["loss_count"] = summary.get("loss_count") or 0
-                bitget_state["trade_count"] = summary.get("trade_count") or 0
-                bitget_state["realized_pnl_total"] = summary.get("realized_pnl_total")
-                bitget_state["combined_pnl"] = summary.get("combined_pnl")
-                bitget_state["updated_at"] = datetime.now(timezone.utc).isoformat()
-                bitget_state["last_error"] = summary.get("errors") or None
-        except Exception as exc:
-            with _state_lock:
-                bitget_state["last_error"] = f"{type(exc).__name__}: {exc}"
-            log("BITGET_ERROR", bitget_state["last_error"])
-        elapsed = time.monotonic() - started
-        time.sleep(max(1.0, BITGET_POLL_INTERVAL - elapsed))
-
-
-def start_bitget_loop_once() -> None:
-    with _state_lock:
-        bitget_state["configured"] = bool(bitget_client and bitget_client.bitget_configured())
-        if bitget_state["started"] or not bitget_state["configured"]:
-            if not bitget_state["configured"]:
-                log("BITGET_BOOT", "BITGET_API_KEY/SECRET/PASSPHRASE not set, Bitget position card disabled")
-            return
-        bitget_state["started"] = True
-    thread = threading.Thread(target=bitget_loop, name="bitget-position-poll", daemon=True)
-    thread.start()
-
-
 def db_summary() -> Dict[str, Any]:
     try:
         with db_cursor() as (conn, cur):
@@ -1783,12 +2116,13 @@ def healthz() -> Response:
 @app.get("/api/status")
 def api_status() -> Response:
     summary = db_summary()
+    user_id = session["user_id"]
     with _state_lock:
         state = dict(collector_state)
         live_price = dict(live_price_state)
         live_binance = dict(live_binance_state)
-        telegram = dict(telegram_state)
-        bitget = dict(bitget_state)
+        telegram = dict(_get_telegram_state(user_id))
+    bitget = _public_bitget_state(get_bitget_state_for_user(user_id))
     return jsonify(
         {
             "service": "coin-monitor",
@@ -1819,8 +2153,7 @@ def api_binance_live() -> Response:
 
 @app.get("/api/bitget-live")
 def api_bitget_live() -> Response:
-    with _state_lock:
-        return jsonify(dict(bitget_state))
+    return jsonify(_public_bitget_state(get_bitget_state_for_user(session["user_id"])))
 
 
 @app.get("/api/history")
@@ -1937,35 +2270,41 @@ def api_update_status() -> Response:
 
 @app.get("/api/auto-trade/status")
 def api_auto_trade_status() -> Response:
+    user_id = session["user_id"]
+    settings = get_all_user_settings(user_id)
+    symbol = settings["AUTO_TRADE_SYMBOL"]
+    api_key, api_secret = settings["BINGX_API_KEY"], settings["BINGX_API_SECRET"]
+    configured = bool(bingx_client and bingx_client.bingx_configured(api_key, api_secret))
     today_pnl = None
-    if bingx_client is not None and bingx_client.bingx_configured():
+    if configured:
         try:
-            today_pnl = _today_realized_pnl_usdt(AUTO_TRADE_SYMBOL)
+            today_pnl = _today_realized_pnl_usdt(symbol, api_key, api_secret)
         except Exception:
             today_pnl = None
     return jsonify({
-        "enabled": AUTO_TRADE_ENABLED,
-        "dry_run": AUTO_TRADE_DRY_RUN,
-        "symbol": AUTO_TRADE_SYMBOL,
-        "leverage": AUTO_TRADE_LEVERAGE,
-        "margin_usdt": AUTO_TRADE_MARGIN_USDT,
-        "max_daily_trades": AUTO_TRADE_MAX_DAILY_TRADES,
-        "max_daily_loss_usdt": AUTO_TRADE_MAX_DAILY_LOSS_USDT,
-        "today_trade_count": _count_today_trades(),
+        "enabled": str(settings["AUTO_TRADE_ENABLED"]).lower() not in {"0", "false", "no", "off", ""},
+        "dry_run": str(settings["AUTO_TRADE_DRY_RUN"]).lower() not in {"0", "false", "no", "off", ""},
+        "symbol": symbol,
+        "leverage": settings["AUTO_TRADE_LEVERAGE"],
+        "margin_usdt": settings["AUTO_TRADE_MARGIN_USDT"],
+        "max_daily_trades": settings["AUTO_TRADE_MAX_DAILY_TRADES"],
+        "max_daily_loss_usdt": settings["AUTO_TRADE_MAX_DAILY_LOSS_USDT"],
+        "today_trade_count": _count_today_trades(user_id),
         "today_realized_pnl_usdt": today_pnl,
-        "bingx_configured": bool(bingx_client and bingx_client.bingx_configured()),
+        "bingx_configured": configured,
     })
 
 
 @app.get("/api/auto-trade/log")
 def api_auto_trade_log() -> Response:
+    user_id = session["user_id"]
     limit = max(1, min(500, int(request.args.get("limit", "100"))))
     with db_cursor() as (conn, cur):
         cur.execute(
             "SELECT id, created_at, side, action, symbol, entry_price, quantity, leverage, "
             "take_profit, stop_loss, order_id, dry_run, detail, error "
-            "FROM auto_trades ORDER BY id DESC LIMIT ?",
-            (limit,),
+            "FROM auto_trades WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
         )
         items = [
             {
@@ -1980,26 +2319,29 @@ def api_auto_trade_log() -> Response:
 
 @app.post("/api/auto-trade/kill-switch")
 def api_auto_trade_kill_switch() -> Response:
-    """Emergency stop: turns auto-trading off immediately and cancels every
-    open order for the configured symbol. Does NOT close already-filled
-    positions (those still have their own TP/SL orders working) - closing
-    live positions automatically is a separate, deliberately-not-included
-    action since doing that wrong (e.g. on a flaky connection) could itself
-    cause a loss."""
-    global AUTO_TRADE_ENABLED
-    save_setting("AUTO_TRADE_ENABLED", "false")
-    AUTO_TRADE_ENABLED = False
+    """Emergency stop: turns off MY OWN auto-trading immediately and cancels
+    every open order for my configured symbol (does not affect other
+    users). Does NOT close already-filled positions (those still have
+    their own TP/SL orders working) - closing live positions automatically
+    is a separate, deliberately-not-included action since doing that wrong
+    (e.g. on a flaky connection) could itself cause a loss."""
+    user_id = session["user_id"]
+    settings = get_all_user_settings(user_id)
+    symbol = settings["AUTO_TRADE_SYMBOL"]
+    dry_run = str(settings["AUTO_TRADE_DRY_RUN"]).lower() not in {"0", "false", "no", "off", ""}
+    save_user_setting(user_id, "AUTO_TRADE_ENABLED", "false")
     cancel_result = None
-    if bingx_client is not None and bingx_client.bingx_configured():
+    api_key, api_secret = settings["BINGX_API_KEY"], settings["BINGX_API_SECRET"]
+    if bingx_client is not None and bingx_client.bingx_configured(api_key, api_secret):
         try:
-            cancel_result = bingx_client.cancel_all_open_orders(AUTO_TRADE_SYMBOL)
+            cancel_result = bingx_client.cancel_all_open_orders(symbol, api_key=api_key, api_secret=api_secret)
         except Exception as exc:
             cancel_result = {"error": f"{type(exc).__name__}: {exc}"}
     _auto_trade_log(
-        "both", "kill_switch", symbol=AUTO_TRADE_SYMBOL, dry_run=AUTO_TRADE_DRY_RUN,
+        user_id, "both", "kill_switch", symbol=symbol, dry_run=dry_run,
         detail=json.dumps(cancel_result, ensure_ascii=False) if cancel_result else None,
     )
-    log("AUTO_TRADE", f"KILL SWITCH activated - orders cancelled: {cancel_result}")
+    log("AUTO_TRADE", f"KILL SWITCH activated for user {user_id} - orders cancelled: {cancel_result}")
     return jsonify({"ok": True, "auto_trade_enabled": False, "cancel_result": cancel_result})
 
 
@@ -2396,23 +2738,20 @@ if __name__ == "__main__":
     except Exception as exc:
         log("DB_ERROR", f"initial schema failed: {type(exc).__name__}: {exc}")
     load_settings_cache()
-    apply_settings()  # pulls Telegram/Bitget/admin/etc. from the settings DB (or seeds defaults on first run)
-    if telegram_state["enabled"]:
-        try:
-            summary = db_summary()
-            latest = summary.get("latest") or {}
-            with _state_lock:
-                telegram_state["last_long_signal"] = latest.get("long_signal")
-                telegram_state["last_short_signal"] = latest.get("short_signal")
-            log("TELEGRAM_BOOT", f"seeded prev state long={latest.get('long_signal')} short={latest.get('short_signal')}")
-        except Exception as exc:
-            log("TELEGRAM_ERROR", f"failed to seed previous signal state: {type(exc).__name__}: {exc}")
-    else:
-        log("TELEGRAM_BOOT", "텔레그램 봇 토큰/채팅 ID가 설정 안 됨 - /settings 에서 입력하면 재시작 없이 바로 켜집니다")
+    apply_settings()  # pulls E-RANG/GitHub/etc. global config from the settings DB (or seeds defaults on first run)
+    try:
+        summary = db_summary()
+        latest = summary.get("latest") or {}
+        for uid in list_user_ids():
+            state = _get_telegram_state(uid)
+            state["last_long_signal"] = latest.get("long_signal")
+            state["last_short_signal"] = latest.get("short_signal")
+        log("TELEGRAM_BOOT", f"seeded prev state for all users: long={latest.get('long_signal')} short={latest.get('short_signal')}")
+    except Exception as exc:
+        log("TELEGRAM_ERROR", f"failed to seed previous signal state: {type(exc).__name__}: {exc}")
     start_collector_once()
     start_live_price_once()
     start_binance_snapshot_once()
-    start_bitget_loop_once()
     start_update_check_loop_once()
     port = int(os.getenv("PORT", "8765"))
     # Desktop installs bind to localhost only (127.0.0.1) by default - this

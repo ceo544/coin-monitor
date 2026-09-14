@@ -110,21 +110,21 @@ class FetchSummaryTests(unittest.TestCase):
             bitget_client.fetch_fills, bitget_client.fetch_history_orders,
         )
         try:
-            bitget_client.fetch_account_assets = lambda: [{
+            bitget_client.fetch_account_assets = lambda **kwargs: [{
                 "accountEquity": "1240.55", "usdtEquity": "1240.55",
                 "unrealisedPnl": "60.0", "usdtUnrealisedPnl": "60.0", "effEquity": "1200.0",
             }]
-            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None: [
+            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None, **kwargs: [
                 {"symbol": "BTCUSDT", "posSide": "long", "holdSize": "0.06", "avgPrice": "100000", "unrealisedPnl": "60.0"},
             ]
-            bitget_client.fetch_fills = lambda symbol=None: [
+            bitget_client.fetch_fills = lambda symbol=None, **kwargs: [
                 {"symbol": "BTCUSDT", "tradeSide": "open", "execPnl": "0"},
                 {"symbol": "BTCUSDT", "tradeSide": "close", "execPnl": "50.0"},
                 {"symbol": "ETHUSDT", "tradeSide": "close", "execPnl": "-20.0"},
                 {"symbol": "SOLUSDT", "tradeSide": "close", "execPnl": "30.0"},
                 {"symbol": "ADAUSDT", "tradeSide": "close", "execPnl": "0.0"},
             ]
-            bitget_client.fetch_history_orders = lambda symbol=None: []
+            bitget_client.fetch_history_orders = lambda symbol=None, **kwargs: []
             summary = bitget_client.fetch_summary()
             self.assertEqual(summary["win_count"], 2)
             self.assertEqual(summary["loss_count"], 1)
@@ -148,10 +148,10 @@ class FetchSummaryTests(unittest.TestCase):
             bitget_client.fetch_fills, bitget_client.fetch_history_orders,
         )
         try:
-            bitget_client.fetch_account_assets = lambda: []
-            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None: []
-            bitget_client.fetch_fills = lambda symbol=None: [{"tradeSide": "close", "execPnl": "0.0"}]
-            bitget_client.fetch_history_orders = lambda symbol=None: []
+            bitget_client.fetch_account_assets = lambda **kwargs: []
+            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None, **kwargs: []
+            bitget_client.fetch_fills = lambda symbol=None, **kwargs: [{"tradeSide": "close", "execPnl": "0.0"}]
+            bitget_client.fetch_history_orders = lambda symbol=None, **kwargs: []
             summary = bitget_client.fetch_summary()
             self.assertIsNone(summary["win_rate_pct"])
         finally:
@@ -166,13 +166,13 @@ class FetchSummaryTests(unittest.TestCase):
             bitget_client.fetch_fills, bitget_client.fetch_history_orders,
         )
         try:
-            bitget_client.fetch_account_assets = lambda: [{"usdtEquity": "500.0"}]
-            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None: []
+            bitget_client.fetch_account_assets = lambda **kwargs: [{"usdtEquity": "500.0"}]
+            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None, **kwargs: []
 
-            def boom(symbol=None):
+            def boom(symbol=None, **kwargs):
                 raise RuntimeError("[40001] some transient error")
             bitget_client.fetch_fills = boom
-            bitget_client.fetch_history_orders = lambda symbol=None: []
+            bitget_client.fetch_history_orders = lambda symbol=None, **kwargs: []
             summary = bitget_client.fetch_summary()
             self.assertAlmostEqual(summary["total_equity"], 500.0)
             self.assertEqual(summary["fills"], [])
@@ -189,7 +189,7 @@ class EndpointPathTests(unittest.TestCase):
         orig_get = bitget_client._get
         captured = {}
         try:
-            bitget_client._get = lambda path, params=None: captured.update(path=path, params=params) or []
+            bitget_client._get = lambda path, params=None, **kwargs: captured.update(path=path, params=params) or []
             bitget_client.fetch_account_assets()
             self.assertEqual(captured["path"], "/api/v3/account/assets")
         finally:
@@ -199,7 +199,7 @@ class EndpointPathTests(unittest.TestCase):
         orig_get = bitget_client._get
         captured = {}
         try:
-            bitget_client._get = lambda path, params=None: captured.update(path=path, params=params) or []
+            bitget_client._get = lambda path, params=None, **kwargs: captured.update(path=path, params=params) or []
             bitget_client.fetch_fills()
             self.assertEqual(captured["path"], "/api/v3/trade/fills")
             self.assertEqual(captured["params"]["category"], "USDT-FUTURES")
@@ -210,7 +210,7 @@ class EndpointPathTests(unittest.TestCase):
         orig_get = bitget_client._get
         captured = {}
         try:
-            bitget_client._get = lambda path, params=None: captured.update(path=path, params=params) or []
+            bitget_client._get = lambda path, params=None, **kwargs: captured.update(path=path, params=params) or []
             bitget_client.fetch_history_orders(symbol="BTCUSDT")
             self.assertEqual(captured["path"], "/api/v3/trade/history-orders")
             self.assertEqual(captured["params"]["symbol"], "BTCUSDT")
@@ -281,7 +281,7 @@ class ComputeOpenPositionsTests(unittest.TestCase):
         orig_get = bitget_client._get
         captured = {}
         try:
-            bitget_client._get = lambda path, params=None: captured.update(path=path, params=params) or []
+            bitget_client._get = lambda path, params=None, **kwargs: captured.update(path=path, params=params) or []
             bitget_client.fetch_current_positions(pos_side="long")
             self.assertEqual(captured["path"], "/api/v3/position/current-position")
             self.assertEqual(captured["params"]["posSide"], "long")
@@ -297,13 +297,13 @@ class LiveOpenPositionsPnlTests(unittest.TestCase):
             bitget_client.fetch_fills, bitget_client.fetch_history_orders,
         )
         try:
-            bitget_client.fetch_account_assets = lambda: []
-            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None: [
+            bitget_client.fetch_account_assets = lambda **kwargs: []
+            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None, **kwargs: [
                 {"symbol": "BTCUSDT", "posSide": "long", "unrealisedPnl": "60.0"},
                 {"symbol": "ETHUSDT", "posSide": "short", "unrealisedPnl": "-15.5"},
             ]
-            bitget_client.fetch_fills = lambda symbol=None: []
-            bitget_client.fetch_history_orders = lambda symbol=None: []
+            bitget_client.fetch_fills = lambda symbol=None, **kwargs: []
+            bitget_client.fetch_history_orders = lambda symbol=None, **kwargs: []
             summary = bitget_client.fetch_summary()
             self.assertAlmostEqual(summary["live_open_positions_pnl"], 44.5)
         finally:
@@ -318,10 +318,10 @@ class LiveOpenPositionsPnlTests(unittest.TestCase):
             bitget_client.fetch_fills, bitget_client.fetch_history_orders,
         )
         try:
-            bitget_client.fetch_account_assets = lambda: []
-            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None: []
-            bitget_client.fetch_fills = lambda symbol=None: []
-            bitget_client.fetch_history_orders = lambda symbol=None: []
+            bitget_client.fetch_account_assets = lambda **kwargs: []
+            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None, **kwargs: []
+            bitget_client.fetch_fills = lambda symbol=None, **kwargs: []
+            bitget_client.fetch_history_orders = lambda symbol=None, **kwargs: []
             summary = bitget_client.fetch_summary()
             self.assertIsNone(summary["live_open_positions_pnl"])
         finally:
@@ -336,10 +336,10 @@ class LiveOpenPositionsPnlTests(unittest.TestCase):
             bitget_client.fetch_fills, bitget_client.fetch_history_orders,
         )
         try:
-            bitget_client.fetch_account_assets = lambda: []
-            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None: [{"symbol": "BTCUSDT", "unrealisedPnl": "bad"}]
-            bitget_client.fetch_fills = lambda symbol=None: []
-            bitget_client.fetch_history_orders = lambda symbol=None: []
+            bitget_client.fetch_account_assets = lambda **kwargs: []
+            bitget_client.fetch_current_positions = lambda symbol=None, pos_side=None, **kwargs: [{"symbol": "BTCUSDT", "unrealisedPnl": "bad"}]
+            bitget_client.fetch_fills = lambda symbol=None, **kwargs: []
+            bitget_client.fetch_history_orders = lambda symbol=None, **kwargs: []
             summary = bitget_client.fetch_summary()
             self.assertEqual(summary["live_open_positions_pnl"], 0.0)
         finally:

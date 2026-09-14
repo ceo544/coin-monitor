@@ -10,6 +10,9 @@ from typing import Any, Dict, List, Optional
 import requests
 
 BITGET_BASE_URL = os.getenv("BITGET_BASE_URL", "https://api.bitget.com")
+# Module-level defaults, kept for backward compatibility with single-user
+# desktop/env-var setups. In the multi-user app, every function below is
+# called with explicit credentials for the current user instead.
 BITGET_API_KEY = os.getenv("BITGET_API_KEY", "").strip()
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "").strip()
 BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "").strip()
@@ -21,8 +24,11 @@ BITGET_CATEGORY = os.getenv("BITGET_CATEGORY", "USDT-FUTURES")
 BITGET_SYMBOL = os.getenv("BITGET_SYMBOL", "").strip() or None
 
 
-def bitget_configured() -> bool:
-    return bool(BITGET_API_KEY and BITGET_API_SECRET and BITGET_API_PASSPHRASE)
+def bitget_configured(api_key: Optional[str] = None, api_secret: Optional[str] = None, api_passphrase: Optional[str] = None) -> bool:
+    key = api_key if api_key is not None else BITGET_API_KEY
+    secret = api_secret if api_secret is not None else BITGET_API_SECRET
+    passphrase = api_passphrase if api_passphrase is not None else BITGET_API_PASSPHRASE
+    return bool(key and secret and passphrase)
 
 
 def configure(
@@ -31,10 +37,9 @@ def configure(
     api_passphrase: Optional[str] = None,
     category: Optional[str] = None,
 ) -> None:
-    """Updates credentials/category at runtime (e.g. from the desktop app's
-    Settings page) without needing to restart the process - unlike the
-    original env-var-at-import-time setup, a local install's user will
-    routinely enter these after first launch rather than before it."""
+    """Updates the module-level default credentials/category (single-user/
+    desktop use). Multi-user callers should pass credentials directly to
+    each function instead of calling this."""
     global BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE, BITGET_CATEGORY
     if api_key is not None:
         BITGET_API_KEY = api_key.strip()
@@ -59,22 +64,31 @@ def _sign(secret: str, message: str) -> str:
     return base64.b64encode(digest).decode("utf-8")
 
 
-def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    if not bitget_configured():
-        raise RuntimeError("BITGET_API_KEY / BITGET_API_SECRET / BITGET_API_PASSPHRASE not set")
+def _get(
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
+    api_passphrase: Optional[str] = None,
+) -> Any:
+    key = (api_key if api_key is not None else BITGET_API_KEY) or ""
+    secret = (api_secret if api_secret is not None else BITGET_API_SECRET) or ""
+    passphrase = (api_passphrase if api_passphrase is not None else BITGET_API_PASSPHRASE) or ""
+    if not (key and secret and passphrase):
+        raise RuntimeError("Bitget API key/secret/passphrase not set")
     params = params or {}
     qs = _build_query(params)
     timestamp = str(int(time.time() * 1000))
     prehash = timestamp + "GET" + path + qs
-    signature = _sign(BITGET_API_SECRET, prehash)
+    signature = _sign(secret, prehash)
     resp = requests.get(
         BITGET_BASE_URL + path + qs,
         timeout=BITGET_TIMEOUT,
         headers={
-            "ACCESS-KEY": BITGET_API_KEY,
+            "ACCESS-KEY": key,
             "ACCESS-SIGN": signature,
             "ACCESS-TIMESTAMP": timestamp,
-            "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
+            "ACCESS-PASSPHRASE": passphrase,
             "Content-Type": "application/json",
             "locale": "en-US",
         },
@@ -95,41 +109,52 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     return data.get("data")
 
 
-def fetch_account_assets() -> List[Dict[str, Any]]:
+def fetch_account_assets(
+    api_key: Optional[str] = None, api_secret: Optional[str] = None, api_passphrase: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Overall Unified Trading Account balance/equity snapshot: accountEquity,
     usdtEquity, unrealisedPnl, usdtUnrealisedPnl, effEquity."""
-    data = _get("/api/v3/account/assets")
+    data = _get("/api/v3/account/assets", api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
     if isinstance(data, dict):
         return [data]
     return data or []
 
 
-def fetch_fills(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+def fetch_fills(
+    symbol: Optional[str] = None, category: Optional[str] = None,
+    api_key: Optional[str] = None, api_secret: Optional[str] = None, api_passphrase: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Executed trades. Each fill has tradeSide ('open'/'close') and, for
     closes, execPnl - the realized PnL for that specific close."""
-    params = {"category": BITGET_CATEGORY, "symbol": symbol or BITGET_SYMBOL}
-    data = _get("/api/v3/trade/fills", params)
+    params = {"category": category or BITGET_CATEGORY, "symbol": symbol or BITGET_SYMBOL}
+    data = _get("/api/v3/trade/fills", params, api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
     if isinstance(data, dict):
         return data.get("fillList") or data.get("list") or []
     return data or []
 
 
-def fetch_current_positions(symbol: Optional[str] = None, pos_side: Optional[str] = None) -> List[Dict[str, Any]]:
+def fetch_current_positions(
+    symbol: Optional[str] = None, pos_side: Optional[str] = None, category: Optional[str] = None,
+    api_key: Optional[str] = None, api_secret: Optional[str] = None, api_passphrase: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Live currently-open positions - the real thing (entry price, mark
     price, leverage, margin, liquidation price, unrealized PnL), not a
     derived estimate. posSide can be 'long' or 'short' to filter one side."""
-    params = {"category": BITGET_CATEGORY, "symbol": symbol or BITGET_SYMBOL, "posSide": pos_side}
-    data = _get("/api/v3/position/current-position", params)
+    params = {"category": category or BITGET_CATEGORY, "symbol": symbol or BITGET_SYMBOL, "posSide": pos_side}
+    data = _get("/api/v3/position/current-position", params, api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
     if isinstance(data, dict):
         return data.get("list") or data.get("positionList") or []
     return data or []
 
 
-def fetch_history_orders(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+def fetch_history_orders(
+    symbol: Optional[str] = None, category: Optional[str] = None,
+    api_key: Optional[str] = None, api_secret: Optional[str] = None, api_passphrase: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Historical futures orders (filled/cancelled/etc.) - order-level detail,
     coarser than fills."""
-    params = {"category": BITGET_CATEGORY, "symbol": symbol or BITGET_SYMBOL}
-    data = _get("/api/v3/trade/history-orders", params)
+    params = {"category": category or BITGET_CATEGORY, "symbol": symbol or BITGET_SYMBOL}
+    data = _get("/api/v3/trade/history-orders", params, api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
     if isinstance(data, dict):
         return data.get("orderList") or data.get("list") or []
     return data or []
@@ -253,7 +278,10 @@ def _position_unrealized_pnl(position: Dict[str, Any]) -> float:
         return 0.0
 
 
-def fetch_summary() -> Dict[str, Any]:
+def fetch_summary(
+    api_key: Optional[str] = None, api_secret: Optional[str] = None, api_passphrase: Optional[str] = None,
+    category: Optional[str] = None,
+) -> Dict[str, Any]:
     """One combined snapshot for the dashboard's Bitget card: account
     balance/equity, live currently-open positions, recent fills, recent
     order history, and a win-rate/PnL readout built from closing fills'
@@ -264,20 +292,21 @@ def fetch_summary() -> Dict[str, Any]:
     positions: List[Dict[str, Any]] = []
     fills: List[Dict[str, Any]] = []
     orders: List[Dict[str, Any]] = []
+    creds = {"api_key": api_key, "api_secret": api_secret, "api_passphrase": api_passphrase}
     try:
-        assets = fetch_account_assets()
+        assets = fetch_account_assets(**creds)
     except Exception as exc:
         errors["assets"] = f"{type(exc).__name__}: {exc}"
     try:
-        positions = fetch_current_positions()
+        positions = fetch_current_positions(category=category, **creds)
     except Exception as exc:
         errors["positions"] = f"{type(exc).__name__}: {exc}"
     try:
-        fills = fetch_fills()
+        fills = fetch_fills(category=category, **creds)
     except Exception as exc:
         errors["fills"] = f"{type(exc).__name__}: {exc}"
     try:
-        orders = fetch_history_orders()
+        orders = fetch_history_orders(category=category, **creds)
     except Exception as exc:
         errors["history_orders"] = f"{type(exc).__name__}: {exc}"
 
