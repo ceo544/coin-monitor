@@ -49,6 +49,13 @@ def _get_json(path: str, params: Dict[str, Any] | None = None) -> Any:
     return response.json()
 
 
+def fetch_klines(interval: str = "15m", limit: int = 200) -> list:
+    """Raw OHLCV candles for chart display - a thin public wrapper so
+    callers (like the /api/chart-klines endpoint) don't need to reach into
+    the private _get_json helper directly."""
+    return _get_json("/fapi/v1/klines", {"symbol": SYMBOL, "interval": interval, "limit": limit})
+
+
 def fetch_last_price() -> Dict[str, Any]:
     """Lightweight, single-field price fetch (no 24h stats, no klines).
 
