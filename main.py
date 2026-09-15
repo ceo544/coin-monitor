@@ -47,6 +47,11 @@ try:
 except Exception:  # pragma: no cover
     bingx_client = None
 
+try:
+    import liquidation_stream
+except Exception:  # pragma: no cover
+    liquidation_stream = None
+
 # ---------------------------------------------------------------------------
 # Desktop-friendly data directory: a per-user folder that's always writable,
 # regardless of where the packaged .exe happens to sit (Program Files etc.
@@ -615,6 +620,19 @@ def init_db() -> None:
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_observations_observed_at ON observations(observed_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_observations_signal ON observations(long_signal, short_signal, observed_at DESC)")
+        # v3.58 FINAL data collector migration - additive only, never drops
+        # or renames anything: observed_at_kst (convenience copy of
+        # observed_at in KST, spec section 2) and long_start/long_end/
+        # short_start/short_end (spec section 2 - explicit OFF->ON / ON->OFF
+        # transition markers, separate from the plain long_signal/
+        # short_signal state columns that already existed).
+        for column in ("observed_at_kst", "long_start", "long_end", "short_start", "short_end"):
+            try:
+                cur.execute(f"ALTER TABLE observations ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_observations_long_start ON observations(long_start)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_observations_short_start ON observations(short_start)")
         cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         cur.execute(
             """
@@ -1115,23 +1133,39 @@ def _prepare_sqlite_params(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def insert_observation(record: Dict[str, Any]) -> int:
+    """Guards against inserting two rows with the exact same observed_at
+    (spec section 33) - a soft, application-level check rather than a hard
+    SQL UNIQUE constraint, since adding a UNIQUE constraint retroactively
+    to an existing table could fail outright if any duplicates already
+    slipped in before this check existed. In normal operation this should
+    essentially never trigger (observed_at is stamped fresh, to
+    microsecond precision, once per collection cycle), but a Flask debug-
+    reloader double-invocation or a manual double-call to collect_once()
+    could otherwise create one."""
     params = _prepare_sqlite_params(record)
     with db_cursor() as (conn, cur):
+        cur.execute("SELECT id FROM observations WHERE observed_at = ?", (params["observed_at"],))
+        existing = cur.fetchone()
+        if existing:
+            log("DB", f"skipped duplicate observed_at={params['observed_at']} (existing id={existing[0]})")
+            return int(existing[0])
         cur.execute(
             """
             INSERT INTO observations (
-                observed_at, target_url, http_status, success,
+                observed_at, observed_at_kst, target_url, http_status, success,
                 current_price, current_price_raw,
-                long_signal, short_signal, long_color, short_color, entry_message,
+                long_signal, short_signal, long_start, long_end, short_start, short_end,
+                long_color, short_color, entry_message,
                 long_matched_selector, long_matched_declaration, long_ancestor_classes,
                 long_label_classes, long_own_inline_background,
                 short_matched_selector, short_matched_declaration, short_ancestor_classes,
                 short_label_classes, short_own_inline_background,
                 parsed_json, binance_json, raw_text, raw_html, content_sha256, error
             ) VALUES (
-                :observed_at, :target_url, :http_status, :success,
+                :observed_at, :observed_at_kst, :target_url, :http_status, :success,
                 :current_price, :current_price_raw,
-                :long_signal, :short_signal, :long_color, :short_color, :entry_message,
+                :long_signal, :short_signal, :long_start, :long_end, :short_start, :short_end,
+                :long_color, :short_color, :entry_message,
                 :long_matched_selector, :long_matched_declaration, :long_ancestor_classes,
                 :long_label_classes, :long_own_inline_background,
                 :short_matched_selector, :short_matched_declaration, :short_ancestor_classes,
@@ -1572,8 +1606,8 @@ auto_trade_states: Dict[int, Dict[str, Any]] = {}
 def _get_auto_trade_state(user_id: int) -> Dict[str, Any]:
     if user_id not in auto_trade_states:
         auto_trade_states[user_id] = {
-            "long_prev_active": None,   # None = unknown yet (e.g. right after boot) - mirrors telegram_state's edge-trigger pattern
-            "short_prev_active": None,
+            "long_near_entry": False,   # edge-trigger flags, same pattern as telegram_state's "진입 임박" tracking
+            "short_near_entry": False,
         }
     return auto_trade_states[user_id]
 
@@ -1777,36 +1811,49 @@ def _execute_auto_trade(user_id: int, side: str, rows: Dict[str, list], settings
         log("AUTO_TRADE_ERROR", f"order failed for user {user_id}: {type(exc).__name__}: {exc}")
 
 
-def _maybe_auto_trade_for_user(user_id: int, parsed: Dict[str, Any], long_active: bool, short_active: bool) -> None:
-    """Edge-triggered exactly like the Telegram ON alert: fires once when a
-    side flips from OFF to ON, not on every poll while it stays ON, for ONE
-    specific user's own settings/credentials."""
+def _maybe_auto_trade_for_user(
+    user_id: int, parsed: Dict[str, Any], long_active: bool, short_active: bool, current_price_raw: Optional[str],
+) -> None:
+    """Real entries happen when price actually approaches the 1st-stage
+    (25%) E-RANG entry level, NOT the instant the signal turns ON - the
+    signal being ON is a necessary precondition (gates which side is even
+    eligible), but by itself it doesn't mean price is anywhere near a
+    sensible entry. This mirrors the "진입 임박" Telegram alert's trigger
+    exactly (same ENTRY_PROXIMITY_USD threshold, same edge-triggering so it
+    fires once per approach and re-arms once price moves back out of
+    range) rather than duplicating separate logic."""
     if bingx_client is None:
         return
     settings = get_all_user_settings(user_id)
     enabled = str(settings["AUTO_TRADE_ENABLED"]).lower() not in {"0", "false", "no", "off", ""}
     if not enabled:
         return
-    state = _get_auto_trade_state(user_id)
-    with _state_lock:
-        prev_long = state.get("long_prev_active")
-        prev_short = state.get("short_prev_active")
-        state["long_prev_active"] = long_active
-        state["short_prev_active"] = short_active
+    current_price = _to_float_loose(current_price_raw)
+    if current_price is None:
+        return
     rows = _row_map_from_parsed(parsed)
-    if prev_long is not None and long_active and not prev_long:
-        try:
-            _execute_auto_trade(user_id, "long", rows, settings)
-        except Exception as exc:
-            log("AUTO_TRADE_ERROR", f"unhandled error executing LONG auto-trade for user {user_id}: {type(exc).__name__}: {exc}")
-    if prev_short is not None and short_active and not prev_short:
-        try:
-            _execute_auto_trade(user_id, "short", rows, settings)
-        except Exception as exc:
-            log("AUTO_TRADE_ERROR", f"unhandled error executing SHORT auto-trade for user {user_id}: {type(exc).__name__}: {exc}")
+    state = _get_auto_trade_state(user_id)
+    for side, active, state_key in (("long", long_active, "long_near_entry"), ("short", short_active, "short_near_entry")):
+        if not active:
+            with _state_lock:
+                state[state_key] = False
+            continue
+        entries = rows.get(side) or []
+        entry1 = _to_float_loose(entries[0]) if entries else None
+        if entry1 is None:
+            continue
+        is_near = abs(current_price - entry1) <= ENTRY_PROXIMITY_USD
+        with _state_lock:
+            was_near = state.get(state_key, False)
+            state[state_key] = is_near
+        if is_near and not was_near:
+            try:
+                _execute_auto_trade(user_id, side, rows, settings)
+            except Exception as exc:
+                log("AUTO_TRADE_ERROR", f"unhandled error executing {side.upper()} auto-trade for user {user_id}: {type(exc).__name__}: {exc}")
 
 
-def _maybe_auto_trade_all_users(parsed: Dict[str, Any], long_active: bool, short_active: bool) -> None:
+def _maybe_auto_trade_all_users(parsed: Dict[str, Any], long_active: bool, short_active: bool, current_price_raw: Optional[str]) -> None:
     """Runs the auto-trade check for every registered user - each trades (or
     doesn't) independently based on their own settings."""
     try:
@@ -1816,9 +1863,172 @@ def _maybe_auto_trade_all_users(parsed: Dict[str, Any], long_active: bool, short
         return
     for user_id in user_ids:
         try:
-            _maybe_auto_trade_for_user(user_id, parsed, long_active, short_active)
+            _maybe_auto_trade_for_user(user_id, parsed, long_active, short_active, current_price_raw)
         except Exception as exc:
             log("AUTO_TRADE_ERROR", f"unhandled error for user {user_id}: {type(exc).__name__}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# "1/3/5/15분 변화량" - real wall-clock-minute lookback (not candle-count),
+# built by looking up THIS app's own past observations rather than
+# recomputing indicators on truncated kline data - a candle-count lookback
+# means something different on every timeframe (1 candle back on 1h is an
+# hour, on 1m is a minute), whereas "5 minutes ago" should mean the same
+# thing regardless of which timeframe's indicators are being compared.
+# ---------------------------------------------------------------------------
+MINUTE_HISTORY_LOOKBACKS = (1, 3, 5, 15)
+MINUTE_HISTORY_PATHS = {
+    "rsi14": ("rsi14",),
+    "macd": ("macd", "macd"),
+    "macd_hist": ("macd", "histogram"),
+    "cci20": ("cci20",),
+    "stoch_k": ("stochastic", "k"),
+    "adx": ("adx14", "adx"),
+    "plus_di": ("adx14", "plus_di"),
+    "minus_di": ("adx14", "minus_di"),
+    "atr_pct": ("atr_pct",),
+    "vwap_distance_pct": ("vwap_distance_pct",),
+    "volume": ("volume",),
+    "cvd": ("cvd", "cvd"),
+    "taker_buy_ratio": ("taker_flow", "taker_buy_ratio"),
+}
+# Top-level (not per-interval) fields tracked the same way as OI - see
+# _build_minute_history()'s handling of "oi" for the pattern this follows.
+MINUTE_HISTORY_TOP_LEVEL_PATHS = {
+    "long_short_ratio": ("long_short_ratio", "long_short_ratio"),
+    "order_book_imbalance": ("order_book", "imbalance"),
+}
+
+
+def _extract_path(data: Any, path: tuple) -> Any:
+    cur = data
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _binance_json_at(minutes_ago: int) -> Optional[Dict[str, Any]]:
+    target = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+    try:
+        with db_cursor() as (conn, cur):
+            cur.execute(
+                "SELECT binance_json FROM observations WHERE observed_at <= ? ORDER BY observed_at DESC LIMIT 1",
+                (target,),
+            )
+            row = cur.fetchone()
+    except Exception as exc:
+        log("MINUTE_HISTORY_ERROR", f"lookup failed for {minutes_ago}min ago: {type(exc).__name__}: {exc}")
+        return None
+    if not row or not row[0]:
+        return None
+    try:
+        return json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_minute_history(current_binance_json: Dict[str, Any]) -> Dict[str, Any]:
+    """For each configured timeframe and each tracked indicator, reports the
+    current value plus the value from 1/3/5/15 real minutes ago (looked up
+    from this app's own stored observations) and the deltas - directly
+    answering "is this rising/falling and how fast", independent of
+    candle-count-based history tracked separately per indicator."""
+    snapshots = {m: _binance_json_at(m) for m in MINUTE_HISTORY_LOOKBACKS}
+    current_indicators = current_binance_json.get("indicators") or {}
+    result: Dict[str, Any] = {}
+    for interval, cur_ind in current_indicators.items():
+        interval_out: Dict[str, Any] = {}
+        for field, path in MINUTE_HISTORY_PATHS.items():
+            cur_val = _extract_path(cur_ind, path)
+            field_out: Dict[str, Any] = {"current": cur_val}
+            for m in MINUTE_HISTORY_LOOKBACKS:
+                snap = snapshots.get(m)
+                past_ind = (_extract_path(snap, ("indicators", interval)) or {}) if snap else {}
+                past_val = _extract_path(past_ind, path) if past_ind else None
+                field_out[f"m{m}_ago"] = past_val
+                if isinstance(cur_val, (int, float)) and isinstance(past_val, (int, float)):
+                    field_out[f"delta_{m}m"] = cur_val - past_val
+                else:
+                    field_out[f"delta_{m}m"] = None
+            interval_out[field] = field_out
+        result[interval] = interval_out
+    # Open interest is a top-level (not per-interval) field.
+    cur_oi = _to_float_loose(_extract_path(current_binance_json, ("open_interest", "openInterest")))
+    oi_out: Dict[str, Any] = {"current": cur_oi}
+    for m in MINUTE_HISTORY_LOOKBACKS:
+        snap = snapshots.get(m)
+        past_oi = _to_float_loose(_extract_path(snap, ("open_interest", "openInterest"))) if snap else None
+        oi_out[f"m{m}_ago"] = past_oi
+        oi_out[f"delta_{m}m"] = (cur_oi - past_oi) if (cur_oi is not None and past_oi is not None) else None
+    result["oi"] = oi_out
+    # Other top-level (not per-interval) fields - same pattern as OI above.
+    for field, path in MINUTE_HISTORY_TOP_LEVEL_PATHS.items():
+        cur_val = _to_float_loose(_extract_path(current_binance_json, path))
+        field_out: Dict[str, Any] = {"current": cur_val}
+        for m in MINUTE_HISTORY_LOOKBACKS:
+            snap = snapshots.get(m)
+            past_val = _to_float_loose(_extract_path(snap, path)) if snap else None
+            field_out[f"m{m}_ago"] = past_val
+            field_out[f"delta_{m}m"] = (cur_val - past_val) if (cur_val is not None and past_val is not None) else None
+        result[field] = field_out
+    return result
+
+
+# ---------------------------------------------------------------------------
+# long_start/long_end/short_start/short_end (spec section 2) - the E-RANG
+# signal itself is global/shared (one collector for everyone), so this is
+# process-wide state, not per-user. long_start/short_start are carried
+# forward on every row FOR AS LONG AS that side stays ON (so any row can
+# answer "when did the current streak begin" directly, which minutes_since_
+# long_start/short_start then use) - long_end/short_end are stamped only on
+# the exact row where that side turns OFF, marking when it just ended.
+# ---------------------------------------------------------------------------
+_signal_streak_state: Dict[str, Optional[str]] = {"long_start": None, "short_start": None}
+_signal_streak_lock = threading.Lock()
+
+
+def _init_signal_streak_state() -> None:
+    """Recovers in-progress streak state after a restart by checking the
+    most recent observation - if a side was already ON, look back for when
+    that streak actually began instead of resetting to 'started now'."""
+    try:
+        with db_cursor() as (conn, cur):
+            cur.execute(
+                "SELECT long_signal, short_signal, long_start, short_start FROM observations ORDER BY id DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+        if row:
+            with _signal_streak_lock:
+                if row[0]:
+                    _signal_streak_state["long_start"] = row[2]
+                if row[1]:
+                    _signal_streak_state["short_start"] = row[3]
+    except Exception as exc:
+        log("DB_ERROR", f"failed to recover signal streak state: {type(exc).__name__}: {exc}")
+
+
+def _update_signal_streak(observed_at_iso: str, long_active: bool, short_active: bool) -> Dict[str, Optional[str]]:
+    with _signal_streak_lock:
+        long_end = None
+        short_end = None
+        if long_active and not _signal_streak_state["long_start"]:
+            _signal_streak_state["long_start"] = observed_at_iso
+        elif not long_active and _signal_streak_state["long_start"]:
+            long_end = observed_at_iso
+            _signal_streak_state["long_start"] = None
+        if short_active and not _signal_streak_state["short_start"]:
+            _signal_streak_state["short_start"] = observed_at_iso
+        elif not short_active and _signal_streak_state["short_start"]:
+            short_end = observed_at_iso
+            _signal_streak_state["short_start"] = None
+        return {
+            "long_start": _signal_streak_state["long_start"] if long_active else None,
+            "long_end": long_end,
+            "short_start": _signal_streak_state["short_start"] if short_active else None,
+            "short_end": short_end,
+        }
 
 
 def collect_once() -> Dict[str, Any]:
@@ -1849,6 +2059,8 @@ def collect_once() -> Dict[str, Any]:
         "short_ancestor_classes": None,
         "short_label_classes": None,
         "short_own_inline_background": None,
+        "observed_at_kst": None,
+        "long_start": None, "long_end": None, "short_start": None, "short_end": None,
         "parsed_json": {},
         "binance_json": {},
         "raw_text": None,
@@ -1884,20 +2096,36 @@ def collect_once() -> Dict[str, Any]:
         if ENABLE_BINANCE:
             b_price = (binance_json.get("ticker_24h") or {}).get("lastPrice")
             log("BINANCE", f"using snapshot lastPrice={b_price or '-'} errors={len(binance_json.get('errors') or {})}")
+            try:
+                binance_json["minute_history"] = _build_minute_history(binance_json)
+            except Exception as exc:
+                log("MINUTE_HISTORY_ERROR", f"{type(exc).__name__}: {exc}")
+            if liquidation_stream is not None:
+                try:
+                    binance_json["liquidations"] = liquidation_stream.liquidation_summary()
+                except Exception as exc:
+                    log("LIQUIDATION_ERROR", f"{type(exc).__name__}: {exc}")
         sha = hashlib.sha256(html.encode("utf-8", "replace")).hexdigest()
 
         def _join_classes(values: Any) -> Optional[str]:
             vals = [str(v) for v in (values or []) if v]
             return ", ".join(vals) if vals else None
 
+        observed_at_kst = observed_at.astimezone(KST).isoformat()
+        long_active_now = bool(long_sig.get("active"))
+        short_active_now = bool(short_sig.get("active"))
+        streak = _update_signal_streak(observed_at.isoformat(), long_active_now, short_active_now)
         record.update(
             {
                 "http_status": status_code,
                 "success": True,
                 "current_price": current_price,
                 "current_price_raw": current_price_raw,
-                "long_signal": bool(long_sig.get("active")),
-                "short_signal": bool(short_sig.get("active")),
+                "long_signal": long_active_now,
+                "short_signal": short_active_now,
+                "observed_at_kst": observed_at_kst,
+                "long_start": streak["long_start"], "long_end": streak["long_end"],
+                "short_start": streak["short_start"], "short_end": streak["short_end"],
                 "long_color": long_sig.get("detected_color"),
                 "short_color": short_sig.get("detected_color"),
                 "entry_message": bool(parsed.get("entry_message")),
@@ -1949,7 +2177,7 @@ def collect_once() -> Dict[str, Any]:
             except Exception as exc:
                 log("TELEGRAM_ERROR", f"entry-proximity notify failed for user {uid}: {type(exc).__name__}: {exc}")
         try:
-            _maybe_auto_trade_all_users(parsed, bool(long_sig.get("active")), bool(short_sig.get("active")))
+            _maybe_auto_trade_all_users(parsed, bool(long_sig.get("active")), bool(short_sig.get("active")), current_price_raw)
         except Exception as exc:
             log("AUTO_TRADE_ERROR", f"auto-trade check failed: {type(exc).__name__}: {exc}")
     except Exception as exc:
@@ -2312,6 +2540,129 @@ def api_update_status() -> Response:
         return jsonify(dict(update_state))
 
 
+@app.get("/api/events")
+def api_events() -> Response:
+    """Every LONG/SHORT start/end event (spec section 32) - richer than
+    /api/chart-markers: each start event carries the FULL flattened
+    indicator snapshot from that exact row, so a caller can see "what did
+    every tracked indicator look like at the moment this signal began"
+    without a second lookup. Built directly from the long_start/long_end/
+    short_start/short_end columns (spec section 2) rather than re-deriving
+    transitions from long_signal/short_signal."""
+    days = max(1, min(180, int(request.args.get("days", "30"))))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT id, observed_at, long_start, long_end, short_start, short_end, parsed_json, binance_json "
+            "FROM observations WHERE observed_at >= ? ORDER BY id ASC",
+            (since,),
+        )
+        rows = cur.fetchall()
+    events = []
+    seen_long_start = None
+    seen_short_start = None
+    for rid, observed_at, long_start, long_end, short_start, short_end, parsed_text, binance_text in rows:
+        if long_start and long_start != seen_long_start:
+            events.append({
+                "side": "long", "event": "start", "time": long_start, "row_id": rid,
+                "entries": _flatten_entries_for_csv(parsed_text),
+                "indicators": _flatten_binance_for_csv(binance_text),
+            })
+        seen_long_start = long_start
+        if long_end:
+            events.append({"side": "long", "event": "end", "time": long_end, "row_id": rid})
+        if short_start and short_start != seen_short_start:
+            events.append({
+                "side": "short", "event": "start", "time": short_start, "row_id": rid,
+                "entries": _flatten_entries_for_csv(parsed_text),
+                "indicators": _flatten_binance_for_csv(binance_text),
+            })
+        seen_short_start = short_start
+        if short_end:
+            events.append({"side": "short", "event": "end", "time": short_end, "row_id": rid})
+    return jsonify({"events": events})
+
+
+@app.get("/export-signals.csv")
+def export_signals_csv() -> Response:
+    """One row per LONG/SHORT START event (spec section 32) - the same
+    column set as /export.csv, but pre-filtered to just the moments a
+    signal began, so this is directly usable as a labeled dataset ("what
+    did every indicator look like right when LONG/SHORT started") without
+    filtering the full observation history yourself."""
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow([
+        "side", "start_time", "row_id",
+        *CSV_ENTRY_COLUMNS,
+        *CSV_MARKET_COLUMNS,
+        *CSV_INDICATOR_COLUMNS,
+    ])
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT id, long_start, short_start, parsed_json, binance_json FROM observations ORDER BY id ASC"
+        )
+        rows = cur.fetchall()
+    seen_long_start = None
+    seen_short_start = None
+    for rid, long_start, short_start, parsed_text, binance_text in rows:
+        if long_start and long_start != seen_long_start:
+            entries = _flatten_entries_for_csv(parsed_text)
+            market = _flatten_binance_for_csv(binance_text)
+            writer.writerow([
+                "long", long_start, rid,
+                *[entries.get(c) for c in CSV_ENTRY_COLUMNS],
+                *[market.get(c) for c in CSV_MARKET_COLUMNS],
+                *[market.get(c) for c in CSV_INDICATOR_COLUMNS],
+            ])
+        seen_long_start = long_start
+        if short_start and short_start != seen_short_start:
+            entries = _flatten_entries_for_csv(parsed_text)
+            market = _flatten_binance_for_csv(binance_text)
+            writer.writerow([
+                "short", short_start, rid,
+                *[entries.get(c) for c in CSV_ENTRY_COLUMNS],
+                *[market.get(c) for c in CSV_MARKET_COLUMNS],
+                *[market.get(c) for c in CSV_INDICATOR_COLUMNS],
+            ])
+        seen_short_start = short_start
+    return Response(
+        out.getvalue(),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=coin_signal_events.csv"},
+    )
+
+
+@app.get("/api/chart-markers")
+def api_chart_markers() -> Response:
+    """LONG/SHORT signal OFF->ON transition points (edge-triggered, same
+    definition used everywhere else in the app) within the requested
+    lookback window, for overlaying as arrows on the price chart. E-RANG
+    signal collection is shared/global (one collector for everyone), so
+    this isn't scoped per-user."""
+    days = max(1, min(90, int(request.args.get("days", "14"))))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT observed_at, long_signal, short_signal FROM observations "
+            "WHERE observed_at >= ? ORDER BY id ASC",
+            (since,),
+        )
+        rows = cur.fetchall()
+    markers = []
+    prev_long: Optional[bool] = None
+    prev_short: Optional[bool] = None
+    for observed_at, long_sig, short_sig in rows:
+        long_active = bool(long_sig)
+        short_active = bool(short_sig)
+        if prev_long is not None and long_active and not prev_long:
+            markers.append({"time": observed_at, "side": "long"})
+        if prev_short is not None and short_active and not prev_short:
+            markers.append({"time": observed_at, "side": "short"})
+        prev_long, prev_short = long_active, short_active
+    return jsonify({"markers": markers})
+
+
 @app.get("/api/auto-trade/status")
 def api_auto_trade_status() -> Response:
     user_id = session["user_id"]
@@ -2389,38 +2740,132 @@ def api_auto_trade_kill_switch() -> Response:
     return jsonify({"ok": True, "auto_trade_enabled": False, "cancel_result": cancel_result})
 
 
-CSV_INDICATOR_INTERVALS = ["1m", "5m", "15m", "1h"]
+CSV_INDICATOR_INTERVALS = ["1m", "5m", "15m", "1h", "4h"]
 CSV_INDICATOR_FIELDS = [
-    "close", "ema20", "ema50", "ema200", "rsi14", "atr14",
-    "macd", "macd_signal", "macd_hist",
-    "bb_upper", "bb_middle", "bb_lower",
-    "stoch_k", "stoch_d", "adx", "plus_di", "minus_di", "cci", "vwap", "taker_buy_ratio",
+    "close", "ema9", "ema20", "ema21", "ema50", "ema100", "ema200", "ema_alignment", "ema_fast_cross",
+    "dema20", "hma20",
+    "rsi7", "rsi14", "rsi21", "roc12", "atr7", "atr14", "atr_pct",
+    "macd", "macd_signal", "macd_hist", "macd_cross",
+    "bb_upper", "bb_middle", "bb_lower", "bb_width", "bb_width_pct", "bb_position",
+    "kc_upper", "kc_middle", "kc_lower", "bb_keltner_squeeze",
+    "stoch_k", "stoch_d", "stoch_cross", "adx", "plus_di", "minus_di", "di_cross", "di_diff",
+    "cci14", "cci", "cci_zero_cross", "cci_plus100_cross", "cci_minus100_cross",
+    "vwap", "vwap_distance_pct", "vwap_diff", "vwap_diff_atr", "vwap_slope", "taker_buy_ratio", "taker_sell_ratio",
+    "volume_ma20", "volume_ratio", "volume_ma_5", "volume_ma_50", "volume_delta", "volume_slope", "volume_spike",
     "ichimoku_tenkan", "ichimoku_kijun", "ichimoku_senkou_a", "ichimoku_senkou_b",
     "ichimoku_chikou", "ichimoku_cloud_top", "ichimoku_cloud_bottom", "ichimoku_price_vs_cloud",
+    "ichimoku_cloud_thickness", "ichimoku_distance_to_cloud_pct",
+    "stoch_rsi_k", "stoch_rsi_d",
+    "supertrend_value", "supertrend_direction",
+    "structure_last_high_type", "structure_last_low_type", "structure", "structure_bos", "structure_choch",
+    "pivot_high", "pivot_low", "dist_to_pivot_high_pct", "dist_to_pivot_low_pct",
+    "highest_high", "lowest_low", "dist_to_highest_high_pct", "dist_to_lowest_low_pct",
+    "price_change_pct", "return_1", "return_3", "return_5", "return_15",
+    "close_vs_ema9_pct", "close_vs_ema20_pct", "close_vs_ema50_pct", "close_vs_ema100_pct", "close_vs_ema200_pct",
+    "ema9_ema21_pct", "ema20_ema50_pct", "ema50_ema200_pct",
+    "cvd", "cvd_slope5", "cvd_divergence",
 ]
+# "변화량/기울기" (rate-of-change) columns - current / 1-candle-ago /
+# 5-candles-ago / deltas / slope, for the core momentum+trend indicators.
+CSV_HISTORY_INDICATORS = ["rsi14", "macd_hist", "atr_pct", "cci20", "stoch_k", "adx14"]
+CSV_HISTORY_SUFFIXES = ["current", "prev1", "prev5", "delta1", "delta5", "slope5"]
+# Real wall-clock-minute lookback columns (see _build_minute_history) -
+# separate from the candle-count history above.
+CSV_MINUTE_HISTORY_FIELDS = list(MINUTE_HISTORY_PATHS.keys())
+CSV_MINUTE_HISTORY_SUFFIXES = ["current"] + [f"m{m}_ago" for m in MINUTE_HISTORY_LOOKBACKS] + [f"delta_{m}m" for m in MINUTE_HISTORY_LOOKBACKS]
 
 
 def _flatten_indicator_row(ind: Dict[str, Any]) -> Dict[str, Any]:
     macd_d = ind.get("macd") or {}
     bb_d = ind.get("bollinger20") or {}
+    kc_d = ind.get("keltner20") or {}
     stoch_d = ind.get("stochastic") or {}
     adx_d = ind.get("adx14") or {}
     taker_d = ind.get("taker_flow") or {}
     ichi_d = ind.get("ichimoku") or {}
-    return {
-        "close": ind.get("close"), "ema20": ind.get("ema20"), "ema50": ind.get("ema50"), "ema200": ind.get("ema200"),
-        "rsi14": ind.get("rsi14"), "atr14": ind.get("atr14"),
+    ichi_extra_d = ind.get("ichimoku_extra") or {}
+    stoch_rsi_d = ind.get("stoch_rsi") or {}
+    supertrend_d = ind.get("supertrend") or {}
+    structure_d = ind.get("market_structure") or {}
+    structure_breaks_d = ind.get("market_structure_breaks") or {}
+    cvd_d = ind.get("cvd") or {}
+    ema_align_d = ind.get("ema_alignment") or {}
+    ema_dist_d = ind.get("ema_distance") or {}
+    volume_ma_d = ind.get("volume_ma20") or {}
+    volume_extra_d = ind.get("volume_extra") or {}
+    pivot_d = ind.get("pivot_levels") or {}
+    recent_hl_d = ind.get("recent_high_low") or {}
+    returns_d = ind.get("price_returns") or {}
+    bb_extra_d = ind.get("bollinger_extra") or {}
+    vwap_extra_d = ind.get("vwap_extra") or {}
+    cci_cross_d = ind.get("cci_cross") or {}
+    taker_buy_ratio = taker_d.get("taker_buy_ratio")
+    plus_di, minus_di = adx_d.get("plus_di"), adx_d.get("minus_di")
+    out = {
+        "close": ind.get("close"),
+        "ema9": ind.get("ema9"), "ema20": ind.get("ema20"), "ema21": ind.get("ema21"),
+        "ema50": ind.get("ema50"), "ema100": ind.get("ema100"), "ema200": ind.get("ema200"),
+        "ema_alignment": ema_align_d.get("alignment"), "ema_fast_cross": ema_align_d.get("fast_cross"),
+        "dema20": ind.get("dema20"), "hma20": ind.get("hma20"),
+        "rsi7": ind.get("rsi7"), "rsi14": ind.get("rsi14"), "rsi21": ind.get("rsi21"), "roc12": ind.get("roc12"),
+        "atr7": ind.get("atr7"), "atr14": ind.get("atr14"), "atr_pct": ind.get("atr_pct"),
         "macd": macd_d.get("macd"), "macd_signal": macd_d.get("signal"), "macd_hist": macd_d.get("histogram"),
+        "macd_cross": ind.get("macd_cross"),
         "bb_upper": bb_d.get("upper"), "bb_middle": bb_d.get("middle"), "bb_lower": bb_d.get("lower"),
-        "stoch_k": stoch_d.get("k"), "stoch_d": stoch_d.get("d"),
-        "adx": adx_d.get("adx"), "plus_di": adx_d.get("plus_di"), "minus_di": adx_d.get("minus_di"),
-        "cci": ind.get("cci20"), "vwap": ind.get("vwap"), "taker_buy_ratio": taker_d.get("taker_buy_ratio"),
+        "bb_width": bb_extra_d.get("bb_width"), "bb_width_pct": bb_extra_d.get("bb_width_pct"),
+        "bb_position": bb_extra_d.get("bb_position"),
+        "kc_upper": kc_d.get("upper"), "kc_middle": kc_d.get("middle"), "kc_lower": kc_d.get("lower"),
+        "bb_keltner_squeeze": ind.get("bb_keltner_squeeze"),
+        "stoch_k": stoch_d.get("k"), "stoch_d": stoch_d.get("d"), "stoch_cross": ind.get("stoch_cross"),
+        "adx": adx_d.get("adx"), "plus_di": plus_di, "minus_di": minus_di,
+        "di_cross": ind.get("di_cross"),
+        "di_diff": (plus_di - minus_di) if (plus_di is not None and minus_di is not None) else None,
+        "cci14": ind.get("cci14"), "cci": ind.get("cci20"),
+        "cci_zero_cross": cci_cross_d.get("zero_cross"), "cci_plus100_cross": cci_cross_d.get("plus100_cross"),
+        "cci_minus100_cross": cci_cross_d.get("minus100_cross"),
+        "vwap": ind.get("vwap"), "vwap_distance_pct": ind.get("vwap_distance_pct"),
+        "vwap_diff": vwap_extra_d.get("vwap_diff"), "vwap_diff_atr": vwap_extra_d.get("vwap_diff_atr"),
+        "vwap_slope": vwap_extra_d.get("vwap_slope"),
+        "taker_buy_ratio": taker_buy_ratio,
+        "taker_sell_ratio": (1 - taker_buy_ratio) if taker_buy_ratio is not None else None,
+        "volume_ma20": volume_ma_d.get("volume_ma"), "volume_ratio": volume_ma_d.get("volume_ratio"),
+        "volume_ma_5": volume_extra_d.get("volume_ma_5"), "volume_ma_50": volume_extra_d.get("volume_ma_50"),
+        "volume_delta": volume_extra_d.get("volume_delta"), "volume_slope": volume_extra_d.get("volume_slope"),
+        "volume_spike": volume_extra_d.get("volume_spike"),
         "ichimoku_tenkan": ichi_d.get("tenkan_sen"), "ichimoku_kijun": ichi_d.get("kijun_sen"),
         "ichimoku_senkou_a": ichi_d.get("senkou_span_a"), "ichimoku_senkou_b": ichi_d.get("senkou_span_b"),
         "ichimoku_chikou": ichi_d.get("chikou_span"),
         "ichimoku_cloud_top": ichi_d.get("cloud_top"), "ichimoku_cloud_bottom": ichi_d.get("cloud_bottom"),
         "ichimoku_price_vs_cloud": ichi_d.get("price_vs_cloud"),
+        "ichimoku_cloud_thickness": ichi_extra_d.get("cloud_thickness"),
+        "ichimoku_distance_to_cloud_pct": ichi_extra_d.get("distance_to_cloud_pct"),
+        "stoch_rsi_k": stoch_rsi_d.get("k"), "stoch_rsi_d": stoch_rsi_d.get("d"),
+        "supertrend_value": supertrend_d.get("value"), "supertrend_direction": supertrend_d.get("direction"),
+        "structure_last_high_type": structure_d.get("last_high_type"),
+        "structure_last_low_type": structure_d.get("last_low_type"),
+        "structure": structure_d.get("structure"),
+        "structure_bos": structure_breaks_d.get("bos"), "structure_choch": structure_breaks_d.get("choch"),
+        "pivot_high": pivot_d.get("recent_pivot_high"), "pivot_low": pivot_d.get("recent_pivot_low"),
+        "dist_to_pivot_high_pct": pivot_d.get("dist_to_pivot_high_pct"),
+        "dist_to_pivot_low_pct": pivot_d.get("dist_to_pivot_low_pct"),
+        "highest_high": recent_hl_d.get("highest_high"), "lowest_low": recent_hl_d.get("lowest_low"),
+        "dist_to_highest_high_pct": recent_hl_d.get("dist_to_highest_high_pct"),
+        "dist_to_lowest_low_pct": recent_hl_d.get("dist_to_lowest_low_pct"),
+        "price_change_pct": returns_d.get("price_change_pct"),
+        "return_1": returns_d.get("return_1"), "return_3": returns_d.get("return_3"),
+        "return_5": returns_d.get("return_5"), "return_15": returns_d.get("return_15"),
+        "close_vs_ema9_pct": ema_dist_d.get("close_vs_ema9_pct"), "close_vs_ema20_pct": ema_dist_d.get("close_vs_ema20_pct"),
+        "close_vs_ema50_pct": ema_dist_d.get("close_vs_ema50_pct"), "close_vs_ema100_pct": ema_dist_d.get("close_vs_ema100_pct"),
+        "close_vs_ema200_pct": ema_dist_d.get("close_vs_ema200_pct"),
+        "ema9_ema21_pct": ema_dist_d.get("ema9_ema21_pct"), "ema20_ema50_pct": ema_dist_d.get("ema20_ema50_pct"),
+        "ema50_ema200_pct": ema_dist_d.get("ema50_ema200_pct"),
+        "cvd": cvd_d.get("cvd"), "cvd_slope5": cvd_d.get("cvd_slope5"), "cvd_divergence": ind.get("cvd_divergence"),
     }
+    for hist_key in CSV_HISTORY_INDICATORS:
+        hist_d = ind.get(f"{hist_key}_history") or {}
+        for suffix in CSV_HISTORY_SUFFIXES:
+            out[f"{hist_key}_{suffix}"] = hist_d.get(suffix)
+    return out
 
 
 def _flatten_binance_for_csv(binance_json_text: Optional[str]) -> Dict[str, Any]:
@@ -2436,17 +2881,64 @@ def _flatten_binance_for_csv(binance_json_text: Optional[str]) -> Dict[str, Any]
     indicators = data.get("indicators") or {}
     for interval in CSV_INDICATOR_INTERVALS:
         flat = _flatten_indicator_row(indicators.get(interval) or {})
-        for field in CSV_INDICATOR_FIELDS:
+        for field in CSV_INDICATOR_FIELDS_WITH_HISTORY:
             out[f"{interval}_{field}"] = flat.get(field)
     ob = data.get("order_book") or {}
     out["order_book_bid_volume"] = ob.get("bid_volume")
     out["order_book_ask_volume"] = ob.get("ask_volume")
     out["order_book_imbalance"] = ob.get("imbalance")
+    out["order_book_imbalance_5"] = ob.get("imbalance_5")
+    out["order_book_imbalance_10"] = ob.get("imbalance_10")
+    out["order_book_imbalance_20"] = ob.get("imbalance_20")
     out["order_book_spread"] = ob.get("spread")
+    out["order_book_spread_pct"] = ob.get("spread_pct")
     premium = data.get("premium_index") or {}
     out["funding_rate_latest"] = premium.get("lastFundingRate")
+    fx = data.get("funding_extra") or {}
+    out["funding_change"] = fx.get("funding_change")
+    out["funding_extreme"] = fx.get("funding_extreme")
     oi = data.get("open_interest") or {}
     out["open_interest"] = oi.get("openInterest")
+    ls = data.get("long_short_ratio") or {}
+    out["long_short_ratio"] = ls.get("long_short_ratio")
+    out["long_account_pct"] = ls.get("long_account_pct")
+    out["short_account_pct"] = ls.get("short_account_pct")
+    tt = data.get("top_trader_ratio") or {}
+    out["top_account_long_short_ratio"] = tt.get("top_account_long_short_ratio")
+    out["top_position_long_short_ratio"] = tt.get("top_position_long_short_ratio")
+    oi_change = data.get("oi_change") or {}
+    out["oi_change_pct"] = oi_change.get("oi_change_pct")
+    out["oi_price_classification"] = data.get("oi_price_classification")
+    tc = data.get("time_context") or {}
+    out["hour_kst"] = tc.get("hour_kst")
+    out["hour_utc"] = tc.get("hour_utc")
+    out["weekday"] = tc.get("weekday")
+    out["is_weekend"] = tc.get("is_weekend")
+    sessions = tc.get("sessions") or []
+    out["session_asia"] = "asia" in sessions
+    out["session_europe"] = "europe" in sessions
+    out["session_us"] = "us" in sessions
+    out["session_overlap"] = tc.get("session_overlap")
+    minute_history = data.get("minute_history") or {}
+    for interval in CSV_INDICATOR_INTERVALS:
+        interval_hist = minute_history.get(interval) or {}
+        for field in CSV_MINUTE_HISTORY_FIELDS:
+            field_hist = interval_hist.get(field) or {}
+            for suffix in CSV_MINUTE_HISTORY_SUFFIXES:
+                out[f"{interval}_{field}_{suffix}"] = field_hist.get(suffix)
+    oi_hist = minute_history.get("oi") or {}
+    for suffix in CSV_MINUTE_HISTORY_SUFFIXES:
+        out[f"oi_{suffix}"] = oi_hist.get(suffix)
+    for field in MINUTE_HISTORY_TOP_LEVEL_PATHS:
+        field_hist = minute_history.get(field) or {}
+        for suffix in CSV_MINUTE_HISTORY_SUFFIXES:
+            out[f"{field}_{suffix}"] = field_hist.get(suffix)
+    liq = data.get("liquidations") or {}
+    out["liq_connected"] = liq.get("connected")
+    for minutes in (1, 5, 15):
+        w = liq.get(f"m{minutes}") or {}
+        for field in ("long_liq_count", "long_liq_qty", "long_liq_notional", "short_liq_count", "short_liq_qty", "short_liq_notional", "liq_imbalance"):
+            out[f"liq_m{minutes}_{field}"] = w.get(field)
     return out
 
 
@@ -2467,9 +2959,72 @@ def _flatten_entries_for_csv(parsed_json_text: Optional[str]) -> Dict[str, Any]:
     }
 
 
-CSV_INDICATOR_COLUMNS = [f"{iv}_{field}" for iv in CSV_INDICATOR_INTERVALS for field in CSV_INDICATOR_FIELDS]
-CSV_MARKET_COLUMNS = ["order_book_bid_volume", "order_book_ask_volume", "order_book_imbalance", "order_book_spread", "funding_rate_latest", "open_interest"]
+CSV_INDICATOR_FIELDS_WITH_HISTORY = CSV_INDICATOR_FIELDS + [
+    f"{k}_{s}" for k in CSV_HISTORY_INDICATORS for s in CSV_HISTORY_SUFFIXES
+] + [
+    f"{k}_{s}" for k in CSV_MINUTE_HISTORY_FIELDS for s in CSV_MINUTE_HISTORY_SUFFIXES
+]
+CSV_INDICATOR_COLUMNS = [f"{iv}_{field}" for iv in CSV_INDICATOR_INTERVALS for field in CSV_INDICATOR_FIELDS_WITH_HISTORY]
+CSV_MARKET_COLUMNS = [
+    "order_book_bid_volume", "order_book_ask_volume", "order_book_imbalance",
+    "order_book_imbalance_5", "order_book_imbalance_10", "order_book_imbalance_20",
+    "order_book_spread", "order_book_spread_pct",
+    "funding_rate_latest", "funding_change", "funding_extreme", "open_interest",
+    "long_short_ratio", "long_account_pct", "short_account_pct",
+    "top_account_long_short_ratio", "top_position_long_short_ratio",
+    "oi_change_pct", "oi_price_classification",
+    "hour_kst", "hour_utc", "weekday", "is_weekend",
+    "session_asia", "session_europe", "session_us", "session_overlap",
+] + [f"oi_{s}" for s in CSV_MINUTE_HISTORY_SUFFIXES] + [
+    f"{field}_{s}" for field in MINUTE_HISTORY_TOP_LEVEL_PATHS for s in CSV_MINUTE_HISTORY_SUFFIXES
+] + [
+    "liq_connected",
+] + [
+    f"liq_m{m}_{f}" for m in (1, 5, 15)
+    for f in ("long_liq_count", "long_liq_qty", "long_liq_notional", "short_liq_count", "short_liq_qty", "short_liq_notional", "liq_imbalance")
+]
 CSV_ENTRY_COLUMNS = ["long_entry1", "long_tp1", "long_sl1", "short_entry1", "short_tp1", "short_sl1"]
+
+
+EXPECTED_BINANCE_TOP_KEYS = [
+    "ticker_24h", "premium_index", "open_interest", "order_book",
+    "funding_rate_history", "long_short_ratio", "top_trader_ratio",
+    "oi_change", "indicators", "time_context", "minute_history", "liquidations",
+]
+
+
+def _data_quality(binance_json_text: Optional[str]) -> tuple:
+    """data_quality_score (spec section 30): % of the expected top-level
+    Binance data groups that are actually present and non-empty for this
+    row, penalized further for any recorded per-call errors - lets a
+    downstream model (or a human) filter out/weight down rows where a lot
+    of context was missing (e.g. Binance had a bad moment) rather than
+    silently treating a partially-empty row the same as a complete one."""
+    try:
+        data = json.loads(binance_json_text) if binance_json_text else {}
+    except (TypeError, ValueError):
+        data = {}
+    if not data:
+        return None, None
+    present = sum(1 for k in EXPECTED_BINANCE_TOP_KEYS if data.get(k))
+    error_count = len(data.get("errors") or {})
+    missing_count = (len(EXPECTED_BINANCE_TOP_KEYS) - present) + error_count
+    score = round(present / len(EXPECTED_BINANCE_TOP_KEYS) * 100, 1)
+    return score, missing_count
+
+
+def _minutes_since(start_iso: Optional[str], observed_at_iso: Optional[str]) -> Optional[float]:
+    """minutes_since_long_start/short_start (spec section 29) - how long
+    the CURRENT ON streak has been running as of this row, computed from
+    the carried-forward long_start/short_start columns."""
+    if not start_iso or not observed_at_iso:
+        return None
+    try:
+        start_dt = datetime.fromisoformat(start_iso)
+        obs_dt = datetime.fromisoformat(observed_at_iso)
+        return round((obs_dt - start_dt).total_seconds() / 60, 2)
+    except (TypeError, ValueError):
+        return None
 
 
 @app.get("/export.csv")
@@ -2477,8 +3032,10 @@ def export_csv() -> Response:
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow([
-        "id", "observed_at", "http_status", "success", "current_price", "current_price_raw",
-        "long_signal", "short_signal", "long_color", "short_color", "entry_message",
+        "id", "observed_at", "observed_at_kst", "http_status", "success", "current_price", "current_price_raw",
+        "long_signal", "short_signal", "long_start", "long_end", "short_start", "short_end",
+        "minutes_since_long_start", "minutes_since_short_start",
+        "long_color", "short_color", "entry_message",
         # Precise, structured entry-basis evidence (v3.6) - exactly what
         # caused each side's color to be detected, as flat CSV columns so
         # this is directly usable for building a separate dataset without
@@ -2494,15 +3051,17 @@ def export_csv() -> Response:
         # Full technical-indicator set per timeframe, flattened (v3.52) -
         # this is the main payload for building an independent long/short
         # model: EMA/RSI/ATR/MACD/Bollinger/Stochastic/ADX/CCI/VWAP/taker-flow
-        # for each of 1m/5m/15m/1h, one column per (interval, field) pair.
+        # for each of 1m/5m/15m/1h/4h, one column per (interval, field) pair.
         *CSV_INDICATOR_COLUMNS,
+        "data_quality_score", "missing_fields_count",
         "content_sha256", "error", "parsed_json", "binance_json",
     ])
     with db_cursor() as (conn, cur):
         cur.execute(
             """
-            SELECT id, observed_at, http_status, success, current_price, current_price_raw,
-                   long_signal, short_signal, long_color, short_color, entry_message,
+            SELECT id, observed_at, observed_at_kst, http_status, success, current_price, current_price_raw,
+                   long_signal, short_signal, long_start, long_end, short_start, short_end,
+                   long_color, short_color, entry_message,
                    long_matched_selector, long_matched_declaration, long_ancestor_classes,
                    long_label_classes, long_own_inline_background,
                    short_matched_selector, short_matched_declaration, short_ancestor_classes,
@@ -2512,19 +3071,29 @@ def export_csv() -> Response:
             """
         )
         for row in cur:
-            entries = _flatten_entries_for_csv(row[23])
-            market = _flatten_binance_for_csv(row[24])
+            (rid, observed_at, observed_at_kst, http_status, success, current_price, current_price_raw,
+             long_signal, short_signal, long_start, long_end, short_start, short_end,
+             long_color, short_color, entry_message,
+             long_sel, long_decl, long_anc, long_lbl, long_bg,
+             short_sel, short_decl, short_anc, short_lbl, short_bg,
+             sha, error, parsed_json_text, binance_json_text) = row
+            entries = _flatten_entries_for_csv(parsed_json_text)
+            market = _flatten_binance_for_csv(binance_json_text)
+            dq_score, dq_missing = _data_quality(binance_json_text)
             writer.writerow([
-                row[0], row[1], row[2], row[3], row[4], row[5],
-                row[6], row[7], row[8], row[9], row[10],
-                row[11], row[12], row[13], row[14], row[15],
-                row[16], row[17], row[18], row[19], row[20],
+                rid, observed_at, observed_at_kst, http_status, success, current_price, current_price_raw,
+                long_signal, short_signal, long_start, long_end, short_start, short_end,
+                _minutes_since(long_start, observed_at), _minutes_since(short_start, observed_at),
+                long_color, short_color, entry_message,
+                long_sel, long_decl, long_anc, long_lbl, long_bg,
+                short_sel, short_decl, short_anc, short_lbl, short_bg,
                 *[entries.get(c) for c in CSV_ENTRY_COLUMNS],
                 *[market.get(c) for c in CSV_MARKET_COLUMNS],
                 *[market.get(c) for c in CSV_INDICATOR_COLUMNS],
-                row[21], row[22],
-                row[23] or "{}",
-                row[24] or "{}",
+                dq_score, dq_missing,
+                sha, error,
+                parsed_json_text or "{}",
+                binance_json_text or "{}",
             ])
     return Response(
         out.getvalue(),
@@ -2543,7 +3112,9 @@ DASHBOARD_HTML = r"""
 <style>
 :root{--bg:#07101f;--panel:#0e1b31;--panel2:#101f38;--line:#243b5f;--text:#f4f7ff;--muted:#8fa7c9;--blue:#38a5ff;--red:#ff5364;--green:#35e29a;--yellow:#ffc83d}*{box-sizing:border-box}html{overflow-x:hidden}body{margin:0;overflow-x:hidden;max-width:100vw;background:radial-gradient(circle at 20% 0,#102442 0,#07101f 45%);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1540px;margin:auto;padding:24px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.topTitle{min-width:0;flex:1 1 auto}.top h1{margin:0;font-size:30px;overflow-wrap:break-word}.actions{min-width:0}.sub,.muted{color:var(--muted)}.sub{margin-top:5px}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.btn{border:1px solid var(--line);background:#152540;color:#fff;padding:11px 15px;border-radius:11px;text-decoration:none;font-weight:800;cursor:pointer}.live{color:var(--green);font-weight:900}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{background:linear-gradient(145deg,rgba(16,31,56,.98),rgba(10,24,44,.98));border:1px solid var(--line);border-radius:17px;padding:18px;box-shadow:0 14px 32px #0004;min-width:0}.s2{grid-column:span 2}.s3{grid-column:span 3}.s4{grid-column:span 4}.s6{grid-column:span 6}.s8{grid-column:span 8}.s12{grid-column:span 12}.label{font-size:13px;color:#a9bfdf;font-weight:800}.big{font-size:29px;font-weight:950;margin-top:7px}.hero{display:flex;align-items:center;gap:22px;min-height:110px}.heroSignal{font-size:42px;font-weight:1000}.short{color:var(--red)}.long{color:var(--blue)}.wait{color:var(--yellow)}.ok{color:var(--green)}h2{font-size:18px;margin:0 0 14px}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:680px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}th{background:#132947;color:#c7dcfa;font-size:12px}.rowlong.on td:first-child{font-weight:950;color:var(--blue)}.rowshort.on td:first-child{background:#ef3340;color:#fff;font-weight:950}.entryrow{display:grid;grid-template-columns:82px repeat(5,1fr);gap:8px;align-items:stretch;margin-bottom:10px}.sideLabel{display:flex;align-items:center;font-size:20px;font-weight:950}.entry{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:10px;min-width:0}.entry b{font-size:12px;color:#9fb8db;display:block}.entry strong{font-size:17px;display:block;margin-top:5px;white-space:nowrap}.dist{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.dist .entry strong{font-size:20px}.tabs{display:flex;gap:7px;margin:12px 0}.tab{flex:1;border:1px solid var(--line);background:#102746;color:#c8daf4;padding:9px;border-radius:9px;font-weight:850;cursor:pointer}.tab.active{background:#168cff;color:white}.metricTop{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metricTop6{display:grid;grid-template-columns:repeat(6,1fr);gap:9px}.metricTop7{display:grid;grid-template-columns:repeat(7,1fr);gap:9px}.metricTop8{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{background:#0a172b;border:1px solid var(--line);border-radius:11px;padding:12px}.metric b{display:block;color:#9fb8db;font-size:12px}.metric strong{display:block;font-size:19px;margin-top:6px}.indtable{min-width:0}.indtable td:nth-child(2){font-weight:800}.statusUp{color:var(--green)}.statusDown{color:var(--red)}.statusNeutral{color:#dbe7f8}.evidence{line-height:1.7}.evidence strong{font-size:18px}.foot{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:13px;gap:12px}.nowrap{white-space:nowrap}.clickrow{cursor:pointer}.clickrow:hover{background:#132947}.analysisGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.analysisBox{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:14px}.analysisBox h3{margin:0 0 10px;font-size:17px}.chips{display:flex;gap:7px;flex-wrap:wrap}.chip{background:#102746;border:1px solid var(--line);border-radius:999px;padding:6px 9px;font-size:12px}.detailHead{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}.hint{font-size:12px;color:var(--muted)}.reasonCell{text-align:left;white-space:normal;min-width:220px;max-width:320px}.profitCell{text-align:left;white-space:normal;min-width:170px}.profitCell div{margin-bottom:4px;font-weight:800}.profitCell div:last-child{margin-bottom:0}.profitCell .muted{font-weight:600;font-size:11px}.reasonMini{font-size:11px;line-height:1.45;margin-bottom:5px;padding:5px 7px;border-radius:7px;background:#0a172b;border:1px solid var(--line)}.reasonMini:last-child{margin-bottom:0}.reasonMini.long{color:#bcdcff;border-color:#2563eb55}.reasonMini.short{color:#ffd0d6;border-color:#ef334055}.reasonMini b{font-weight:900}.reasonList{margin:9px 0 0;padding-left:18px;font-size:12px;color:#c7dcfa;line-height:1.6}.reasonList li{margin-bottom:3px}.reasonSummary{background:#0a172b;border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:6px}.reasonSummary b{display:block;margin-bottom:6px;font-size:13px;color:#dbe7f8}.ptabs{display:flex;gap:7px;margin:12px 0}.ptab{flex:1;border:1px solid var(--line);background:#102746;color:#c8daf4;padding:9px;border-radius:9px;font-weight:850;cursor:pointer;text-align:center}.ptab.active{background:#168cff;color:white}.ppanel{display:none}.ppanel.active{display:block}.pside-long{color:var(--blue);background:rgba(56,165,255,.14);padding:2px 8px;border-radius:5px;font-size:12px;font-weight:800}.pside-short{color:var(--red);background:rgba(255,83,100,.14);padding:2px 8px;border-radius:5px;font-size:12px;font-weight:800}.ptable td.pnum{text-align:right}.ptable{min-width:0}.posAvatar{display:inline-block;width:20px;height:20px;border-radius:50%;background:#102746;margin-right:5px;object-fit:cover;vertical-align:middle;border:1px solid var(--line)}.posMini{font-size:12px;line-height:1.7;margin-top:7px}.posMini .prow{display:flex;justify-content:space-between;gap:8px}.posMini .prow b{font-weight:800}.tvChartBox{height:760px;border-radius:12px;overflow:hidden;resize:vertical;min-height:320px;max-height:1400px}
 @media(max-width:1050px){.s2,.s3,.s4,.s6,.s8{grid-column:span 12}.metricTop{grid-template-columns:1fr 1fr}.metricTop6{grid-template-columns:repeat(3,1fr)}.metricTop7{grid-template-columns:repeat(4,1fr)}.metricTop8{grid-template-columns:repeat(4,1fr)}.two{grid-template-columns:1fr}.entryrow{grid-template-columns:70px repeat(5,130px);overflow-x:auto}.dist{grid-template-columns:repeat(5,140px);overflow-x:auto}.tvChartBox{height:520px}}@media(max-width:600px){.wrap{padding:12px}.card{padding:14px}.top{flex-direction:column}.metricTop{grid-template-columns:1fr 1fr}.metricTop6{grid-template-columns:1fr 1fr}.metricTop7{grid-template-columns:1fr 1fr}.metricTop8{grid-template-columns:1fr 1fr}.heroSignal{font-size:34px}.tvChartBox{height:400px}.actions{width:100%}.actions .btn{flex:1 1 auto;text-align:center}.metric b{font-size:11px}.metric strong{font-size:16px}}@media(max-width:380px){.top h1{font-size:24px}.metricTop6{grid-template-columns:1fr}.metricTop7{grid-template-columns:1fr}.metricTop8{grid-template-columns:1fr}.ptabs{flex-wrap:wrap}.ptab{flex:1 1 45%}}
-</style></head><body><div class="wrap">
+</style>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+</head><body><div class="wrap">
 <div class="top"><div class="topTitle"><h1>Coin Monitor</h1><div class="sub">e-rang coin.php 1분 수집 + LONG/SHORT 색상 신호 + Binance 보조 데이터</div></div><div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collect" class="btn">강제 수집</button><button id="telegramTest" class="btn">텔레그램 현재상태 발송</button><a class="btn" href="/settings">설정</a><a class="btn" href="/logout">로그아웃</a><span id="live" class="live">● 정상 수집 중</span><span id="lastSync" class="muted"></span><span id="lastTop" class="muted"></span></div></div>
 <div id="updateBanner" style="display:none;background:linear-gradient(90deg,#1a3a6e,#0e1b31);border:1px solid #38a5ff88;border-radius:12px;padding:12px 16px;margin-bottom:16px;align-items:center;justify-content:space-between;gap:12px"><span>🎮 <b>새 버전이 나왔어요!</b> <span id="updateVersionText" class="muted"></span></span><a id="updateDownloadLink" class="btn" href="#" target="_blank" style="background:#38a5ff;color:#04101f">지금 다운로드</a></div>
 <div class="grid">
@@ -2553,24 +3124,7 @@ DASHBOARD_HTML = r"""
 <div class="card s2"><div class="label">DB / 서버</div><div id="db" class="big ok" style="font-size:21px">-</div><div id="server" class="muted">-</div></div>
 <div class="card s2"><div class="label"><img class="posAvatar" src="data:image/png;base64,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" alt="뿌꾸"> 현재 포지션</div><div id="posMini" class="posMini"><span class="muted">-</span></div></div>
 <div class="card s6"><h2>E-RANG 진입가 <span class="muted">(현재 화면 기준)</span></h2><div class="tablewrap"><table><thead><tr><th>구분</th><th>진입 1<br>(25%)</th><th>진입 2<br>(40%)</th><th>진입 3<br>(60%)</th><th>진입 4<br>(100%)</th><th>진입 5<br>(예비)</th></tr></thead><tbody id="erangRows"></tbody></table></div></div>
-<div class="card s6"><div class="detailHead"><h2>실시간 BTC 선물 차트 <span class="muted">(Binance BTCUSDT Perpetual · TradingView 위젯)</span></h2><div style="display:flex;gap:6px"><button type="button" class="btn chartSizeBtn" data-h="420" style="padding:6px 11px;font-size:12px">작게</button><button type="button" class="btn chartSizeBtn" data-h="760" style="padding:6px 11px;font-size:12px">보통</button><button type="button" class="btn chartSizeBtn" data-h="1100" style="padding:6px 11px;font-size:12px">크게</button></div></div><div class="tradingview-widget-container tvChartBox" style="width:100%"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div><script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
-{
-"autosize": true,
-"symbol": "BINANCE:BTCUSDT.P",
-"interval": "15",
-"timezone": "Asia/Seoul",
-"theme": "dark",
-"style": "1",
-"locale": "kr",
-"backgroundColor": "rgba(14, 27, 49, 1)",
-"gridColor": "rgba(36, 59, 95, 0.35)",
-"hide_top_toolbar": false,
-"hide_legend": false,
-"save_image": false,
-"calendar": false,
-"support_host": "https://www.tradingview.com"
-}
-</script></div></div>
+<div class="card s6"><div class="detailHead"><h2>실시간 BTC 선물 차트 <span class="muted">(Binance BTCUSDT · LONG/SHORT 신호 마커 표시)</span></h2><div style="display:flex;gap:6px"><button type="button" class="btn chartSizeBtn" data-h="420" style="padding:6px 11px;font-size:12px">작게</button><button type="button" class="btn chartSizeBtn" data-h="760" style="padding:6px 11px;font-size:12px">보통</button><button type="button" class="btn chartSizeBtn" data-h="1100" style="padding:6px 11px;font-size:12px">크게</button></div></div><div id="lwChartBox" class="tvChartBox" style="width:100%"></div></div>
 <div class="card s12"><div class="detailHead"><h2>내 Bitget 계좌 <span class="muted">(통합계좌 · 실계좌 · 읽기 전용)</span></h2><span class="hint" id="bgHint"></span></div><div class="metricTop metricTop8"><div class="metric"><b>지금까지 수익PNL (계정 전체)</b><strong id="bgLifetimePnl">-</strong></div><div class="metric"><b>총 PNL (실시간 · 포지션 없으면 사라짐)</b><strong id="bgLivePnl">-</strong></div><div class="metric"><b>총자산 (Account Equity)</b><strong id="bgAccountEquity">-</strong></div><div class="metric"><b>USDT 잔고</b><strong id="bgEquity">-</strong></div><div class="metric"><b>미실현 PNL</b><strong id="bgPnl">-</strong></div><div class="metric"><b>유효자산 (Eff. Equity)</b><strong id="bgEffEquity">-</strong></div><div class="metric"><b>승률</b><strong id="bgWinRate">-</strong></div><div class="metric"><b>PNL (통합)</b><strong id="bgCombinedPnl">-</strong></div></div><div class="ptabs"><button class="ptab active" data-ptab="positions">현재 포지션</button><button class="ptab" data-ptab="fills">체결 내역</button><button class="ptab" data-ptab="orders">주문 내역</button></div><div id="ppanel-positions" class="ppanel active"><div class="muted">-</div></div><div id="ppanel-fills" class="ppanel"><div class="muted">-</div></div><div id="ppanel-orders" class="ppanel"><div class="muted">-</div></div><div class="foot"><span>ⓘ 가격/손익은 Bitget API 응답을 그대로 표시합니다. 승률/PNL(통합)은 청산(close) 체결의 실현손익 기준이며, 매매 판단 참고용입니다.</span><span id="bgUpdate"></span></div></div>
 <div class="card s12"><div class="detailHead"><h2>🤖 자동매매 <span class="muted">(BingX)</span></h2><span id="atStatusBadge" class="hint">-</span></div><div class="metricTop" style="grid-template-columns:repeat(4,1fr)"><div class="metric"><b>오늘 진입 횟수</b><strong id="atTradeCount">-</strong></div><div class="metric"><b>오늘 실현손익</b><strong id="atTodayPnl">-</strong></div><div class="metric"><b>심볼 / 레버리지</b><strong id="atSymbolLev" style="font-size:16px">-</strong></div><div class="metric"><b>1회 진입 마진</b><strong id="atMargin" style="font-size:16px">-</strong></div></div><div style="margin:12px 0"><a class="btn" href="/settings">설정에서 자동매매 켜기/끄기</a> <button id="atKillSwitch" class="btn" style="background:#ff5364;color:#1a0508;border:none">🛑 긴급 정지</button></div><div id="atLog"><div class="muted">-</div></div></div>
 <div class="card s6"><h2>Binance 보조 지표 (BTCUSDT)</h2><div class="metricTop"><div class="metric"><b>현재가 (Last Price)</b><strong id="bLast">-</strong></div><div class="metric"><b>펀딩비 (Funding Rate)</b><strong id="funding">-</strong></div><div class="metric"><b>미결제약정 (Open Interest)</b><strong id="oi">-</strong></div><div class="metric"><b>24h 거래량</b><strong id="vol24">-</strong></div></div><div class="tabs"><button class="tab" data-tf="1m">1분</button><button class="tab" data-tf="5m">5분</button><button class="tab active" data-tf="15m">15분</button><button class="tab" data-tf="1h">1시간</button></div><div class="tablewrap"><table class="indtable"><thead><tr><th>지표</th><th>현재값</th><th>상태</th></tr></thead><tbody id="indicatorRows"></tbody></table></div><div class="foot"><span>ⓘ 최근 220개 캔들 데이터 기반 계산</span><span id="bUpdate"></span></div></div>
@@ -2841,7 +3395,59 @@ async function refreshAutoTrade(){
     }
   }catch(e){/* auto-trade card is non-critical; fail silently */}
 }
-document.querySelectorAll('.chartSizeBtn').forEach(b=>b.onclick=()=>{document.querySelector('.tvChartBox').style.height=b.dataset.h+'px'});
+let lwChart=null,lwCandleSeries=null;
+function initLwChart(){
+  const box=document.getElementById('lwChartBox');
+  if(!box||typeof LightweightCharts==='undefined')return false;
+  lwChart=LightweightCharts.createChart(box,{
+    layout:{background:{color:'transparent'},textColor:'#c7dcfa'},
+    grid:{vertLines:{color:'rgba(36,59,95,0.35)'},horzLines:{color:'rgba(36,59,95,0.35)'}},
+    timeScale:{timeVisible:true,secondsVisible:false,borderColor:'#243b5f'},
+    rightPriceScale:{borderColor:'#243b5f'},
+    crosshair:{mode:0},
+  });
+  lwCandleSeries=lwChart.addCandlestickSeries({
+    upColor:'#35e29a',downColor:'#ff5364',borderVisible:false,
+    wickUpColor:'#35e29a',wickDownColor:'#ff5364',
+  });
+  new ResizeObserver(entries=>{
+    for(const entry of entries){
+      if(lwChart)lwChart.resize(entry.contentRect.width,entry.contentRect.height);
+    }
+  }).observe(box);
+  return true;
+}
+async function fetchLwKlines(interval){
+  try{
+    let r=await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=${interval}&limit=200`);
+    let data=await r.json();
+    return data.map(k=>({time:Math.floor(k[0]/1000),open:+k[1],high:+k[2],low:+k[3],close:+k[4]}));
+  }catch(e){return [];}
+}
+async function fetchChartMarkers(){
+  try{
+    let r=await fetch('/api/chart-markers?days=14',{cache:'no-store'});
+    let j=await r.json();
+    return j.markers||[];
+  }catch(e){return [];}
+}
+async function refreshLwChart(){
+  if(!lwChart){if(!initLwChart())return;}
+  let [klines,markers]=await Promise.all([fetchLwKlines('15m'),fetchChartMarkers()]);
+  if(klines.length)lwCandleSeries.setData(klines);
+  let markerObjs=markers.map(m=>({
+    time:Math.floor(new Date(m.time).getTime()/1000),
+    position:m.side==='long'?'belowBar':'aboveBar',
+    color:m.side==='long'?'#35e29a':'#ff5364',
+    shape:m.side==='long'?'arrowUp':'arrowDown',
+    text:m.side==='long'?'LONG':'SHORT',
+  })).sort((a,b)=>a.time-b.time);
+  lwCandleSeries.setMarkers(markerObjs);
+}
+document.querySelectorAll('.chartSizeBtn').forEach(b=>b.onclick=()=>{
+  document.querySelector('.tvChartBox').style.height=b.dataset.h+'px';
+  if(lwChart){let box=document.getElementById('lwChartBox');lwChart.resize(box.clientWidth,parseInt(b.dataset.h));}
+});
 $('atKillSwitch').onclick=async()=>{
   if(!confirm('자동매매를 즉시 끄고 미체결 주문을 전부 취소합니다. 계속할까요?'))return;
   let b=$('atKillSwitch');b.disabled=true;b.textContent='처리 중...';
@@ -2865,9 +3471,11 @@ async function checkUpdate(){
 refresh();
 refreshAutoTrade();
 checkUpdate();
+refreshLwChart();
 setInterval(refresh,1000);
 setInterval(refreshAutoTrade,5000);
 setInterval(checkUpdate,60000);
+setInterval(refreshLwChart,30000);
 </script></body></html>
 """
 
@@ -2880,6 +3488,7 @@ if __name__ == "__main__":
         log("DB_ERROR", f"initial schema failed: {type(exc).__name__}: {exc}")
     load_settings_cache()
     apply_settings()  # pulls E-RANG/GitHub/etc. global config from the settings DB (or seeds defaults on first run)
+    _init_signal_streak_state()
     try:
         summary = db_summary()
         latest = summary.get("latest") or {}
@@ -2894,6 +3503,11 @@ if __name__ == "__main__":
     start_live_price_once()
     start_binance_snapshot_once()
     start_update_check_loop_once()
+    if liquidation_stream is not None and ENABLE_BINANCE:
+        try:
+            liquidation_stream.start_liquidation_stream_once()
+        except Exception as exc:
+            log("LIQUIDATION_ERROR", f"failed to start liquidation stream: {type(exc).__name__}: {exc}")
     port = int(os.getenv("PORT", "8765"))
     # Desktop installs bind to localhost only (127.0.0.1) by default - this
     # is a single-user local app, not a public service. Hosting platforms

@@ -56,28 +56,66 @@ class AutoTradeTestBase(unittest.TestCase):
         main.auto_trade_states.pop(TEST_USER_ID, None)
 
 
-class EdgeTriggerTests(AutoTradeTestBase):
+class ProximityTriggerTests(AutoTradeTestBase):
+    """Real entries fire when price approaches the 1st-stage entry level
+    (while the signal is ON) - not the instant the signal turns ON. Fixture
+    long entry1 = 100000, short entry1 = 104000 (see _parsed_with_entries)."""
+
     def test_disabled_never_calls_execute(self):
         with patch("main.get_all_user_settings", return_value=_test_settings(AUTO_TRADE_ENABLED="false")), \
              patch("main._execute_auto_trade") as mock_exec:
-            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False)
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False, "100050")
         mock_exec.assert_not_called()
 
-    def test_first_call_with_unknown_prev_state_does_not_fire(self):
+    def test_signal_on_but_price_far_from_entry_does_not_fire(self):
         with patch("main.get_all_user_settings", return_value=_test_settings()), \
              patch("main._execute_auto_trade") as mock_exec:
-            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False)
-        mock_exec.assert_not_called()  # prev was None (boot) -> no edge yet
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False, "102000")  # 2000 away
+        mock_exec.assert_not_called()
 
-    def test_flip_from_off_to_on_fires_once(self):
+    def test_price_near_entry_but_signal_off_does_not_fire(self):
         with patch("main.get_all_user_settings", return_value=_test_settings()), \
              patch("main._execute_auto_trade") as mock_exec:
-            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=False), False, False)  # seed prev=False
-            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False)    # OFF->ON edge
-            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False)    # stays ON, no re-fire
-        self.assertEqual(mock_exec.call_count, 1)
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=False), False, False, "100050")
+        mock_exec.assert_not_called()
+
+    def test_signal_on_and_price_near_entry_fires(self):
+        with patch("main.get_all_user_settings", return_value=_test_settings()), \
+             patch("main._execute_auto_trade") as mock_exec:
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False, "100050")  # 50 away, within default $100
+        mock_exec.assert_called_once()
         # _execute_auto_trade(user_id, side, rows, settings)
         self.assertEqual(mock_exec.call_args[0][1], "long")
+
+    def test_staying_near_entry_does_not_refire(self):
+        with patch("main.get_all_user_settings", return_value=_test_settings()), \
+             patch("main._execute_auto_trade") as mock_exec:
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False, "100050")
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False, "100040")
+        self.assertEqual(mock_exec.call_count, 1)
+
+    def test_moving_away_then_back_refires(self):
+        with patch("main.get_all_user_settings", return_value=_test_settings()), \
+             patch("main._execute_auto_trade") as mock_exec:
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False, "100050")
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False, "101000")  # moves away
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False, "100010")  # back in range
+        self.assertEqual(mock_exec.call_count, 2)
+
+    def test_short_side_tracked_independently_from_long(self):
+        with patch("main.get_all_user_settings", return_value=_test_settings()), \
+             patch("main._execute_auto_trade") as mock_exec:
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True, short_active=True), True, True, "100050")  # near LONG entry (100000) only
+        self.assertEqual(mock_exec.call_count, 1)
+        self.assertEqual(mock_exec.call_args[0][1], "long")
+
+    def test_signal_turning_off_resets_state_so_it_can_refire_later(self):
+        with patch("main.get_all_user_settings", return_value=_test_settings()), \
+             patch("main._execute_auto_trade") as mock_exec:
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False, "100050")   # fires
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=False), False, False, "100050")  # signal OFF, still near - resets, no fire
+            main._maybe_auto_trade_for_user(TEST_USER_ID, _parsed_with_entries(long_active=True), True, False, "100050")   # signal back ON, still near - fires fresh
+        self.assertEqual(mock_exec.call_count, 2)
 
 
 class DryRunTests(AutoTradeTestBase):

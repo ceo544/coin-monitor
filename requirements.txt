@@ -3,3 +3,4 @@ requests==2.32.3
 beautifulsoup4==4.12.3
 tzdata==2024.2
 pywebview==5.3.2
+websocket-client==1.9.2
