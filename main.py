@@ -2709,6 +2709,7 @@ def api_chart_klines() -> Response:
             {
                 "time": int(k[0]) // 1000 + 9 * 3600,  # ms->s, then shift to KST wall-clock for chart display
                 "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]),
+                "volume": float(k[5]),
             }
             for k in klines
         ]
@@ -3233,6 +3234,8 @@ td:first-child{font-family:'Rajdhani',sans-serif;font-size:14px}
 .chip{background:rgba(23,65,95,.3);font-family:'JetBrains Mono',monospace;font-size:11px}
 input,select{font-family:'JetBrains Mono',monospace}
 #lwChartBox{border:1px solid var(--line);box-shadow:0 0 0 1px rgba(34,227,255,.06),0 0 30px rgba(34,227,255,.06) inset}
+.ovBtn.active{background:var(--blue);color:#031018;box-shadow:0 0 12px rgba(34,227,255,.4)}
+#lwOscBox{border:1px solid var(--line);border-radius:8px}
 ::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}::-webkit-scrollbar-thumb:hover{background:var(--blue)}
 </style>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
@@ -3246,7 +3249,27 @@ input,select{font-family:'JetBrains Mono',monospace}
 <div class="card s2"><div class="label">DB / 서버</div><div id="db" class="big ok" style="font-size:21px">-</div><div id="server" class="muted">-</div></div>
 <div class="card s2"><div class="label"><img class="posAvatar" src="data:image/png;base64,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" alt="뿌꾸"> 현재 포지션</div><div id="posMini" class="posMini"><span class="muted">-</span></div></div>
 <div class="card s6"><h2>진입가 <span class="muted">(현재 화면 기준)</span></h2><div class="tablewrap"><table><thead><tr><th>구분</th><th>진입 1<br>(25%)</th><th>진입 2<br>(40%)</th><th>진입 3<br>(60%)</th><th>진입 4<br>(100%)</th><th>진입 5<br>(예비)</th></tr></thead><tbody id="erangRows"></tbody></table></div></div>
-<div class="card s6"><div class="detailHead"><h2>실시간 BTC 선물 차트 <span class="muted">(Binance BTCUSDT · LONG/SHORT 신호 마커 표시)</span></h2><div style="display:flex;gap:6px"><button type="button" class="btn chartSizeBtn" data-h="420" style="padding:6px 11px;font-size:12px">작게</button><button type="button" class="btn chartSizeBtn" data-h="760" style="padding:6px 11px;font-size:12px">보통</button><button type="button" class="btn chartSizeBtn" data-h="1100" style="padding:6px 11px;font-size:12px">크게</button></div></div><div id="lwChartBox" class="tvChartBox" style="width:100%"></div></div>
+<div class="card s6"><div class="detailHead"><h2>실시간 BTC 선물 차트 <span class="muted">(Binance BTCUSDT · LONG/SHORT 신호 마커 표시)</span></h2><div style="display:flex;gap:6px"><button type="button" class="btn chartSizeBtn" data-h="420" style="padding:6px 11px;font-size:12px">작게</button><button type="button" class="btn chartSizeBtn" data-h="760" style="padding:6px 11px;font-size:12px">보통</button><button type="button" class="btn chartSizeBtn" data-h="1100" style="padding:6px 11px;font-size:12px">크게</button></div></div>
+<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
+  <button type="button" class="btn ovBtn" data-ov="ema" style="padding:5px 10px;font-size:11px">EMA</button>
+  <button type="button" class="btn ovBtn" data-ov="bb" style="padding:5px 10px;font-size:11px">볼린저밴드</button>
+  <button type="button" class="btn ovBtn" data-ov="vwap" style="padding:5px 10px;font-size:11px">VWAP</button>
+  <button type="button" class="btn ovBtn" data-ov="ichimoku" style="padding:5px 10px;font-size:11px">일목구름</button>
+  <button type="button" class="btn ovBtn" data-ov="supertrend" style="padding:5px 10px;font-size:11px">Supertrend</button>
+  <span style="width:1px;background:var(--line);margin:2px 4px"></span>
+  <select id="oscPick" class="btn" style="padding:5px 10px;font-size:11px;cursor:pointer">
+    <option value="">보조지표 없음</option>
+    <option value="rsi">RSI</option>
+    <option value="macd">MACD</option>
+    <option value="stoch">Stochastic</option>
+    <option value="adx">ADX/DI</option>
+    <option value="cci">CCI</option>
+  </select>
+</div>
+<div id="lwChartBox" class="tvChartBox" style="width:100%"></div>
+<div id="lwOscBox" style="width:100%;height:140px;margin-top:6px;display:none"></div>
+<div id="lwClickInfo" class="hint" style="margin-top:8px">캔들을 클릭하면 그 시점 정보가 여기에 표시됩니다.</div>
+</div>
 <div class="card s12"><div class="detailHead"><h2>내 Bitget 계좌 <span class="muted">(통합계좌 · 실계좌 · 읽기 전용)</span></h2><span class="hint" id="bgHint"></span></div><div class="metricTop metricTop8"><div class="metric"><b>지금까지 수익PNL (계정 전체)</b><strong id="bgLifetimePnl">-</strong></div><div class="metric"><b>총 PNL (실시간 · 포지션 없으면 사라짐)</b><strong id="bgLivePnl">-</strong></div><div class="metric"><b>총자산 (Account Equity)</b><strong id="bgAccountEquity">-</strong></div><div class="metric"><b>USDT 잔고</b><strong id="bgEquity">-</strong></div><div class="metric"><b>미실현 PNL</b><strong id="bgPnl">-</strong></div><div class="metric"><b>유효자산 (Eff. Equity)</b><strong id="bgEffEquity">-</strong></div><div class="metric"><b>승률</b><strong id="bgWinRate">-</strong></div><div class="metric"><b>PNL (통합)</b><strong id="bgCombinedPnl">-</strong></div></div><div class="ptabs"><button class="ptab active" data-ptab="positions">현재 포지션</button><button class="ptab" data-ptab="fills">체결 내역</button><button class="ptab" data-ptab="orders">주문 내역</button></div><div id="ppanel-positions" class="ppanel active"><div class="muted">-</div></div><div id="ppanel-fills" class="ppanel"><div class="muted">-</div></div><div id="ppanel-orders" class="ppanel"><div class="muted">-</div></div><div class="foot"><span>ⓘ 가격/손익은 Bitget API 응답을 그대로 표시합니다. 승률/PNL(통합)은 청산(close) 체결의 실현손익 기준이며, 매매 판단 참고용입니다.</span><span id="bgUpdate"></span></div></div>
 <div class="card s6"><h2>Binance 보조 지표 (BTCUSDT)</h2><div class="metricTop"><div class="metric"><b>현재가 (Last Price)</b><strong id="bLast">-</strong></div><div class="metric"><b>펀딩비 (Funding Rate)</b><strong id="funding">-</strong></div><div class="metric"><b>미결제약정 (Open Interest)</b><strong id="oi">-</strong></div><div class="metric"><b>24h 거래량</b><strong id="vol24">-</strong></div></div><div class="tabs"><button class="tab" data-tf="1m">1분</button><button class="tab" data-tf="5m">5분</button><button class="tab active" data-tf="15m">15분</button><button class="tab" data-tf="1h">1시간</button></div><div class="tablewrap"><table class="indtable"><thead><tr><th>지표</th><th>현재값</th><th>상태</th></tr></thead><tbody id="indicatorRows"></tbody></table></div><div class="foot"><span>ⓘ 최근 220개 캔들 데이터 기반 계산</span><span id="bUpdate"></span></div></div>
 <div class="card s6"><h2>현재가와 주요 진입가 거리 <span class="muted">(Long 기준)</span></h2><div id="distanceLong" class="dist"></div><h2 style="margin-top:16px">현재가와 주요 진입가 거리 <span class="muted">(Short 기준)</span></h2><div id="distanceShort" class="dist"></div></div>
@@ -3597,6 +3620,7 @@ function initLwChart(){
       if(lwChart)lwChart.resize(entry.contentRect.width,entry.contentRect.height);
     }
   }).observe(box);
+  setupLwClickHandler();
   return true;
 }
 let lwLastCandle=null,lwChartInterval='15m';
@@ -3626,6 +3650,9 @@ async function refreshLwChart(){
   if(klines.length){
     lwCandleSeries.setData(klines);
     lwLastCandle=klines[klines.length-1];
+    lwKlinesCache=klines;
+    redrawActiveOverlays();
+    if(lwOscKind)drawOscillator(lwOscKind,klines);
   }
   let markerObjs=markers.map(m=>({
     time:Math.floor(new Date(m.time).getTime()/1000)+9*3600,
@@ -3652,6 +3679,258 @@ function tickLwChart(livePrice){
     lwLastCandle={...lwLastCandle,high:Math.max(lwLastCandle.high,price),low:Math.min(lwLastCandle.low,price),close:price};
   }
   lwCandleSeries.update(lwLastCandle);
+}
+// ---------------------------------------------------------------------
+// Client-side indicator math for chart overlays/oscillators - computed
+// in the browser from the same kline data already fetched for the
+// candles, so toggling an indicator on/off is instant (no extra network
+// round-trip). These mirror the formulas in indicators.py but are a
+// separate implementation purely for chart drawing - small floating-
+// point differences from the backend's own numbers are expected and
+// don't matter for a visual overlay.
+// ---------------------------------------------------------------------
+function calcEMA(closes,period){
+  let out=new Array(closes.length).fill(null);
+  if(closes.length<period)return out;
+  let k=2/(period+1), sum=0;
+  for(let i=0;i<period;i++)sum+=closes[i];
+  let prev=sum/period; out[period-1]=prev;
+  for(let i=period;i<closes.length;i++){prev=closes[i]*k+prev*(1-k);out[i]=prev;}
+  return out;
+}
+function calcBB(closes,period,mult){
+  let mid=new Array(closes.length).fill(null),up=new Array(closes.length).fill(null),low=new Array(closes.length).fill(null);
+  for(let i=period-1;i<closes.length;i++){
+    let w=closes.slice(i-period+1,i+1),mean=w.reduce((a,b)=>a+b,0)/period;
+    let variance=w.reduce((a,b)=>a+(b-mean)*(b-mean),0)/period,std=Math.sqrt(variance);
+    mid[i]=mean;up[i]=mean+mult*std;low[i]=mean-mult*std;
+  }
+  return {mid,up,low};
+}
+function calcVWAP(klines){
+  let out=new Array(klines.length).fill(null),cumPV=0,cumVol=0;
+  for(let i=0;i<klines.length;i++){
+    let tp=(klines[i].high+klines[i].low+klines[i].close)/3,vol=klines[i].volume||0;
+    cumPV+=tp*vol;cumVol+=vol;out[i]=cumVol?cumPV/cumVol:null;
+  }
+  return out;
+}
+function calcRSI(closes,period){
+  let out=new Array(closes.length).fill(null);
+  if(closes.length<=period)return out;
+  let gains=0,losses=0;
+  for(let i=1;i<=period;i++){let d=closes[i]-closes[i-1];if(d>0)gains+=d;else losses-=d;}
+  let avgGain=gains/period,avgLoss=losses/period;
+  out[period]=avgLoss===0?100:100-100/(1+avgGain/avgLoss);
+  for(let i=period+1;i<closes.length;i++){
+    let d=closes[i]-closes[i-1],g=d>0?d:0,l=d<0?-d:0;
+    avgGain=(avgGain*(period-1)+g)/period;avgLoss=(avgLoss*(period-1)+l)/period;
+    out[i]=avgLoss===0?100:100-100/(1+avgGain/avgLoss);
+  }
+  return out;
+}
+function calcMACD(closes){
+  let e12=calcEMA(closes,12),e26=calcEMA(closes,26);
+  let macdLine=closes.map((_,i)=>(e12[i]!=null&&e26[i]!=null)?e12[i]-e26[i]:null);
+  let startIdx=macdLine.findIndex(v=>v!=null),signal=new Array(closes.length).fill(null);
+  if(startIdx>=0){
+    let sub=macdLine.slice(startIdx),subEma=calcEMA(sub,9);
+    for(let i=0;i<subEma.length;i++)signal[startIdx+i]=subEma[i];
+  }
+  let hist=closes.map((_,i)=>(macdLine[i]!=null&&signal[i]!=null)?macdLine[i]-signal[i]:null);
+  return {macdLine,signal,hist};
+}
+function calcStochastic(klines,period,dPeriod){
+  let k=new Array(klines.length).fill(null);
+  for(let i=period-1;i<klines.length;i++){
+    let w=klines.slice(i-period+1,i+1),hh=Math.max(...w.map(c=>c.high)),ll=Math.min(...w.map(c=>c.low));
+    k[i]=hh===ll?50:100*(klines[i].close-ll)/(hh-ll);
+  }
+  let d=new Array(klines.length).fill(null);
+  for(let i=period-1+dPeriod-1;i<klines.length;i++){
+    let w=k.slice(i-dPeriod+1,i+1);
+    if(w.every(v=>v!=null))d[i]=w.reduce((a,b)=>a+b,0)/dPeriod;
+  }
+  return {k,d};
+}
+function calcADX(klines,period){
+  let n=klines.length,plusDM=new Array(n).fill(0),minusDM=new Array(n).fill(0),tr=new Array(n).fill(0);
+  for(let i=1;i<n;i++){
+    let up=klines[i].high-klines[i-1].high,down=klines[i-1].low-klines[i].low;
+    plusDM[i]=(up>down&&up>0)?up:0;minusDM[i]=(down>up&&down>0)?down:0;
+    tr[i]=Math.max(klines[i].high-klines[i].low,Math.abs(klines[i].high-klines[i-1].close),Math.abs(klines[i].low-klines[i-1].close));
+  }
+  let adx=new Array(n).fill(null),plusDI=new Array(n).fill(null),minusDI=new Array(n).fill(null);
+  if(n<period*2+1)return {adx,plusDI,minusDI};
+  let smTR=tr.slice(1,period+1).reduce((a,b)=>a+b,0),smP=plusDM.slice(1,period+1).reduce((a,b)=>a+b,0),smM=minusDM.slice(1,period+1).reduce((a,b)=>a+b,0);
+  let dxArr=[];
+  for(let i=period;i<n;i++){
+    if(i>period){smTR=smTR-smTR/period+tr[i];smP=smP-smP/period+plusDM[i];smM=smM-smM/period+minusDM[i];}
+    let pdi=smTR?100*smP/smTR:0,mdi=smTR?100*smM/smTR:0;
+    plusDI[i]=pdi;minusDI[i]=mdi;
+    let s=pdi+mdi;dxArr.push(s?100*Math.abs(pdi-mdi)/s:0);
+  }
+  if(dxArr.length>=period){
+    let a=dxArr.slice(0,period).reduce((a,b)=>a+b,0)/period,idx=period*2-1;
+    if(idx<n)adx[idx]=a;
+    for(let j=period;j<dxArr.length;j++){a=(a*(period-1)+dxArr[j])/period;idx++;if(idx<n)adx[idx]=a;}
+  }
+  return {adx,plusDI,minusDI};
+}
+function calcCCI(klines,period){
+  let out=new Array(klines.length).fill(null),tp=klines.map(c=>(c.high+c.low+c.close)/3);
+  for(let i=period-1;i<klines.length;i++){
+    let w=tp.slice(i-period+1,i+1),mean=w.reduce((a,b)=>a+b,0)/period;
+    let md=w.reduce((a,b)=>a+Math.abs(b-mean),0)/period;
+    out[i]=md?(tp[i]-mean)/(0.015*md):0;
+  }
+  return out;
+}
+function calcIchimoku(klines){
+  let n=klines.length;
+  function mid(period,i){
+    if(i<period-1)return null;
+    let w=klines.slice(i-period+1,i+1);
+    return (Math.max(...w.map(c=>c.high))+Math.min(...w.map(c=>c.low)))/2;
+  }
+  let tenkan=[],kijun=[],senkouA=[],senkouB=[];
+  for(let i=0;i<n;i++){
+    let t=mid(9,i),k=mid(26,i),b=mid(52,i);
+    tenkan.push(t);kijun.push(k);senkouA.push((t!=null&&k!=null)?(t+k)/2:null);senkouB.push(b);
+  }
+  return {tenkan,kijun,senkouA,senkouB};
+}
+function calcSupertrend(klines,period,mult){
+  let n=klines.length,tr=new Array(n).fill(0);
+  for(let i=1;i<n;i++)tr[i]=Math.max(klines[i].high-klines[i].low,Math.abs(klines[i].high-klines[i-1].close),Math.abs(klines[i].low-klines[i-1].close));
+  let atr=new Array(n).fill(null);
+  if(n>period){
+    let s=tr.slice(1,period+1).reduce((a,b)=>a+b,0)/period;atr[period]=s;
+    for(let i=period+1;i<n;i++){s=(s*(period-1)+tr[i])/period;atr[i]=s;}
+  }
+  let finalUpper=new Array(n).fill(null),finalLower=new Array(n).fill(null),trend=new Array(n).fill(null),dir=new Array(n).fill(null);
+  for(let i=period;i<n;i++){
+    if(atr[i]==null)continue;
+    let hl2=(klines[i].high+klines[i].low)/2,bu=hl2+mult*atr[i],bl=hl2-mult*atr[i];
+    if(finalUpper[i-1]==null){finalUpper[i]=bu;finalLower[i]=bl;dir[i]='down';trend[i]=bu;continue;}
+    let pc=klines[i-1].close;
+    finalUpper[i]=(bu<finalUpper[i-1]||pc>finalUpper[i-1])?bu:finalUpper[i-1];
+    finalLower[i]=(bl>finalLower[i-1]||pc<finalLower[i-1])?bl:finalLower[i-1];
+    let close=klines[i].close;
+    if(dir[i-1]==='down'){
+      if(close>finalUpper[i]){dir[i]='up';trend[i]=finalLower[i];}else{dir[i]='down';trend[i]=finalUpper[i];}
+    } else {
+      if(close<finalLower[i]){dir[i]='down';trend[i]=finalUpper[i];}else{dir[i]='up';trend[i]=finalLower[i];}
+    }
+  }
+  return trend;
+}
+// --- Overlay (drawn on main price chart, same scale) management ---
+let lwOverlaySeries={}, lwActiveOverlays=new Set(), lwKlinesCache=[];
+function seriesOf(name){let s=lwOverlaySeries[name];return s?(Array.isArray(s)?s:[s]):[];}
+function clearOverlay(name){seriesOf(name).forEach(s=>{try{lwChart.removeSeries(s)}catch(e){}});delete lwOverlaySeries[name];}
+function toPoints(klines,arr){return klines.map((c,i)=>arr[i]!=null?{time:c.time,value:arr[i]}:null).filter(Boolean);}
+function drawOverlay(name,klines){
+  clearOverlay(name);
+  let closes=klines.map(c=>c.close);
+  const line=(color,width,style)=>lwChart.addLineSeries({color,lineWidth:width||1,priceLineVisible:false,lastValueVisible:false,lineStyle:style||0});
+  if(name==='ema'){
+    lwOverlaySeries.ema=[
+      (()=>{let s=line('#22e3ff',1.5);s.setData(toPoints(klines,calcEMA(closes,20)));return s})(),
+      (()=>{let s=line('#ffe14d',1.5);s.setData(toPoints(klines,calcEMA(closes,50)));return s})(),
+      (()=>{let s=line('#ff2f6e',1.5);s.setData(toPoints(klines,calcEMA(closes,200)));return s})(),
+    ];
+  } else if(name==='bb'){
+    let {mid,up,low}=calcBB(closes,20,2);
+    lwOverlaySeries.bb=[
+      (()=>{let s=line('#5e84a3',1,2);s.setData(toPoints(klines,up));return s})(),
+      (()=>{let s=line('#22e3ff',1);s.setData(toPoints(klines,mid));return s})(),
+      (()=>{let s=line('#5e84a3',1,2);s.setData(toPoints(klines,low));return s})(),
+    ];
+  } else if(name==='vwap'){
+    let s=line('#ffe14d',1.5);s.setData(toPoints(klines,calcVWAP(klines)));lwOverlaySeries.vwap=s;
+  } else if(name==='ichimoku'){
+    let {tenkan,kijun,senkouA,senkouB}=calcIchimoku(klines);
+    let cloud=lwChart.addAreaSeries({topColor:'rgba(34,227,255,.14)',bottomColor:'rgba(34,227,255,.02)',lineColor:'rgba(34,227,255,.25)',lineWidth:1,priceLineVisible:false,lastValueVisible:false});
+    cloud.setData(toPoints(klines,senkouA.map((v,i)=>v!=null&&senkouB[i]!=null?Math.max(v,senkouB[i]):null)));
+    lwOverlaySeries.ichimoku=[
+      (()=>{let s=line('#22e3ff',1);s.setData(toPoints(klines,tenkan));return s})(),
+      (()=>{let s=line('#ff2f6e',1);s.setData(toPoints(klines,kijun));return s})(),
+      cloud,
+    ];
+  } else if(name==='supertrend'){
+    let s=line('#39ffa0',2);s.setData(toPoints(klines,calcSupertrend(klines,10,3)));lwOverlaySeries.supertrend=s;
+  }
+}
+function redrawActiveOverlays(){lwActiveOverlays.forEach(name=>drawOverlay(name,lwKlinesCache));}
+document.querySelectorAll('.ovBtn').forEach(btn=>{
+  btn.onclick=()=>{
+    let name=btn.dataset.ov;
+    if(lwActiveOverlays.has(name)){lwActiveOverlays.delete(name);clearOverlay(name);btn.classList.remove('active');}
+    else{lwActiveOverlays.add(name);btn.classList.add('active');if(lwKlinesCache.length)drawOverlay(name,lwKlinesCache);}
+  };
+});
+// --- Oscillator sub-panel (separate mini chart, own price scale) ---
+let lwOscChart=null,lwOscSeries=null,lwOscKind='';
+function initLwOscChart(){
+  const box=document.getElementById('lwOscBox');
+  if(!box||lwOscChart)return;
+  lwOscChart=LightweightCharts.createChart(box,{
+    layout:{background:{color:'transparent'},textColor:'#c7dcfa'},
+    grid:{vertLines:{color:'rgba(36,59,95,.3)'},horzLines:{color:'rgba(36,59,95,.18)'}},
+    timeScale:{visible:false},rightPriceScale:{borderColor:'#243b5f'},crosshair:{mode:0},
+  });
+  new ResizeObserver(entries=>{for(const e of entries){if(lwOscChart)lwOscChart.resize(e.contentRect.width,e.contentRect.height)}}).observe(box);
+  lwChart.timeScale().subscribeVisibleLogicalRangeChange(r=>{if(r&&lwOscChart)lwOscChart.timeScale().setVisibleLogicalRange(r)});
+}
+function drawOscillator(kind,klines){
+  if(!lwOscChart)initLwOscChart();
+  if(lwOscSeries){(Array.isArray(lwOscSeries)?lwOscSeries:[lwOscSeries]).forEach(s=>{try{lwOscChart.removeSeries(s)}catch(e){}});lwOscSeries=null;}
+  let closes=klines.map(c=>c.close);
+  const line=(chart,color,width)=>chart.addLineSeries({color,lineWidth:width||1.5,priceLineVisible:false});
+  if(kind==='rsi'){
+    let s=line(lwOscChart,'#22e3ff');s.setData(toPoints(klines,calcRSI(closes,14)));lwOscSeries=s;
+  } else if(kind==='macd'){
+    let {macdLine,signal,hist}=calcMACD(closes);
+    let h=lwOscChart.addHistogramSeries({priceLineVisible:false});
+    h.setData(klines.map((c,i)=>hist[i]!=null?{time:c.time,value:hist[i],color:hist[i]>=0?'#39ffa0':'#ff2f6e'}:null).filter(Boolean));
+    let m=line(lwOscChart,'#22e3ff',1),sig=line(lwOscChart,'#ffe14d',1);
+    m.setData(toPoints(klines,macdLine));sig.setData(toPoints(klines,signal));
+    lwOscSeries=[h,m,sig];
+  } else if(kind==='stoch'){
+    let {k,d}=calcStochastic(klines,14,3);
+    let kS=line(lwOscChart,'#22e3ff'),dS=line(lwOscChart,'#ffe14d');
+    kS.setData(toPoints(klines,k));dS.setData(toPoints(klines,d));
+    lwOscSeries=[kS,dS];
+  } else if(kind==='adx'){
+    let {adx,plusDI,minusDI}=calcADX(klines,14);
+    let a=line(lwOscChart,'#e4f6ff'),p=line(lwOscChart,'#39ffa0',1),m=line(lwOscChart,'#ff2f6e',1);
+    a.setData(toPoints(klines,adx));p.setData(toPoints(klines,plusDI));m.setData(toPoints(klines,minusDI));
+    lwOscSeries=[a,p,m];
+  } else if(kind==='cci'){
+    let s=line(lwOscChart,'#22e3ff');s.setData(toPoints(klines,calcCCI(klines,20)));lwOscSeries=s;
+  }
+}
+$('oscPick').onchange=e=>{
+  lwOscKind=e.target.value;
+  let box=$('lwOscBox');
+  if(!lwOscKind){
+    box.style.display='none';
+    if(lwOscChart&&lwOscSeries){(Array.isArray(lwOscSeries)?lwOscSeries:[lwOscSeries]).forEach(s=>{try{lwOscChart.removeSeries(s)}catch(e){}});lwOscSeries=null;}
+    return;
+  }
+  box.style.display='block';
+  if(lwKlinesCache.length)drawOscillator(lwOscKind,lwKlinesCache);
+};
+// --- Click a candle to see its OHLCV ---
+function setupLwClickHandler(){
+  lwChart.subscribeClick(param=>{
+    if(!param||!param.time||!lwKlinesCache.length)return;
+    let candle=lwKlinesCache.find(c=>c.time===param.time);
+    if(!candle)return;
+    let dateStr=new Date(candle.time*1000).toISOString().replace('T',' ').substring(0,16)+' (KST)';
+    $('lwClickInfo').innerHTML=`<b>${esc(dateStr)}</b> · 시가 ${n(candle.open)} · 고가 ${n(candle.high)} · 저가 ${n(candle.low)} · 종가 ${n(candle.close)} · 거래량 ${n(candle.volume)}`;
+  });
 }
 document.querySelectorAll('.chartSizeBtn').forEach(b=>b.onclick=()=>{
   document.querySelector('.tvChartBox').style.height=b.dataset.h+'px';
