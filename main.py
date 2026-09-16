@@ -52,6 +52,11 @@ try:
 except Exception:  # pragma: no cover
     liquidation_stream = None
 
+try:
+    import news_feed
+except Exception:  # pragma: no cover
+    news_feed = None
+
 # ---------------------------------------------------------------------------
 # Desktop-friendly data directory: a per-user folder that's always writable,
 # regardless of where the packaged .exe happens to sit (Program Files etc.
@@ -2689,6 +2694,88 @@ def export_signals_csv() -> Response:
     )
 
 
+_news_cache: Dict[str, Any] = {"data": None, "fetched_at": 0.0}
+_news_cache_lock = threading.Lock()
+NEWS_CACHE_TTL_SECONDS = 300  # RSS feeds don't need to be re-fetched every 1s poll
+_calendar_cache: Dict[str, Any] = {"data": None, "fetched_at": 0.0}
+CALENDAR_CACHE_TTL_SECONDS = 1800  # the calendar itself only needs refreshing a few times a day
+CALENDAR_HIGHLIGHT_WINDOW_HOURS = 48  # how close an event must be to get bumped to the front of the ticker
+_topcoins_cache: Dict[str, Any] = {"data": None, "fetched_at": 0.0}
+TOPCOINS_CACHE_TTL_SECONDS = 10  # prices should feel live, but still throttled below the 1s dashboard poll
+
+
+def _get_economic_calendar() -> Dict[str, Any]:
+    now = time.monotonic()
+    stale = _calendar_cache["data"] is None or (now - _calendar_cache["fetched_at"]) > CALENDAR_CACHE_TTL_SECONDS
+    if stale and news_feed is not None:
+        try:
+            _calendar_cache["data"] = news_feed.fetch_economic_calendar()
+        except Exception as exc:
+            if _calendar_cache["data"] is None:
+                _calendar_cache["data"] = {"items": [], "error": f"{type(exc).__name__}: {exc}"}
+        _calendar_cache["fetched_at"] = now
+    return _calendar_cache["data"] or {"items": [], "error": None}
+
+
+@app.get("/api/news")
+def api_news() -> Response:
+    """Crypto market news for the dashboard's scrolling ticker, with
+    upcoming high-impact US economic events (CPI, FOMC, NFP, ...) bumped to
+    the front whenever one falls within the next 48h - those move crypto
+    prices as much as any headline, so on a day with a big release
+    scheduled it's the first thing worth seeing in the ticker. On a normal
+    day with nothing imminent, the ticker is just regular crypto news.
+    Cached server-side for a few minutes so the dashboard's frequent
+    polling doesn't turn into frequent RSS re-fetches."""
+    if news_feed is None:
+        return jsonify({"items": [], "errors": {"news_feed": "module not available"}, "fetched_at": None})
+    now = time.monotonic()
+    with _news_cache_lock:
+        stale = _news_cache["data"] is None or (now - _news_cache["fetched_at"]) > NEWS_CACHE_TTL_SECONDS
+        if stale:
+            try:
+                _news_cache["data"] = news_feed.fetch_all_news()
+            except Exception as exc:
+                if _news_cache["data"] is None:
+                    _news_cache["data"] = {"items": [], "errors": {"fetch": f"{type(exc).__name__}: {exc}"}, "fetched_at": None}
+            _news_cache["fetched_at"] = now
+        payload = dict(_news_cache["data"])
+
+    calendar = _get_economic_calendar()
+    cutoff = datetime.now(timezone.utc) + timedelta(hours=CALENDAR_HIGHLIGHT_WINDOW_HOURS)
+    upcoming = []
+    for ev in calendar.get("items") or []:
+        try:
+            ev_dt = datetime.fromisoformat(ev["date"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if datetime.now(timezone.utc) <= ev_dt <= cutoff:
+            upcoming.append({**ev, "is_calendar": True})
+    payload["items"] = upcoming + (payload.get("items") or [])
+    if calendar.get("error"):
+        errors = dict(payload.get("errors") or {})
+        errors["economic_calendar"] = calendar["error"]
+        payload["errors"] = errors
+    return jsonify(payload)
+
+
+@app.get("/api/top-coins")
+def api_top_coins() -> Response:
+    """Live price + 24h change for a handful of high-volume coins, for the
+    price ticker under the news ticker. Cached briefly (10s) so this
+    doesn't turn the 1s dashboard poll into a 1s Binance call."""
+    now = time.monotonic()
+    stale = _topcoins_cache["data"] is None or (now - _topcoins_cache["fetched_at"]) > TOPCOINS_CACHE_TTL_SECONDS
+    if stale:
+        try:
+            import binance_data
+            _topcoins_cache["data"] = {"items": binance_data.fetch_top_coin_prices(), "error": None}
+        except Exception as exc:
+            _topcoins_cache["data"] = {"items": [], "error": f"{type(exc).__name__}: {exc}"}
+        _topcoins_cache["fetched_at"] = now
+    return jsonify(_topcoins_cache["data"])
+
+
 @app.get("/api/chart-klines")
 def api_chart_klines() -> Response:
     """Fetches OHLC candles server-side and returns them ready for the
@@ -3236,11 +3323,27 @@ input,select{font-family:'JetBrains Mono',monospace}
 #lwChartBox{border:1px solid var(--line);box-shadow:0 0 0 1px rgba(34,227,255,.06),0 0 30px rgba(34,227,255,.06) inset}
 .ovBtn.active{background:var(--blue);color:#031018;box-shadow:0 0 12px rgba(34,227,255,.4)}
 #lwOscBox{border:1px solid var(--line);border-radius:8px}
+.newsTicker{position:relative}
+.newsTicker:hover .newsTrack{animation-play-state:paused}
+@keyframes ticker-scroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.newsItem{display:inline-flex;align-items:center;gap:8px;padding:0 28px;color:var(--text);text-decoration:none;font-size:13px;border-right:1px solid var(--line)}
+.newsItem:hover{color:var(--blue)}
+.newsSrc{font-family:'Rajdhani',sans-serif;font-weight:700;font-size:10.5px;letter-spacing:.4px;color:var(--blue);background:rgba(34,227,255,.1);border:1px solid rgba(34,227,255,.3);border-radius:4px;padding:1px 6px}
+.newsItem.calItem{background:rgba(255,225,77,.06)}
+.newsItem.calItem .newsSrc{color:var(--yellow);background:rgba(255,225,77,.12);border-color:rgba(255,225,77,.4)}
+.coinItem{display:inline-flex;align-items:center;gap:8px;padding:0 28px;text-decoration:none;font-size:13px;border-right:1px solid var(--line);font-family:'JetBrains Mono',monospace}
+.coinItem b{font-family:'Rajdhani',sans-serif;color:var(--text);font-weight:700}
 ::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}::-webkit-scrollbar-thumb:hover{background:var(--blue)}
 </style>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head><body><div class="wrap">
 <div class="top"><div class="topTitle"><h1>🪙 뿌꾸의 코인세상</h1></div><div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collect" class="btn">강제 수집</button><button id="telegramTest" class="btn">텔레그램 현재상태 발송</button><a class="btn" href="/settings">설정</a><a class="btn" href="/logout">로그아웃</a><span id="live" class="live">● 정상 수집 중</span><span id="lastSync" class="muted"></span><span id="lastTop" class="muted"></span></div></div>
+<div class="card s12 newsTicker" id="newsTickerCard" style="padding:10px 0;overflow:hidden;display:none">
+  <div class="newsTrack" id="newsTrack" style="display:inline-flex;white-space:nowrap;animation:ticker-scroll 60s linear infinite"></div>
+</div>
+<div class="card s12 newsTicker" id="coinTickerCard" style="padding:10px 0;overflow:hidden;display:none">
+  <div class="newsTrack" id="coinTrack" style="display:inline-flex;white-space:nowrap;animation:ticker-scroll 40s linear infinite"></div>
+</div>
 <div id="updateBanner" style="display:none;background:linear-gradient(90deg,#1a3a6e,#0e1b31);border:1px solid #38a5ff88;border-radius:12px;padding:12px 16px;margin-bottom:16px;align-items:center;justify-content:space-between;gap:12px"><span>🎮 <b>새 버전이 나왔어요!</b> <span id="updateVersionText" class="muted"></span></span><a id="updateDownloadLink" class="btn" href="#" target="_blank" style="background:#38a5ff;color:#04101f">지금 다운로드</a></div>
 <div class="grid">
 <div class="card s4 hero"><div><div class="label">현재 판정</div><div id="heroSignal" class="heroSignal wait">WAIT</div></div><div><div id="signalBits" class="big" style="font-size:15px">LONG OFF / SHORT OFF</div><div class="muted">색상 신호를 기준으로 판정합니다.</div></div></div>
@@ -3949,12 +4052,59 @@ async function checkUpdate(){
     }
   }catch(e){/* non-critical */}
 }
+function calendarEventLabel(it){
+  // "CPI : 09/16 21:30 (KST)" style label for economic-calendar items.
+  let d=new Date(it.date);
+  if(Number.isNaN(d.getTime()))return esc(it.title);
+  let p=new Intl.DateTimeFormat('ko-KR',{timeZone:'Asia/Seoul',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(d),g=t=>p.find(x=>x.type===t)?.value||'';
+  let extra=it.forecast?` (예상 ${esc(it.forecast)})`:'';
+  return `${esc(it.title)} : ${g('month')}/${g('day')} ${g('hour')}:${g('minute')} KST${extra}`;
+}
+async function refreshNews(){
+  try{
+    let r=await fetch('/api/news',{cache:'no-store'});
+    let j=await r.json();
+    let items=j.items||[];
+    let card=$('newsTickerCard'),track=$('newsTrack');
+    if(!items.length){card.style.display='none';return}
+    card.style.display='block';
+    // Duplicated once so the marquee loop is seamless (scrolls exactly
+    // -50% of the doubled track, landing back on an identical frame).
+    let html=items.map(it=>{
+      if(it.is_calendar){
+        return `<span class="newsItem calItem"><span class="newsSrc">📅 일정</span>${calendarEventLabel(it)}</span>`;
+      }
+      return `<a class="newsItem" href="${esc(it.link)}" target="_blank" rel="noopener"><span class="newsSrc">${esc(it.source)}</span>${esc(it.title)}</a>`;
+    }).join('');
+    track.innerHTML=html+html;
+  }catch(e){/* ticker is non-critical; fail silently */}
+}
+async function refreshCoinTicker(){
+  try{
+    let r=await fetch('/api/top-coins',{cache:'no-store'});
+    let j=await r.json();
+    let items=j.items||[];
+    let card=$('coinTickerCard'),track=$('coinTrack');
+    if(!items.length){card.style.display='none';return}
+    card.style.display='block';
+    let html=items.map(it=>{
+      let up=it.change_pct>=0;
+      let sym=it.symbol.replace('USDT','');
+      return `<span class="coinItem"><b>${esc(sym)}</b> ${n(it.price)} <span class="${up?'statusUp':'statusDown'}">${up?'▲':'▼'}${Math.abs(it.change_pct).toFixed(2)}%</span></span>`;
+    }).join('');
+    track.innerHTML=html+html;
+  }catch(e){/* ticker is non-critical; fail silently */}
+}
 refresh();
 checkUpdate();
 refreshLwChart();
+refreshNews();
+refreshCoinTicker();
 setInterval(refresh,1000);
 setInterval(checkUpdate,60000);
 setInterval(refreshLwChart,30000);
+setInterval(refreshNews,300000);
+setInterval(refreshCoinTicker,10000);
 </script></body></html>
 """
 

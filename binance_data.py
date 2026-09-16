@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 import requests
 from indicators import indicators_from_klines, funding_extra, oi_price_classification
 
@@ -54,6 +54,35 @@ def fetch_klines(interval: str = "15m", limit: int = 200) -> list:
     callers (like the /api/chart-klines endpoint) don't need to reach into
     the private _get_json helper directly."""
     return _get_json("/fapi/v1/klines", {"symbol": SYMBOL, "interval": interval, "limit": limit})
+
+
+TOP_COIN_SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"]
+
+
+def fetch_top_coin_prices(symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Price + 24h change for a curated list of high-volume coins, in ONE
+    API call (Binance's ticker/24hr endpoint accepts a JSON-array-string
+    `symbols` param covering multiple symbols at once, avoiding N separate
+    requests for N coins)."""
+    import json as _json
+    syms = symbols or TOP_COIN_SYMBOLS
+    data = _get_json("/fapi/v1/ticker/24hr", {"symbols": _json.dumps(syms)})
+    rows = data if isinstance(data, list) else [data]
+    by_symbol = {row.get("symbol"): row for row in rows if isinstance(row, dict)}
+    out = []
+    for sym in syms:
+        row = by_symbol.get(sym)
+        if not row:
+            continue
+        try:
+            out.append({
+                "symbol": sym,
+                "price": float(row.get("lastPrice")),
+                "change_pct": float(row.get("priceChangePercent")),
+            })
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def fetch_last_price() -> Dict[str, Any]:

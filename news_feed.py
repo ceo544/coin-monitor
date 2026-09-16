@@ -1,0 +1,140 @@
+"""
+Crypto market news ticker - pulls headlines from a few public RSS feeds
+(no API key needed) so the dashboard can show a scrolling "주요 시황" strip.
+
+Each source is fetched and parsed independently, so one feed being down or
+changing its RSS URL never blanks out the others - it just quietly
+contributes zero headlines and shows up in the "errors" dict for
+debugging.
+"""
+from __future__ import annotations
+
+import os
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Dict, List, Tuple
+
+import requests
+
+# (display name, RSS feed URL). Mix of English and Korean crypto outlets so
+# the ticker isn't one-sided. Each is independently wrapped in try/except -
+# if a URL goes stale or a site changes its feed path, that source just
+# silently drops out rather than breaking the whole ticker.
+NEWS_SOURCES: List[Tuple[str, str]] = [
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+    ("CoinTelegraph", "https://cointelegraph.com/rss"),
+    ("TokenPost", "https://www.tokenpost.kr/rss"),
+]
+USER_AGENT = os.getenv("NEWS_USER_AGENT", "Mozilla/5.0 (compatible; CoinMonitorNewsBot/1.0; +https://github.com)")
+TIMEOUT = float(os.getenv("NEWS_TIMEOUT", "8"))
+ITEMS_PER_SOURCE = 12
+
+
+def _parse_pub_date(raw: str):
+    if not raw:
+        return None
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_feed(name: str, url: str) -> Tuple[List[Dict[str, Any]], str]:
+    """Returns (items, error_message). error_message is empty on success -
+    checked as falsy by the caller, so a real error is always a non-empty
+    string."""
+    try:
+        resp = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except Exception as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+
+    items: List[Dict[str, Any]] = []
+    for item in root.findall(".//item")[:ITEMS_PER_SOURCE]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        if not title or not link:
+            continue
+        pub_dt = _parse_pub_date(item.findtext("pubDate") or "")
+        items.append({
+            "title": title,
+            "link": link,
+            "source": name,
+            "published_at": pub_dt.isoformat() if pub_dt else None,
+            "_sort_ts": pub_dt.timestamp() if pub_dt else 0,
+        })
+    return items, ""
+
+
+def fetch_all_news(limit: int = 24) -> Dict[str, Any]:
+    all_items: List[Dict[str, Any]] = []
+    errors: Dict[str, str] = {}
+    for name, url in NEWS_SOURCES:
+        items, err = fetch_feed(name, url)
+        all_items.extend(items)
+        if err:
+            errors[name] = err
+    all_items.sort(key=lambda x: x.get("_sort_ts", 0), reverse=True)
+    for item in all_items:
+        item.pop("_sort_ts", None)
+    return {
+        "items": all_items[:limit],
+        "errors": errors or None,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Economic calendar (CPI, FOMC rate decisions, NFP, etc.) - these US macro
+# releases move crypto prices too, not just forex/stocks, so they're worth
+# surfacing alongside plain news headlines. Pulled from the widely-used
+# public JSON feed that mirrors ForexFactory's calendar (no API key, no
+# auth) - a de-facto standard source many open-source trading dashboards
+# already rely on for exactly this.
+# ---------------------------------------------------------------------------
+CALENDAR_URL = os.getenv("ECON_CALENDAR_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+CALENDAR_COUNTRIES = {"USD"}  # US macro data is what moves crypto most
+CALENDAR_IMPACT_LEVELS = {"High"}
+
+
+def fetch_economic_calendar() -> Dict[str, Any]:
+    """Returns upcoming high-impact USD events (CPI, FOMC, NFP, etc.) for
+    the current week, soonest first. Each event's own "date" field already
+    carries its timezone offset (parsed via fromisoformat), converted to
+    UTC for consistent sorting/comparison by the caller."""
+    try:
+        resp = requests.get(CALENDAR_URL, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+        resp.raise_for_status()
+        raw = resp.json()
+    except Exception as exc:
+        return {"items": [], "error": f"{type(exc).__name__}: {exc}"}
+
+    events = []
+    for row in raw if isinstance(raw, list) else []:
+        try:
+            if row.get("country") not in CALENDAR_COUNTRIES:
+                continue
+            if row.get("impact") not in CALENDAR_IMPACT_LEVELS:
+                continue
+            date_raw = row.get("date")
+            if not date_raw:
+                continue
+            dt = datetime.fromisoformat(date_raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            events.append({
+                "title": row.get("title") or "",
+                "country": row.get("country"),
+                "date": dt.astimezone(timezone.utc).isoformat(),
+                "forecast": row.get("forecast") or None,
+                "previous": row.get("previous") or None,
+            })
+        except (TypeError, ValueError):
+            continue
+    events.sort(key=lambda e: e["date"])
+    return {"items": events, "error": None}
