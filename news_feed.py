@@ -196,6 +196,10 @@ def translate_to_korean(text: str) -> str:
     return text  # 번역 실패 시 원문 그대로 (배너가 비거나 에러 나는 것보다 나음)
 
 
+MAX_NEWS_RISK_ITEMS = 3  # 같은 이슈를 여러 매체가 비슷한 제목으로 반복 보도하는
+                          # 경우가 많아서, 배너가 도배되지 않게 최신순으로 몇 개만
+
+
 def detect_today_risk(news_items: List[Dict[str, Any]], calendar_items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """오늘(KST 기준) 발생하는 위험 요소 목록을 반환합니다. 각 항목은
     {"type": "calendar"|"news", "title": ..., "detail": ...} 형태."""
@@ -211,6 +215,7 @@ def detect_today_risk(news_items: List[Dict[str, Any]], calendar_items: List[Dic
             time_str = ev_dt.astimezone(KST).strftime("%H:%M")
             risks.append({"type": "calendar", "title": translate_to_korean(ev.get("title", "")), "detail": f"{time_str} KST"})
 
+    news_matches = []
     for item in news_items or []:
         title = item.get("title") or ""
         pub = item.get("published_at")
@@ -223,6 +228,9 @@ def detect_today_risk(news_items: List[Dict[str, Any]], calendar_items: List[Dic
         if pub_dt.astimezone(KST).date() != today_kst:
             continue
         if any(kw in title.lower() for kw in LEGISLATION_KEYWORDS):
-            risks.append({"type": "news", "title": translate_to_korean(title), "detail": item.get("source", "")})
+            news_matches.append((pub_dt, item))
+    news_matches.sort(key=lambda pair: pair[0], reverse=True)  # 최신순
+    for _, item in news_matches[:MAX_NEWS_RISK_ITEMS]:
+        risks.append({"type": "news", "title": translate_to_korean(item.get("title") or ""), "detail": item.get("source", "")})
 
     return risks

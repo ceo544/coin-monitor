@@ -3706,6 +3706,7 @@ input,select{font-family:'JetBrains Mono',monospace}
 #lwChartBox{border:1px solid var(--line);box-shadow:0 0 0 1px rgba(34,227,255,.06),0 0 30px rgba(34,227,255,.06) inset}
 .ovBtn.active{background:var(--blue);color:#031018;box-shadow:0 0 12px rgba(34,227,255,.4)}
 .ivBtn.active{background:var(--green);color:#031018;box-shadow:0 0 12px rgba(57,255,160,.4)}
+.patBtn.active{background:#c77dff;color:#1a0a2e;box-shadow:0 0 12px rgba(199,125,255,.4)}
 .gradeBadge{display:inline-flex;align-items:center;gap:5px;font-family:'Rajdhani',sans-serif;font-weight:800;font-size:13px;padding:3px 10px;border-radius:6px;margin-right:6px}
 .gradeBadge.gradeA{background:rgba(57,255,160,.15);color:var(--green);border:1px solid rgba(57,255,160,.4)}
 .gradeBadge.gradeB{background:rgba(34,227,255,.15);color:var(--blue);border:1px solid rgba(34,227,255,.4)}
@@ -3718,6 +3719,10 @@ input,select{font-family:'JetBrains Mono',monospace}
 .newsTicker:hover .newsTrack{animation-play-state:paused}
 @keyframes ticker-scroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
 .newsTicker{-webkit-mask-image:linear-gradient(to right,transparent,#000 48px,#000 calc(100% - 48px),transparent);mask-image:linear-gradient(to right,transparent,#000 48px,#000 calc(100% - 48px),transparent)}
+.newsItem{display:inline-flex;align-items:center;gap:10px;padding:0 34px;color:var(--text);text-decoration:none;font-size:13.5px;border-right:1px solid var(--line)}
+.newsItem:hover{color:var(--blue)}
+.newsItem.calItem{background:rgba(255,225,77,.06)}
+.newsItem.calItem .newsSrc{color:var(--yellow);background:rgba(255,225,77,.12);border-color:rgba(255,225,77,.4)}
 .newsListBox{max-height:104px;overflow-y:auto;display:flex;flex-direction:column;gap:2px}
 .newsRow{display:flex;align-items:center;gap:10px;padding:6px 4px;color:var(--text);text-decoration:none;font-size:13px;border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .newsRow:last-child{border-bottom:none}
@@ -3735,8 +3740,8 @@ input,select{font-family:'JetBrains Mono',monospace}
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head><body><div class="wrap">
 <div class="top"><div class="topTitle"><h1>🪙 뿌꾸의 코인세상</h1></div><div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collect" class="btn">강제 수집</button><button id="telegramTest" class="btn">텔레그램 현재상태 발송</button><a class="btn" href="/settings">설정</a><a class="btn" href="/logout">로그아웃</a><span id="live" class="live">● 정상 수집 중</span><span id="lastSync" class="muted"></span><span id="lastTop" class="muted"></span></div></div>
-<div class="card s12" id="newsTickerCard" style="padding:10px 14px;display:none;margin-bottom:14px">
-  <div id="newsTrack" class="newsListBox"></div>
+<div class="card s12 newsTicker" id="newsTickerCard" style="padding:10px 0;overflow:hidden;display:none;margin-bottom:14px">
+  <div class="newsTrack" id="newsTrack" style="display:inline-flex;white-space:nowrap;animation:ticker-scroll linear infinite"></div>
 </div>
 <div class="card s12 newsTicker" id="coinTickerCard" style="padding:10px 0;overflow:hidden;display:none;margin-bottom:16px">
   <div class="newsTrack" id="coinTrack" style="display:inline-flex;white-space:nowrap;animation:ticker-scroll linear infinite"></div>
@@ -3767,15 +3772,21 @@ input,select{font-family:'JetBrains Mono',monospace}
     <option value="cci">CCI</option>
   </select>
 </div>
+<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
+  <button type="button" class="btn patBtn active" data-pat="reversal" style="padding:5px 10px;font-size:11px">반전패턴</button>
+  <button type="button" class="btn patBtn active" data-pat="continuation" style="padding:5px 10px;font-size:11px">지속패턴</button>
+  <button type="button" class="btn patBtn active" data-pat="harmonic" style="padding:5px 10px;font-size:11px">하모닉패턴</button>
+</div>
 <div id="lwChartBox" class="tvChartBox" style="width:100%"></div>
 <div id="lwOscBox" style="width:100%;height:140px;margin-top:6px;display:none"></div>
+<div id="lwPatternInfo" class="hint" style="margin-top:6px;display:none"></div>
 <div id="lwClickInfo" class="hint" style="margin-top:8px">캔들을 클릭하면 그 시점 정보가 여기에 표시됩니다.</div>
 </div>
 <div class="card s6">
 <div class="hero" style="margin-bottom:20px"><div><div class="label">현재 판정</div><div id="heroSignal" class="heroSignal wait">WAIT</div></div><div><div id="signalBits" class="big" style="font-size:15px">LONG OFF / SHORT OFF</div><div class="muted">색상 신호를 기준으로 판정합니다.</div><div id="entryRisk" style="margin-top:6px"></div></div></div>
 <div id="dayRiskBanner" style="display:none;margin-bottom:18px;padding:12px 16px;border-radius:10px;background:rgba(255,47,110,.1);border:1px solid rgba(255,47,110,.4)">
   <div style="font-family:'Rajdhani',sans-serif;font-weight:800;color:var(--red);font-size:15px;margin-bottom:6px">⚠️ 오늘은 위험한 날입니다</div>
-  <div id="dayRiskList" style="font-size:12.5px;line-height:1.7"></div>
+  <div id="dayRiskList" class="newsListBox"></div>
 </div>
 <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;background:rgba(10,20,36,.7);border:1px solid var(--line);border-radius:12px;margin-bottom:20px"><span class="label">BTCUSDT 현재가</span><div style="text-align:right"><div id="price" class="big" style="margin-top:0">-</div><div id="priceDelta" class="muted" style="font-size:12px">Binance 실시간</div></div></div>
 <h2>진입가 <span class="muted">(현재 화면 기준)</span></h2><div class="tablewrap"><table><thead><tr><th>구분</th><th>진입 1<br>(25%)</th><th>진입 2<br>(40%)</th><th>진입 3<br>(60%)</th><th>진입 4<br>(100%)</th><th>진입 5<br>(예비)</th></tr></thead><tbody id="erangRows"></tbody></table></div>
@@ -4145,6 +4156,7 @@ async function refreshLwChart(){
     lwLastCandle=klines[klines.length-1];
     lwKlinesCache=klines;
     redrawActiveOverlays();
+    redrawActivePatterns();
     if(lwOscKind)drawOscillator(lwOscKind,klines);
   }
   // 짧은 시간 안에 같은 방향(LONG/LONG/LONG처럼) 신호가 몇 번이고 다시
@@ -4335,6 +4347,162 @@ function calcSupertrend(klines,period,mult){
   }
   return trend;
 }
+// ---------------------------------------------------------------------------
+// 차트 패턴 감지 (반전패턴/지속패턴/하모닉패턴) - 전부 스윙 고점/저점을 찾은
+// 뒤, 그 사이의 가격 비율/기울기로 패턴을 판정합니다. 차트에 이미 로드된
+// 캔들 데이터로 브라우저에서 직접 계산합니다 (서버 왕복 없음).
+// ---------------------------------------------------------------------------
+function findSwingPoints(klines,window){
+  window=window||3;
+  let points=[];
+  for(let i=window;i<klines.length-window;i++){
+    let isHigh=true,isLow=true;
+    for(let j=i-window;j<=i+window;j++){
+      if(j===i)continue;
+      if(klines[j].high>=klines[i].high)isHigh=false;
+      if(klines[j].low<=klines[i].low)isLow=false;
+    }
+    if(isHigh)points.push({index:i,time:klines[i].time,price:klines[i].high,type:'high'});
+    if(isLow)points.push({index:i,time:klines[i].time,price:klines[i].low,type:'low'});
+  }
+  return points.sort((a,b)=>a.index-b.index);
+}
+function detectDoubleTopBottom(swings,priceTolerance,minRetracement){
+  priceTolerance=priceTolerance??0.015;minRetracement=minRetracement??0.03;
+  let out=[];
+  let highs=swings.filter(s=>s.type==='high'),lows=swings.filter(s=>s.type==='low');
+  for(let i=0;i<highs.length-1;i++){
+    for(let j=i+1;j<highs.length;j++){
+      let h1=highs[i],h2=highs[j];
+      if(Math.abs(h1.price-h2.price)/h1.price>priceTolerance)continue;
+      let between=lows.filter(l=>l.index>h1.index&&l.index<h2.index);
+      if(!between.length)continue;
+      let low=between.reduce((a,b)=>a.price<b.price?a:b);
+      if((h1.price-low.price)/h1.price<minRetracement)continue;
+      out.push({type:'double_top',label:'더블탑',points:[h1,low,h2]});
+    }
+  }
+  for(let i=0;i<lows.length-1;i++){
+    for(let j=i+1;j<lows.length;j++){
+      let l1=lows[i],l2=lows[j];
+      if(Math.abs(l1.price-l2.price)/l1.price>priceTolerance)continue;
+      let between=highs.filter(h=>h.index>l1.index&&h.index<l2.index);
+      if(!between.length)continue;
+      let high=between.reduce((a,b)=>a.price>b.price?a:b);
+      if((high.price-l1.price)/l1.price<minRetracement)continue;
+      out.push({type:'double_bottom',label:'더블바텀',points:[l1,high,l2]});
+    }
+  }
+  return out;
+}
+function detectTripleTopBottom(swings,priceTolerance){
+  priceTolerance=priceTolerance??0.02;
+  let out=[];
+  let highs=swings.filter(s=>s.type==='high'),lows=swings.filter(s=>s.type==='low');
+  for(let i=0;i<highs.length-2;i++){
+    let[a,b,c]=[highs[i],highs[i+1],highs[i+2]];
+    let avg=(a.price+b.price+c.price)/3;
+    let maxDiff=Math.max(Math.abs(a.price-avg),Math.abs(b.price-avg),Math.abs(c.price-avg))/avg;
+    if(maxDiff>priceTolerance)continue;
+    out.push({type:'triple_top',label:'삼중탑',points:[a,b,c]});
+  }
+  for(let i=0;i<lows.length-2;i++){
+    let[a,b,c]=[lows[i],lows[i+1],lows[i+2]];
+    let avg=(a.price+b.price+c.price)/3;
+    let maxDiff=Math.max(Math.abs(a.price-avg),Math.abs(b.price-avg),Math.abs(c.price-avg))/avg;
+    if(maxDiff>priceTolerance)continue;
+    out.push({type:'triple_bottom',label:'삼중바닥',points:[a,b,c]});
+  }
+  return out;
+}
+function detectHeadShoulders(swings,shoulderTolerance,headMinExcess){
+  shoulderTolerance=shoulderTolerance??0.035;headMinExcess=headMinExcess??0.015;
+  let out=[];
+  let highs=swings.filter(s=>s.type==='high'),lows=swings.filter(s=>s.type==='low');
+  for(let i=0;i<highs.length-2;i++){
+    let ls=highs[i],head=highs[i+1],rs=highs[i+2];
+    if(!(head.price>ls.price&&head.price>rs.price))continue;
+    if(Math.abs(ls.price-rs.price)/((ls.price+rs.price)/2)>shoulderTolerance)continue;
+    if((head.price-Math.max(ls.price,rs.price))/head.price<headMinExcess)continue;
+    let t1s=lows.filter(l=>l.index>ls.index&&l.index<head.index);
+    let t2s=lows.filter(l=>l.index>head.index&&l.index<rs.index);
+    if(!t1s.length||!t2s.length)continue;
+    let t1=t1s.reduce((a,b)=>a.price<b.price?a:b),t2=t2s.reduce((a,b)=>a.price<b.price?a:b);
+    out.push({type:'head_shoulders',label:'헤드앤숄더',points:[ls,t1,head,t2,rs]});
+  }
+  for(let i=0;i<lows.length-2;i++){
+    let ls=lows[i],head=lows[i+1],rs=lows[i+2];
+    if(!(head.price<ls.price&&head.price<rs.price))continue;
+    if(Math.abs(ls.price-rs.price)/((ls.price+rs.price)/2)>shoulderTolerance)continue;
+    if((Math.min(ls.price,rs.price)-head.price)/head.price<headMinExcess)continue;
+    let p1s=highs.filter(h=>h.index>ls.index&&h.index<head.index);
+    let p2s=highs.filter(h=>h.index>head.index&&h.index<rs.index);
+    if(!p1s.length||!p2s.length)continue;
+    let p1=p1s.reduce((a,b)=>a.price>b.price?a:b),p2=p2s.reduce((a,b)=>a.price>b.price?a:b);
+    out.push({type:'inverse_head_shoulders',label:'역헤드앤숄더',points:[ls,p1,head,p2,rs]});
+  }
+  return out;
+}
+function linRegSlope(points){
+  let n=points.length,sumX=0,sumY=0,sumXY=0,sumXX=0;
+  for(let p of points){sumX+=p.index;sumY+=p.price;sumXY+=p.index*p.price;sumXX+=p.index*p.index;}
+  let denom=n*sumXX-sumX*sumX;
+  return denom===0?0:(n*sumXY-sumX*sumY)/denom;
+}
+function detectTriangleWedge(swings,lookback){
+  lookback=lookback??4;
+  let highs=swings.filter(s=>s.type==='high').slice(-lookback);
+  let lows=swings.filter(s=>s.type==='low').slice(-lookback);
+  if(highs.length<2||lows.length<2)return [];
+  let avgPrice=(highs[highs.length-1].price+lows[lows.length-1].price)/2;
+  let hSlope=linRegSlope(highs)/avgPrice,lSlope=linRegSlope(lows)/avgPrice;
+  let minSlope=0.0003;      // below this, a line barely moves at all regardless of the other side
+  let flatRatio=0.35;       // "flat" = under 35% as steep as the other line (relative, not absolute -
+                            // real chart lines are rarely perfectly horizontal)
+  let pts=[...highs,...lows];
+  let hFlat=Math.abs(hSlope)<minSlope||Math.abs(hSlope)<flatRatio*Math.abs(lSlope);
+  let lFlat=Math.abs(lSlope)<minSlope||Math.abs(lSlope)<flatRatio*Math.abs(hSlope);
+  if(hFlat&&lSlope>minSlope)return [{type:'ascending_triangle',label:'상승삼각형',points:pts}];
+  if(lFlat&&hSlope<-minSlope)return [{type:'descending_triangle',label:'하락삼각형',points:pts}];
+  if(hSlope<-minSlope&&lSlope>minSlope)return [{type:'symmetrical_triangle',label:'대칭삼각형',points:pts}];
+  let converging=(lSlope-hSlope)>minSlope; // gap between the two lines is shrinking over time, regardless of sign
+  if(hSlope>minSlope&&lSlope>minSlope&&converging)return [{type:'rising_wedge',label:'상승쐐기',points:pts}];
+  if(hSlope<-minSlope&&lSlope<-minSlope&&converging)return [{type:'falling_wedge',label:'하락쐐기',points:pts}];
+  return [];
+}
+function detectHarmonics(swings){
+  let out=[];
+  const within=(v,lo,hi,tol)=>{tol=tol??0.06;return v>=lo-tol&&v<=hi+tol;};
+  for(let i=0;i<=swings.length-5;i++){
+    let[X,A,B,C,D]=swings.slice(i,i+5);
+    let ok=true;
+    for(let k=1;k<5;k++)if(swings[i+k].type===swings[i+k-1].type)ok=false;
+    if(!ok)continue;
+    let bullish=X.type==='low';
+    let XA=Math.abs(A.price-X.price),AB=Math.abs(B.price-A.price),BC=Math.abs(C.price-B.price);
+    if(XA===0||AB===0||BC===0)continue;
+    let AB_XA=AB/XA,BC_AB=BC/AB,CD=Math.abs(D.price-C.price),CD_BC=CD/BC;
+    let XD_XA=Math.abs(D.price-A.price)/XA;
+    let dir=bullish?'불리시':'베어리시';
+    if(within(AB_XA,0.58,0.66)&&within(BC_AB,0.35,0.90)&&within(CD_BC,1.20,1.70)&&within(XD_XA,0.75,0.82))
+      out.push({type:bullish?'gartley_bullish':'gartley_bearish',label:dir+' 가틀리',points:[X,A,B,C,D]});
+    if(within(AB_XA,0.35,0.55)&&within(BC_AB,0.35,0.90)&&within(CD_BC,1.55,2.70)&&within(XD_XA,0.83,0.90))
+      out.push({type:bullish?'bat_bullish':'bat_bearish',label:dir+' 뱃',points:[X,A,B,C,D]});
+    if(within(AB_XA,0.74,0.82)&&within(BC_AB,0.35,0.90)&&within(CD_BC,1.55,2.30)&&within(XD_XA,1.20,1.70))
+      out.push({type:bullish?'butterfly_bullish':'butterfly_bearish',label:dir+' 버터플라이',points:[X,A,B,C,D]});
+    if(within(AB_XA,0.35,0.63)&&within(BC_AB,0.35,0.90)&&within(CD_BC,2.20,3.70)&&within(XD_XA,1.55,1.70))
+      out.push({type:bullish?'crab_bullish':'crab_bearish',label:dir+' 크랩',points:[X,A,B,C,D]});
+  }
+  return out;
+}
+function detectAllPatterns(klines){
+  let swings=findSwingPoints(klines,3);
+  return {
+    reversal:[...detectDoubleTopBottom(swings),...detectTripleTopBottom(swings),...detectHeadShoulders(swings)],
+    continuation:detectTriangleWedge(swings),
+    harmonic:detectHarmonics(swings),
+  };
+}
 // --- Overlay (drawn on main price chart, same scale) management ---
 let lwOverlaySeries={}, lwActiveOverlays=new Set(['ema','bb','vwap','ichimoku','supertrend']), lwKlinesCache=[];
 function seriesOf(name){let s=lwOverlaySeries[name];return s?(Array.isArray(s)?s:[s]):[];}
@@ -4373,6 +4541,60 @@ function drawOverlay(name,klines){
   }
 }
 function redrawActiveOverlays(){lwActiveOverlays.forEach(name=>drawOverlay(name,lwKlinesCache));}
+// --- Chart pattern drawing (반전/지속/하모닉) ---
+// 스윙포인트는 최신 캔들이 들어올 때마다 살짝 재계산되기 때문에, 한 번
+// 잡혔던 패턴이 다음 새로고침에서 순간적으로 재탐지에 실패하면 화면에서
+// 깜빡거리며 없어졌다 나타났다 할 수 있습니다. 그래서 "이번엔 못 찾았어도
+// 마지막으로 찾았던 걸 그대로 유지"하는 sticky 방식으로 동작합니다 -
+// 새로운 패턴이 실제로 잡히거나, 사용자가 버튼을 꺼서 명시적으로 지우거나,
+// 시간대(봉 간격)를 바꾸기 전까지는 계속 화면에 남아있습니다.
+let lwPatternSeries={},lwActivePatterns=new Set(['reversal','continuation','harmonic']);
+let lwLastFoundPatterns={reversal:[],continuation:[],harmonic:[]};
+const PATTERN_COLORS={reversal:'#ff8a3d',continuation:'#3da5ff',harmonic:'#c77dff'};
+function clearPatternCategory(cat){
+  (lwPatternSeries[cat]||[]).forEach(s=>{try{lwChart.removeSeries(s)}catch(e){}});
+  lwPatternSeries[cat]=[];
+  lwLastFoundPatterns[cat]=[];
+}
+function drawPatternCategory(cat,klines){
+  if(!klines.length)return lwLastFoundPatterns[cat];
+  let all=detectAllPatterns(klines);
+  let found=all[cat]||[];
+  if(!found.length)return lwLastFoundPatterns[cat];  // 이번엔 못 찾음 - 이전 걸 그대로 유지
+  (lwPatternSeries[cat]||[]).forEach(s=>{try{lwChart.removeSeries(s)}catch(e){}});
+  let color=PATTERN_COLORS[cat];
+  let series=[];
+  found.forEach(p=>{
+    let s=lwChart.addLineSeries({color,lineWidth:2,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});
+    let pts=p.points.slice().sort((a,b)=>a.index-b.index).map(pt=>({time:pt.time,value:pt.price}));
+    // 같은 시각(time)이 중복되면 라인 시리즈가 에러를 내므로 중복 제거
+    let seen=new Set(),uniq=pts.filter(pt=>{if(seen.has(pt.time))return false;seen.add(pt.time);return true;});
+    if(uniq.length>=2)s.setData(uniq);
+    series.push(s);
+  });
+  lwPatternSeries[cat]=series;
+  lwLastFoundPatterns[cat]=found;
+  return found;
+}
+function redrawActivePatterns(){
+  let allFound=[];
+  ['reversal','continuation','harmonic'].forEach(cat=>{
+    if(lwActivePatterns.has(cat))allFound=allFound.concat(drawPatternCategory(cat,lwKlinesCache));
+    else clearPatternCategory(cat);
+  });
+  let info=$('lwPatternInfo');
+  if(!allFound.length){info.style.display='none';return}
+  info.style.display='block';
+  info.innerHTML='🔎 감지된 패턴: '+allFound.map(p=>esc(p.label)).join(' · ');
+}
+document.querySelectorAll('.patBtn').forEach(btn=>{
+  btn.onclick=()=>{
+    let cat=btn.dataset.pat;
+    if(lwActivePatterns.has(cat)){lwActivePatterns.delete(cat);btn.classList.remove('active');}
+    else{lwActivePatterns.add(cat);btn.classList.add('active');}
+    redrawActivePatterns();
+  };
+});
 document.querySelectorAll('.ovBtn').forEach(btn=>{
   btn.onclick=()=>{
     let name=btn.dataset.ov;
@@ -4386,6 +4608,7 @@ document.querySelectorAll('.ivBtn').forEach(btn=>{
     document.querySelectorAll('.ivBtn').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
     lwChartInterval=btn.dataset.iv;
+    ['reversal','continuation','harmonic'].forEach(cat=>clearPatternCategory(cat));
     refreshLwChart();
   };
 });
@@ -4495,14 +4718,16 @@ async function refreshNews(){
     let card=$('newsTickerCard'),track=$('newsTrack');
     if(!items.length){card.style.display='none';return}
     card.style.display='block';
-    // 세로 스크롤 목록 - 한 번에 3줄 정도만 보이고, 마우스 휠/터치로 위아래
-    // 스크롤해서 나머지를 볼 수 있음 (예전의 가로 흐르는 슬라이드 방식 대신).
-    track.innerHTML=items.map(it=>{
+    // Duplicated once so the marquee loop is seamless (scrolls exactly
+    // -50% of the doubled track, landing back on an identical frame).
+    let html=items.map(it=>{
       if(it.is_calendar){
-        return `<div class="newsRow calItem"><span class="newsSrc">📅 일정</span><span>${calendarEventLabel(it)}</span></div>`;
+        return `<span class="newsItem calItem"><span class="newsSrc">📅 일정</span>${calendarEventLabel(it)}</span>`;
       }
-      return `<a class="newsRow" href="${esc(it.link)}" target="_blank" rel="noopener"><span class="newsSrc">${esc(it.source)}</span><span>${esc(it.title)}</span></a>`;
+      return `<a class="newsItem" href="${esc(it.link)}" target="_blank" rel="noopener"><span class="newsSrc">${esc(it.source)}</span>${esc(it.title)}</a>`;
     }).join('');
+    track.innerHTML=html+html;
+    setTickerSpeed(track,45);
   }catch(e){/* ticker is non-critical; fail silently */}
 }
 async function refreshCoinTicker(){
@@ -4531,8 +4756,8 @@ async function refreshDayRisk(){
     if(!risks.length){banner.style.display='none';return}
     banner.style.display='block';
     list.innerHTML=risks.map(r=>{
-      let icon=r.type==='calendar'?'📅':'📰';
-      return `<div>${icon} <b>${esc(r.title)}</b>${r.detail?` <span class="muted">(${esc(r.detail)})</span>`:''}</div>`;
+      let icon=r.type==='calendar'?'📅 일정':'📰 뉴스';
+      return `<div class="newsRow${r.type==='calendar'?' calItem':''}"><span class="newsSrc">${icon}</span><span>${esc(r.title)}${r.detail?` <span class="muted">(${esc(r.detail)})</span>`:''}</span></div>`;
     }).join('');
   }catch(e){/* non-critical; fail silently */}
 }

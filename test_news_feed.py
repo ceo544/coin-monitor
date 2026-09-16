@@ -210,6 +210,17 @@ class DetectTodayRiskTests(unittest.TestCase):
         risks = news_feed.detect_today_risk(news_items, [])
         self.assertEqual(risks, [])
 
+    def test_news_risk_items_capped_at_three_most_recent(self):
+        from datetime import datetime, timezone, timedelta
+        base = datetime.now(timezone.utc)
+        news_items = [
+            {"title": f"클래리티법 관련 속보 {i}", "published_at": (base - timedelta(minutes=i)).isoformat(), "source": "TokenPost"}
+            for i in range(8)
+        ]
+        risks = news_feed.detect_today_risk(news_items, [])
+        self.assertEqual(len(risks), news_feed.MAX_NEWS_RISK_ITEMS)
+        self.assertEqual(risks[0]["title"], "클래리티법 관련 속보 0")  # 가장 최신(delta 0분)이 먼저
+
 
 class TranslateToKoreanTests(unittest.TestCase):
     def setUp(self):
