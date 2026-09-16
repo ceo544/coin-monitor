@@ -285,6 +285,41 @@ def grade_at_row(side: str, row15: pd.Series, row1h: pd.Series, row4h: pd.Series
     return grade, round(pct, 1)
 
 
+def factor_signals_at_row(row15: pd.Series, row1h: pd.Series, row4h: pd.Series) -> dict:
+    """개별 지표 하나하나가 (다른 지표들과 무관하게) 어느 방향을 가리키는지
+    - "up"/"down"/None - 를 뽑아냅니다. 등급 공식은 이걸 전부 합산한 것인데,
+    합산하기 전에 각 지표 단독으로 방향 예측력이 있는지 따로 검증하기 위함."""
+    out = {}
+    out["supertrend_15m"] = row15.get("supertrend_dir") if row15.get("supertrend_dir") in ("up", "down") else None
+    out["supertrend_1h"] = row1h.get("supertrend_dir") if row1h.get("supertrend_dir") in ("up", "down") else None
+    out["supertrend_4h"] = row4h.get("supertrend_dir") if row4h.get("supertrend_dir") in ("up", "down") else None
+
+    for tf, r in (("15m", row15), ("1h", row1h)):
+        adx_v, pdi, mdi = r.get("adx"), r.get("plus_di"), r.get("minus_di")
+        if pd.notna(adx_v) and pd.notna(pdi) and pd.notna(mdi) and adx_v >= 20:
+            out[f"adx_di_{tf}"] = "up" if pdi > mdi else "down"
+        else:
+            out[f"adx_di_{tf}"] = None
+
+    taker = row15.get("taker_buy_ratio")
+    if pd.notna(taker):
+        if taker >= 0.55:
+            out["taker_flow_15m"] = "up"
+        elif taker <= 0.45:
+            out["taker_flow_15m"] = "down"
+        else:
+            out["taker_flow_15m"] = None
+    else:
+        out["taker_flow_15m"] = None
+
+    structure = row15.get("structure")
+    out["structure_15m"] = "up" if structure == "uptrend" else ("down" if structure == "downtrend" else None)
+
+    cloud = row1h.get("cloud_pos")
+    out["ichimoku_1h"] = "up" if cloud == "above" else ("down" if cloud == "below" else None)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 4. 백테스트 실행: 매 1시간 봉마다 LONG/SHORT 등급 계산 후, 이후 수익률 기록
 # ---------------------------------------------------------------------------
@@ -310,6 +345,7 @@ def run_backtest(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> 
 
         long_grade, long_pct = grade_at_row("long", row15, row1h, row4h)
         short_grade, short_pct = grade_at_row("short", row15, row1h, row4h)
+        factors = factor_signals_at_row(row15, row1h, row4h)
 
         # "이 순간 어느 방향을 선택했겠는가" - LONG/SHORT 등급 점수(%)를 비교해서
         # 더 높은 쪽을 채택. 둘 다 데이터가 없으면 방향 없음(None). 동점이면
@@ -332,6 +368,8 @@ def run_backtest(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> 
         rec = {"time": t, "price": price0, "long_grade": long_grade, "long_pct": long_pct,
                "short_grade": short_grade, "short_pct": short_pct,
                "decision": decision, "decision_grade": decision_grade, "decision_pct": decision_pct}
+        for fname, fdir in factors.items():
+            rec[f"factor_{fname}"] = fdir
         for label, hrs in (("1h", 1), ("4h", 4), ("24h", 24)):
             future_t = t + pd.Timedelta(hours=hrs)
             future_idx = closes_1h.index.asof(future_t)
@@ -402,6 +440,39 @@ def summarize(result: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+FACTOR_NAMES = [
+    "supertrend_15m", "supertrend_1h", "supertrend_4h",
+    "adx_di_15m", "adx_di_1h", "taker_flow_15m", "structure_15m", "ichimoku_1h",
+]
+
+
+def summarize_factors(result: pd.DataFrame) -> str:
+    """등급 공식을 구성하는 8개 지표 각각을, 다른 지표와 합치지 않고 단독으로
+    "up이면 상승/down이면 하락을 예측한다"고 놓았을 때의 승률을 따로 검증합니다.
+    합산 점수는 예측력이 없었지만 혹시 그 중 하나라도 단독으로는 신호가 있는지
+    확인하기 위함."""
+    lines = ["=" * 60, "개별 지표 단독 예측력 검증 (8개 지표 각각 독립적으로)", "=" * 60]
+    for fname in FACTOR_NAMES:
+        col = f"factor_{fname}"
+        if col not in result.columns:
+            continue
+        sub = result.dropna(subset=[col])
+        n_up = (sub[col] == "up").sum()
+        n_down = (sub[col] == "down").sum()
+        lines.append(f"\n[{fname}] (up 판정 {n_up}개 · down 판정 {n_down}개)")
+        for label in ("1h", "4h", "24h"):
+            ret_col = f"ret_{label}_pct"
+            valid = sub.dropna(subset=[ret_col])
+            if valid.empty:
+                continue
+            correct = np.where(valid[col] == "up", valid[ret_col] > 0, valid[ret_col] < 0)
+            n = len(valid)
+            p = correct.mean()
+            se = np.sqrt(0.5 * 0.5 / n) if n > 0 else np.nan
+            lines.append(f"  {label}: 승률 {p*100:.1f}% (n={n}, 95% CI [{(p-1.96*se)*100:.1f}%, {(p+1.96*se)*100:.1f}%])")
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="2025-01-01")
@@ -426,7 +497,13 @@ def main():
     with open("backtest_summary.txt", "w", encoding="utf-8") as f:
         f.write(summary)
     print(summary)
-    print("\n완료: backtest_result.csv, backtest_summary.txt 생성됨")
+
+    factor_summary = summarize_factors(result)
+    with open("factor_analysis.txt", "w", encoding="utf-8") as f:
+        f.write(factor_summary)
+    print("\n" + factor_summary)
+
+    print("\n완료: backtest_result.csv, backtest_summary.txt, factor_analysis.txt 생성됨")
 
 
 if __name__ == "__main__":
