@@ -14,8 +14,11 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
+
+KST = ZoneInfo("Asia/Seoul")
 
 # (display name, RSS feed URL). Mix of English and Korean crypto outlets so
 # the ticker isn't one-sided. Each is independently wrapped in try/except -
@@ -138,3 +141,49 @@ def fetch_economic_calendar() -> Dict[str, Any]:
             continue
     events.sort(key=lambda e: e["date"])
     return {"items": events, "error": None}
+
+
+# ---------------------------------------------------------------------------
+# "오늘은 위험한 날" 배너 - 경제지표 캘린더(CPI/FOMC 등, 오늘 날짜인 것만) +
+# 뉴스 헤드라인 중 코인 관련 법안/규제 이슈(클래리티법 등, 오늘 게재된 것만)를
+# 합쳐서 반환합니다. 매일 뜨는 게 아니라 그런 이슈가 있는 날에만 뜨도록,
+# fetch_all_news()의 "48시간 이내" 우선순위 로직과는 별개로 "오늘(KST)"
+# 기준으로 엄격하게 필터링합니다.
+# ---------------------------------------------------------------------------
+LEGISLATION_KEYWORDS = [
+    "클래리티", "clarity", "법안", "규제", "sec ", "청문회", "제재", "소송",
+    "부결", "가결", "행정명령", "가상자산법", "코인법안", "stablecoin bill",
+    "market structure bill", "규제안", "입법",
+]
+
+
+def detect_today_risk(news_items: List[Dict[str, Any]], calendar_items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """오늘(KST 기준) 발생하는 위험 요소 목록을 반환합니다. 각 항목은
+    {"type": "calendar"|"news", "title": ..., "detail": ...} 형태."""
+    today_kst = datetime.now(KST).date()
+    risks: List[Dict[str, str]] = []
+
+    for ev in calendar_items or []:
+        try:
+            ev_dt = datetime.fromisoformat(ev["date"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ev_dt.astimezone(KST).date() == today_kst:
+            time_str = ev_dt.astimezone(KST).strftime("%H:%M")
+            risks.append({"type": "calendar", "title": ev.get("title", ""), "detail": f"{time_str} KST"})
+
+    for item in news_items or []:
+        title = item.get("title") or ""
+        pub = item.get("published_at")
+        if not pub:
+            continue
+        try:
+            pub_dt = datetime.fromisoformat(pub)
+        except (TypeError, ValueError):
+            continue
+        if pub_dt.astimezone(KST).date() != today_kst:
+            continue
+        if any(kw in title.lower() for kw in LEGISLATION_KEYWORDS):
+            risks.append({"type": "news", "title": title, "detail": item.get("source", "")})
+
+    return risks

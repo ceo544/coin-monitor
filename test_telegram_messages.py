@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import main
 
@@ -207,6 +208,42 @@ class EntryProximityRiskWarningTests(unittest.TestCase):
         )
         self.assertEqual(len(self.sent), 1)
         self.assertNotIn("주의", self.sent[0])
+
+
+class DayRiskNotificationTests(unittest.TestCase):
+    TEST_USER_ID = 999004
+
+    def setUp(self):
+        self.orig_send = main.send_telegram_message
+        self.sent = []
+        main.send_telegram_message = lambda msg, bot_token, chat_id, user_id=None: self.sent.append(msg)
+        main._day_risk_notified_date.pop(self.TEST_USER_ID, None)
+
+    def tearDown(self):
+        main.send_telegram_message = self.orig_send
+        main._day_risk_notified_date.pop(self.TEST_USER_ID, None)
+
+    def test_sends_once_when_risk_exists(self):
+        with patch("main.get_today_risk", return_value=[{"type": "calendar", "title": "CPI m/m", "detail": "21:30 KST"}]):
+            main._maybe_notify_day_risk(self.TEST_USER_ID, "fake-token", "fake-chat", "")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("오늘은 위험한 날", self.sent[0])
+        self.assertIn("CPI m/m", self.sent[0])
+
+    def test_does_not_resend_same_day(self):
+        with patch("main.get_today_risk", return_value=[{"type": "calendar", "title": "CPI m/m", "detail": ""}]):
+            main._maybe_notify_day_risk(self.TEST_USER_ID, "fake-token", "fake-chat", "")
+            main._maybe_notify_day_risk(self.TEST_USER_ID, "fake-token", "fake-chat", "")
+        self.assertEqual(len(self.sent), 1)
+
+    def test_no_message_on_a_normal_day(self):
+        with patch("main.get_today_risk", return_value=[]):
+            main._maybe_notify_day_risk(self.TEST_USER_ID, "fake-token", "fake-chat", "")
+        self.assertEqual(len(self.sent), 0)
+
+    def test_missing_telegram_config_does_not_crash(self):
+        main._maybe_notify_day_risk(self.TEST_USER_ID, "", "", "")
+        self.assertEqual(len(self.sent), 0)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ except Exception:  # pragma: no cover
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import requests
@@ -2516,6 +2516,10 @@ def collect_once() -> Dict[str, Any]:
                 )
             except Exception as exc:
                 log("TELEGRAM_ERROR", f"entry-proximity notify failed for user {uid}: {type(exc).__name__}: {exc}")
+            try:
+                _maybe_notify_day_risk(uid, usettings["TELEGRAM_BOT_TOKEN"], usettings["TELEGRAM_CHAT_ID"], usettings["DASHBOARD_URL"])
+            except Exception as exc:
+                log("TELEGRAM_ERROR", f"day-risk notify failed for user {uid}: {type(exc).__name__}: {exc}")
         try:
             observed_at_iso = observed_at.isoformat()
             minutes_since_long = _minutes_since(streak["long_start"], observed_at_iso)
@@ -3004,6 +3008,35 @@ CALENDAR_CACHE_TTL_SECONDS = 1800  # the calendar itself only needs refreshing a
 CALENDAR_HIGHLIGHT_WINDOW_HOURS = 48  # how close an event must be to get bumped to the front of the ticker
 _topcoins_cache: Dict[str, Any] = {"data": None, "fetched_at": 0.0}
 TOPCOINS_CACHE_TTL_SECONDS = 10  # prices should feel live, but still throttled below the 1s dashboard poll
+_day_risk_notified_date: Dict[int, str] = {}  # user_id -> "YYYY-MM-DD" (KST) already notified today
+
+
+def _maybe_notify_day_risk(user_id: int, bot_token: str, chat_id: str, dashboard_url: str) -> None:
+    """오늘(KST) CPI/FOMC나 코인 법안/규제 이슈가 있으면 딱 하루 한 번만
+    텔레그램으로 경고합니다 - 평범한 날엔 아무 메시지도 안 갑니다. 자정이
+    지나 날짜가 바뀌면 자동으로 다시 알림 대상이 됩니다(딕셔너리 값이
+    새 날짜와 달라지므로)."""
+    if not bot_token or not chat_id:
+        return
+    today_str = datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d")
+    if _day_risk_notified_date.get(user_id) == today_str:
+        return
+    risks = get_today_risk()
+    if not risks:
+        return
+    lines = ["🚨 <b>오늘은 위험한 날입니다</b>", "가격 변동성이 커질 수 있는 일정/이슈가 있어요:", ""]
+    for r in risks:
+        icon = "📅" if r["type"] == "calendar" else "📰"
+        detail = f" ({r['detail']})" if r.get("detail") else ""
+        lines.append(f"{icon} {r['title']}{detail}")
+    if dashboard_url:
+        lines.append("")
+        lines.append(f'<a href="{html.escape(dashboard_url, quote=True)}">대시보드 열기</a>')
+    try:
+        send_telegram_message("\n".join(lines), bot_token, chat_id, user_id)
+        _day_risk_notified_date[user_id] = today_str
+    except Exception as exc:
+        log("TELEGRAM_ERROR", f"day-risk notify failed for user {user_id}: {type(exc).__name__}: {exc}")
 
 
 def _get_economic_calendar() -> Dict[str, Any]:
@@ -3076,6 +3109,37 @@ def api_top_coins() -> Response:
             _topcoins_cache["data"] = {"items": [], "error": f"{type(exc).__name__}: {exc}"}
         _topcoins_cache["fetched_at"] = now
     return jsonify(_topcoins_cache["data"])
+
+
+def get_today_risk() -> List[Dict[str, str]]:
+    """오늘(KST) CPI/FOMC 같은 고영향 캘린더 이벤트가 있거나, 코인 관련
+    법안/규제 뉴스가 오늘 나왔으면 그 목록을 반환합니다. 평소(그런 이슈가
+    없는 날)엔 빈 리스트 - 매일 뜨는 배너가 아니라 정말 위험한 날에만
+    뜨게 하기 위함. /api/news가 이미 캐싱해둔 뉴스/캘린더 데이터를 그대로
+    재사용해서 별도 API 호출을 늘리지 않지만, 아직 한 번도 채워진 적이
+    없으면(예: 부팅 직후) 여기서 직접 한 번 채웁니다."""
+    if news_feed is None:
+        return []
+    with _news_cache_lock:
+        if _news_cache["data"] is None:
+            try:
+                _news_cache["data"] = news_feed.fetch_all_news()
+                _news_cache["fetched_at"] = time.monotonic()
+            except Exception as exc:
+                log("NEWS_ERROR", f"fetch_all_news failed in get_today_risk: {type(exc).__name__}: {exc}")
+                _news_cache["data"] = {"items": [], "errors": None, "fetched_at": None}
+        news_data = dict(_news_cache["data"])
+    calendar_data = _get_economic_calendar()
+    try:
+        return news_feed.detect_today_risk(news_data.get("items") or [], calendar_data.get("items") or [])
+    except Exception as exc:
+        log("NEWS_ERROR", f"detect_today_risk failed: {type(exc).__name__}: {exc}")
+        return []
+
+
+@app.get("/api/day-risk")
+def api_day_risk() -> Response:
+    return jsonify({"risks": get_today_risk()})
 
 
 @app.get("/api/chart-klines")
@@ -3707,6 +3771,10 @@ input,select{font-family:'JetBrains Mono',monospace}
 </div>
 <div class="card s6">
 <div class="hero" style="margin-bottom:20px"><div><div class="label">현재 판정</div><div id="heroSignal" class="heroSignal wait">WAIT</div></div><div><div id="signalBits" class="big" style="font-size:15px">LONG OFF / SHORT OFF</div><div class="muted">색상 신호를 기준으로 판정합니다.</div><div id="entryRisk" style="margin-top:6px"></div></div></div>
+<div id="dayRiskBanner" style="display:none;margin-bottom:18px;padding:12px 16px;border-radius:10px;background:rgba(255,47,110,.1);border:1px solid rgba(255,47,110,.4)">
+  <div style="font-family:'Rajdhani',sans-serif;font-weight:800;color:var(--red);font-size:15px;margin-bottom:6px">⚠️ 오늘은 위험한 날입니다</div>
+  <div id="dayRiskList" style="font-size:12.5px;line-height:1.7"></div>
+</div>
 <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;background:rgba(10,20,36,.7);border:1px solid var(--line);border-radius:12px;margin-bottom:20px"><span class="label">BTCUSDT 현재가</span><div style="text-align:right"><div id="price" class="big" style="margin-top:0">-</div><div id="priceDelta" class="muted" style="font-size:12px">Binance 실시간</div></div></div>
 <h2>진입가 <span class="muted">(현재 화면 기준)</span></h2><div class="tablewrap"><table><thead><tr><th>구분</th><th>진입 1<br>(25%)</th><th>진입 2<br>(40%)</th><th>진입 3<br>(60%)</th><th>진입 4<br>(100%)</th><th>진입 5<br>(예비)</th></tr></thead><tbody id="erangRows"></tbody></table></div>
 </div>
@@ -4437,16 +4505,32 @@ async function refreshCoinTicker(){
     setTickerSpeed(track,45);
   }catch(e){/* ticker is non-critical; fail silently */}
 }
+async function refreshDayRisk(){
+  try{
+    let r=await fetch('/api/day-risk',{cache:'no-store'});
+    let j=await r.json();
+    let risks=j.risks||[];
+    let banner=$('dayRiskBanner'),list=$('dayRiskList');
+    if(!risks.length){banner.style.display='none';return}
+    banner.style.display='block';
+    list.innerHTML=risks.map(r=>{
+      let icon=r.type==='calendar'?'📅':'📰';
+      return `<div>${icon} <b>${esc(r.title)}</b>${r.detail?` <span class="muted">(${esc(r.detail)})</span>`:''}</div>`;
+    }).join('');
+  }catch(e){/* non-critical; fail silently */}
+}
 refresh();
 checkUpdate();
 refreshLwChart();
 refreshNews();
 refreshCoinTicker();
+refreshDayRisk();
 setInterval(refresh,1000);
 setInterval(checkUpdate,60000);
 setInterval(refreshLwChart,30000);
 setInterval(refreshNews,300000);
 setInterval(refreshCoinTicker,10000);
+setInterval(refreshDayRisk,300000);
 </script></body></html>
 """
 

@@ -1,0 +1,66 @@
+name: BTC 2025 Backtest
+
+# btc-backtest-2025 브랜치에 푸시하거나, Actions 탭에서 수동 실행(workflow_dispatch)하면
+# 바이낸스 2025년 데이터를 받아서 A/B/C/D 등급 백테스트를 돌리고,
+# 결과(backtest_result.csv, backtest_summary.txt)를 Actions artifact로 저장합니다.
+#
+# GitHub Actions 러너는 인터넷 제한이 없어서, Claude 개발 환경에서 막혀있던
+# 바이낸스 API 호출이 여기서는 정상 동작합니다.
+#
+# 결과 다운로드 방법: Actions 탭 → 이 워크플로우 실행 기록 클릭 → 아래
+# "Artifacts" 섹션에서 btc-backtest-2025-results.zip 다운로드
+
+on:
+  push:
+    branches: [btc-backtest-2025]
+    paths:
+      - "backtest/**"
+      - ".github/workflows/btc-backtest-2025.yml"
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "시작일 (YYYY-MM-DD)"
+        default: "2025-01-01"
+      end:
+        description: "종료일 (YYYY-MM-DD)"
+        default: "2026-01-01"
+      market:
+        description: "spot 또는 futures"
+        default: "futures"
+        type: choice
+        options: ["futures", "spot"]
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas numpy
+
+      - name: Run 2025 backtest
+        working-directory: backtest
+        run: |
+          python backtest_2025.py \
+            --start "${{ github.event.inputs.start || '2025-01-01' }}" \
+            --end "${{ github.event.inputs.end || '2026-01-01' }}" \
+            --market "${{ github.event.inputs.market || 'futures' }}"
+
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: btc-backtest-2025-results
+          path: |
+            backtest/backtest_result.csv
+            backtest/backtest_summary.txt
+            backtest/factor_analysis.txt
+          retention-days: 30
+
+      - name: Print summary in the Actions log too
+        if: always()
+        run: cat backtest/backtest_summary.txt || echo "요약 파일이 생성되지 않았습니다 - 위 로그에서 에러를 확인해주세요."

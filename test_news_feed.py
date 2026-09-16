@@ -151,5 +151,65 @@ class EconomicCalendarTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["title"], "Good one")
 
 
+class DetectTodayRiskTests(unittest.TestCase):
+    def test_calendar_event_today_is_detected(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        calendar_items = [{"title": "CPI m/m", "date": now.isoformat()}]
+        risks = news_feed.detect_today_risk([], calendar_items)
+        self.assertEqual(len(risks), 1)
+        self.assertEqual(risks[0]["type"], "calendar")
+        self.assertEqual(risks[0]["title"], "CPI m/m")
+
+    def test_calendar_event_tomorrow_is_not_detected(self):
+        from datetime import datetime, timezone, timedelta
+        tomorrow = datetime.now(timezone.utc) + timedelta(days=1, hours=2)
+        calendar_items = [{"title": "FOMC Statement", "date": tomorrow.isoformat()}]
+        risks = news_feed.detect_today_risk([], calendar_items)
+        self.assertEqual(risks, [])
+
+    def test_clarity_act_news_today_is_detected(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        news_items = [{"title": "美 상원, 클래리티법 부결...비트코인 하락", "published_at": now.isoformat(), "source": "TokenPost"}]
+        risks = news_feed.detect_today_risk(news_items, [])
+        self.assertEqual(len(risks), 1)
+        self.assertEqual(risks[0]["type"], "news")
+
+    def test_english_clarity_keyword_also_detected(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        news_items = [{"title": "Senate rejects CLARITY Act in surprise vote", "published_at": now.isoformat(), "source": "CoinDesk"}]
+        risks = news_feed.detect_today_risk(news_items, [])
+        self.assertEqual(len(risks), 1)
+
+    def test_unrelated_news_today_is_not_detected(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        news_items = [{"title": "BTC holds above $70,000 after volatile session", "published_at": now.isoformat(), "source": "CoinDesk"}]
+        risks = news_feed.detect_today_risk(news_items, [])
+        self.assertEqual(risks, [])
+
+    def test_legislation_news_from_yesterday_is_not_detected(self):
+        from datetime import datetime, timezone, timedelta
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1, hours=2)
+        news_items = [{"title": "클래리티법 관련 논의 계속", "published_at": yesterday.isoformat(), "source": "TokenPost"}]
+        risks = news_feed.detect_today_risk(news_items, [])
+        self.assertEqual(risks, [])
+
+    def test_combines_both_calendar_and_news_risks(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        calendar_items = [{"title": "FOMC Press Conference", "date": now.isoformat()}]
+        news_items = [{"title": "클래리티법 재표결 임박", "published_at": now.isoformat(), "source": "TokenPost"}]
+        risks = news_feed.detect_today_risk(news_items, calendar_items)
+        self.assertEqual(len(risks), 2)
+
+    def test_missing_published_at_is_skipped_not_crashing(self):
+        news_items = [{"title": "클래리티법", "published_at": None, "source": "TokenPost"}]
+        risks = news_feed.detect_today_risk(news_items, [])
+        self.assertEqual(risks, [])
+
+
 if __name__ == "__main__":
     unittest.main()
