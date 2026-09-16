@@ -241,5 +241,84 @@ class KillSwitchTests(AutoTradeTestBase):
         mock_cancel.assert_called_once()
 
 
+class RiskFilterGateTests(AutoTradeTestBase):
+    """The safety gate built from the real 09/15 incident: stale signal +
+    higher-timeframe conflict + weak order flow should block a real entry,
+    without ever touching the E-RANG signal itself."""
+
+    def _risky_binance_json(self):
+        return {"indicators": {
+            "15m": {"supertrend": {"direction": "down"}, "taker_flow": {"taker_buy_ratio": 0.30}},
+            "1h": {"supertrend": {"direction": "down"}},
+        }}
+
+    def _clean_binance_json(self):
+        return {"indicators": {
+            "15m": {"supertrend": {"direction": "up"}, "taker_flow": {"taker_buy_ratio": 0.65}},
+            "1h": {"supertrend": {"direction": "up"}},
+        }}
+
+    def test_risky_long_entry_is_blocked_when_filter_enabled(self):
+        with patch("main._has_open_position", return_value=False), \
+             patch("main.bingx_client.create_order") as mock_create:
+            main._execute_auto_trade(
+                TEST_USER_ID, "long", main._row_map_from_parsed(_parsed_with_entries()),
+                _test_settings(AUTO_TRADE_DRY_RUN="false", AUTO_TRADE_RISK_FILTER_ENABLED="true"),
+                binance_json=self._risky_binance_json(), minutes_since_start=210.83,
+            )
+        mock_create.assert_not_called()
+        with main.db_cursor() as (conn, cur):
+            cur.execute("SELECT action, detail FROM auto_trades WHERE user_id = ? ORDER BY id DESC LIMIT 1", (TEST_USER_ID,))
+            row = cur.fetchone()
+        self.assertEqual(row[0], "skipped_risk_filter")
+        self.assertIn("stale", row[1])
+        self.assertIn("higher_tf_conflict", row[1])
+        self.assertIn("order_flow_weak", row[1])
+
+    def test_clean_signal_is_not_blocked_by_filter(self):
+        with patch("main._has_open_position", return_value=False), \
+             patch("main.bingx_client.set_leverage"), \
+             patch("main.bingx_client.create_order", return_value={"orderId": "999"}) as mock_create:
+            main._execute_auto_trade(
+                TEST_USER_ID, "long", main._row_map_from_parsed(_parsed_with_entries()),
+                _test_settings(AUTO_TRADE_DRY_RUN="false", AUTO_TRADE_RISK_FILTER_ENABLED="true"),
+                binance_json=self._clean_binance_json(), minutes_since_start=5.0,
+            )
+            mock_create.assert_called_once()
+        with main.db_cursor() as (conn, cur):
+            cur.execute("SELECT action FROM auto_trades WHERE user_id = ? ORDER BY id DESC LIMIT 1", (TEST_USER_ID,))
+            self.assertEqual(cur.fetchone()[0], "order_placed")
+
+    def test_risky_entry_goes_through_when_filter_disabled(self):
+        # A person can explicitly turn the filter off in Settings - respects
+        # their choice, doesn't force the safety layer on them.
+        with patch("main._has_open_position", return_value=False), \
+             patch("main.bingx_client.set_leverage"), \
+             patch("main.bingx_client.create_order", return_value={"orderId": "1"}):
+            main._execute_auto_trade(
+                TEST_USER_ID, "long", main._row_map_from_parsed(_parsed_with_entries()),
+                _test_settings(AUTO_TRADE_DRY_RUN="false", AUTO_TRADE_RISK_FILTER_ENABLED="false"),
+                binance_json=self._risky_binance_json(), minutes_since_start=210.83,
+            )
+        with main.db_cursor() as (conn, cur):
+            cur.execute("SELECT action FROM auto_trades WHERE user_id = ? ORDER BY id DESC LIMIT 1", (TEST_USER_ID,))
+            self.assertEqual(cur.fetchone()[0], "order_placed")
+
+    def test_no_binance_context_does_not_block_trade(self):
+        # Defensive: if binance_json wasn't available for some reason, the
+        # gate should fail open (no flags) rather than block everything.
+        with patch("main._has_open_position", return_value=False), \
+             patch("main.bingx_client.set_leverage"), \
+             patch("main.bingx_client.create_order", return_value={"orderId": "1"}):
+            main._execute_auto_trade(
+                TEST_USER_ID, "long", main._row_map_from_parsed(_parsed_with_entries()),
+                _test_settings(AUTO_TRADE_DRY_RUN="false", AUTO_TRADE_RISK_FILTER_ENABLED="true"),
+                binance_json=None, minutes_since_start=None,
+            )
+        with main.db_cursor() as (conn, cur):
+            cur.execute("SELECT action FROM auto_trades WHERE user_id = ? ORDER BY id DESC LIMIT 1", (TEST_USER_ID,))
+            self.assertEqual(cur.fetchone()[0], "order_placed")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -426,6 +426,7 @@ def settings_page() -> str:
         "FIELDS_AUTOTRADE": {
             "AUTO_TRADE_ENABLED", "AUTO_TRADE_DRY_RUN", "AUTO_TRADE_SYMBOL", "AUTO_TRADE_LEVERAGE",
             "AUTO_TRADE_MARGIN_USDT", "AUTO_TRADE_MAX_DAILY_TRADES", "AUTO_TRADE_MAX_DAILY_LOSS_USDT",
+            "AUTO_TRADE_RISK_FILTER_ENABLED", "AUTO_TRADE_STALE_MINUTES",
             "BINGX_API_KEY", "BINGX_API_SECRET",
         },
         "FIELDS_UPDATE": {"GITHUB_REPO"},
@@ -483,7 +484,7 @@ OBSERVATION_COLUMNS = """id, observed_at, http_status, success, current_price, c
        long_label_classes, long_own_inline_background,
        short_matched_selector, short_matched_declaration, short_ancestor_classes,
        short_label_classes, short_own_inline_background,
-       error, parsed_json, binance_json"""
+       error, parsed_json, binance_json, long_start, short_start"""
 
 
 @app.after_request
@@ -834,6 +835,8 @@ USER_SETTINGS_SCHEMA = [
     ("AUTO_TRADE_MARGIN_USDT", "1회 진입 마진 (USDT)", "number", "50", False),
     ("AUTO_TRADE_MAX_DAILY_TRADES", "일일 최대 진입 횟수", "number", "10", False),
     ("AUTO_TRADE_MAX_DAILY_LOSS_USDT", "일일 최대 손실 한도 (USDT, 초과시 자동정지)", "number", "100", False),
+    ("AUTO_TRADE_RISK_FILTER_ENABLED", "진입 위험 필터 사용 (오래된 신호·상위시간봉 역행·체결강도 약화 시 자동매매 진입 차단)", "checkbox", "true", False),
+    ("AUTO_TRADE_STALE_MINUTES", "신호 '오래됨' 기준 (분, 이보다 오래 지속된 신호는 위험 신호로 표시)", "number", "45", False),
     ("BINGX_API_KEY", "BingX API Key", "text", "", True),
     ("BINGX_API_SECRET", "BingX API Secret", "password", "", True),
 ]
@@ -1267,6 +1270,158 @@ def _row_map_from_parsed(parsed: Dict[str, Any]) -> Dict[str, list]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Entry-risk assessment - a purely advisory/safety LAYER on top of the raw
+# E-RANG signal, built from a real incident: a person saw "LONG" on the
+# dashboard and entered, not realizing the signal had actually been ON for
+# 3.5 hours already (stale, not a fresh entry trigger) while the 15m/1h
+# timeframes had already flipped into a strong downtrend and order flow was
+# deteriorating. This NEVER changes long_signal/short_signal themselves
+# (those stay 100% E-RANG's own judgment) - it only flags when a signal
+# looks risky to act on RIGHT NOW, for display and as an optional
+# auto-trade safety gate.
+# ---------------------------------------------------------------------------
+def assess_entry_risk(
+    side: str, minutes_since_start: Optional[float], binance_indicators: Dict[str, Any],
+    stale_minutes: float = 45.0,
+) -> Dict[str, Any]:
+    """side: 'long' or 'short'. binance_indicators: the {interval: {...}}
+    dict from binance_json['indicators']. Returns which risk flags are
+    raised, a simple 0-3 risk_level (count of flags, used by the auto-trade
+    safety gate), AND a broader A/B/C/D entry-quality grade built from more
+    factors (higher-timeframe trend alignment across 15m/1h/4h, ADX trend
+    strength+direction, order flow, market structure, Ichimoku cloud
+    position) - the grade is a rule-based score, not yet backtested against
+    actual trade outcomes (too little data collected so far for that), so
+    treat it as "how internally consistent the setup looks right now"
+    rather than a validated win-rate prediction. Re-check/recalibrate the
+    thresholds once enough resolved trades exist."""
+    flags = []
+
+    stale = minutes_since_start is not None and minutes_since_start > stale_minutes
+    if stale:
+        flags.append("stale")
+
+    bad_direction = "down" if side == "long" else "up"
+    good_direction = "up" if side == "long" else "down"
+    tf15 = (binance_indicators.get("15m") or {}).get("supertrend", {}).get("direction")
+    tf1h = (binance_indicators.get("1h") or {}).get("supertrend", {}).get("direction")
+    higher_tf_conflict = tf15 == bad_direction and tf1h == bad_direction
+    if higher_tf_conflict:
+        flags.append("higher_tf_conflict")
+
+    # 15m taker_buy_ratio is itself already smoothed over a 15-minute candle
+    # (unlike the very noisy 1m tick-level reading), so it's used here
+    # rather than a raw instant snapshot that can flip sign within seconds.
+    taker_ratio = (binance_indicators.get("15m") or {}).get("taker_flow", {}).get("taker_buy_ratio")
+    order_flow_weak = False
+    if taker_ratio is not None:
+        if side == "long" and taker_ratio < 0.4:
+            order_flow_weak = True
+        elif side == "short" and taker_ratio > 0.6:
+            order_flow_weak = True
+    if order_flow_weak:
+        flags.append("order_flow_weak")
+
+    # --- Broader grading (informational, doesn't affect flags/risk_level above) ---
+    score = 0.0
+    max_score = 0.0
+    reasons: List[str] = []
+
+    if minutes_since_start is None:
+        pass
+    else:
+        max_score += 2
+        if minutes_since_start <= 15:
+            score += 2
+            reasons.append("신선한 신호 (15분 이내)")
+        elif minutes_since_start <= stale_minutes:
+            score += 1
+            reasons.append(f"진행 중인 신호 ({minutes_since_start:.0f}분)")
+        else:
+            reasons.append(f"오래된 신호 ({minutes_since_start:.0f}분) - 새 진입 근거로 약함")
+
+    for tf in ("15m", "1h", "4h"):
+        direction = (binance_indicators.get(tf) or {}).get("supertrend", {}).get("direction")
+        if direction is None:
+            continue
+        max_score += 1
+        if direction == good_direction:
+            score += 1
+            reasons.append(f"{tf} 추세 방향 일치")
+        else:
+            reasons.append(f"{tf} 추세 역행")
+
+    for tf in ("15m", "1h"):
+        adx_d = (binance_indicators.get(tf) or {}).get("adx14") or {}
+        plus_di, minus_di, adx_val = adx_d.get("plus_di"), adx_d.get("minus_di"), adx_d.get("adx")
+        if plus_di is None or minus_di is None or adx_val is None or adx_val < 20:
+            continue
+        max_score += 1
+        favorable = (plus_di > minus_di) if side == "long" else (minus_di > plus_di)
+        if favorable:
+            score += 1
+            reasons.append(f"{tf} 추세강도(ADX {adx_val:.0f}) 방향 일치")
+        else:
+            reasons.append(f"{tf} 추세강도(ADX {adx_val:.0f}) 역행")
+
+    if taker_ratio is not None:
+        max_score += 1
+        favorable = (taker_ratio >= 0.55) if side == "long" else (taker_ratio <= 0.45)
+        if favorable:
+            score += 1
+            reasons.append("체결강도 방향 일치")
+        else:
+            reasons.append("체결강도 역행")
+
+    structure = (binance_indicators.get("15m") or {}).get("market_structure", {}).get("structure")
+    good_structure = "uptrend" if side == "long" else "downtrend"
+    bad_structure = "downtrend" if side == "long" else "uptrend"
+    if structure in (good_structure, bad_structure):
+        max_score += 1
+        if structure == good_structure:
+            score += 1
+            reasons.append("15m 시장구조 일치")
+        else:
+            reasons.append("15m 시장구조 역행")
+
+    cloud_pos = (binance_indicators.get("1h") or {}).get("ichimoku", {}).get("price_vs_cloud")
+    good_cloud = "above" if side == "long" else "below"
+    bad_cloud = "below" if side == "long" else "above"
+    if cloud_pos in (good_cloud, bad_cloud):
+        max_score += 1
+        if cloud_pos == good_cloud:
+            score += 1
+            reasons.append("1h 일목구름 방향 일치")
+        else:
+            reasons.append("1h 일목구름 역행")
+
+    pct = (score / max_score * 100) if max_score else None
+    if pct is None:
+        grade = None
+    elif pct >= 75:
+        grade = "A"
+    elif pct >= 55:
+        grade = "B"
+    elif pct >= 35:
+        grade = "C"
+    else:
+        grade = "D"
+
+    return {
+        "side": side,
+        "minutes_since_start": minutes_since_start,
+        "stale": stale,
+        "higher_tf_conflict": higher_tf_conflict,
+        "order_flow_weak": order_flow_weak,
+        "flags": flags,
+        "risk_level": len(flags),  # 0 = clean, 1-3 = that many warning signs present (used by the auto-trade gate)
+        "grade": grade,            # A/B/C/D overall entry-quality grade (informational, not yet outcome-validated)
+        "score": score, "max_score": max_score, "score_pct": round(pct, 1) if pct is not None else None,
+        "reasons": reasons,
+    }
+
+
 def send_telegram_message(text: str, bot_token: str, chat_id: str, user_id: Optional[int] = None) -> None:
     if not bot_token or not chat_id:
         return
@@ -1603,6 +1758,8 @@ def _maybe_notify_telegram(
 def _maybe_notify_entry_proximity(
     user_id: int, bot_token: str, chat_id: str, dashboard_url: str,
     parsed: Dict[str, Any], current_price_raw: Optional[str],
+    binance_json: Optional[Dict[str, Any]] = None,
+    minutes_since_long: Optional[float] = None, minutes_since_short: Optional[float] = None,
 ) -> None:
     """Sends a '진입 임박' (entry imminent) alert when the current price gets
     within ENTRY_PROXIMITY_USD of the 1st-stage (25%) entry price for a side
@@ -1610,7 +1767,13 @@ def _maybe_notify_entry_proximity(
     proximity state resets so a later approach (once it turns ON) still
     fires fresh. Edge-triggered (state kept per-user) so it fires once when
     price first comes within range, not every 30s while it lingers there;
-    it re-arms once price moves back out of range."""
+    it re-arms once price moves back out of range.
+
+    Also attaches an entry-quality warning built from the same real
+    incident that motivated assess_entry_risk() - this is exactly the
+    moment a person is likely to act, so it's the most useful place to
+    surface "이 신호, 210분째인데 상위시간봉은 반대야" before they enter,
+    not just passively on the dashboard."""
     if not bot_token or not chat_id:
         return
     telegram_state = _get_telegram_state(user_id)
@@ -1620,6 +1783,8 @@ def _maybe_notify_entry_proximity(
     rows = _row_map_from_parsed(parsed)
     signals = parsed.get("signals") or {}
     now_kst = datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S")
+    minutes_since = {"long": minutes_since_long, "short": minutes_since_short}
+    indicators = (binance_json or {}).get("indicators") or {}
     for side, entries_key, state_key, label, emoji in (
         ("long", "long", "long_near_entry", "롱(LONG)", "🟦"),
         ("short", "short", "short_near_entry", "숏(SHORT)", "🟥"),
@@ -1643,8 +1808,14 @@ def _maybe_notify_entry_proximity(
                     f"{emoji} <b>E-RANG {label} 진입 임박</b>\n"
                     f"현재가: {_fmt_num(current_price_raw)}\n"
                     f"1차 진입가: {_fmt_num(entries[0])} (차이 {abs(current_price - entry1):.1f} 이내)\n"
-                    f"{now_kst} (KST)"
                 )
+                risk = assess_entry_risk(side, minutes_since[side], indicators)
+                if risk["flags"]:
+                    flag_labels = {"stale": "오래된 신호", "higher_tf_conflict": "상위시간봉 역행", "order_flow_weak": "체결강도 약함"}
+                    warn_text = " · ".join(flag_labels.get(f, f) for f in risk["flags"])
+                    grade_text = f" ({risk['grade']}등급)" if risk.get("grade") else ""
+                    msg += f"⚠️ <b>주의{grade_text}</b>: {warn_text}\n"
+                msg += f"{now_kst} (KST)"
                 if dashboard_url:
                     msg += f'\n<a href="{html.escape(dashboard_url, quote=True)}">대시보드 열기</a>'
                 send_telegram_message(msg, bot_token, chat_id, user_id)
@@ -1766,13 +1937,18 @@ def _has_open_position(symbol: str, side: str, api_key: str, api_secret: str) ->
     return False
 
 
-def _execute_auto_trade(user_id: int, side: str, rows: Dict[str, list], settings: Dict[str, str]) -> None:
+def _execute_auto_trade(
+    user_id: int, side: str, rows: Dict[str, list], settings: Dict[str, str],
+    binance_json: Optional[Dict[str, Any]] = None, minutes_since_start: Optional[float] = None,
+) -> None:
     symbol = settings["AUTO_TRADE_SYMBOL"]
     dry_run = str(settings["AUTO_TRADE_DRY_RUN"]).lower() not in {"0", "false", "no", "off", ""}
     leverage = int(float(settings["AUTO_TRADE_LEVERAGE"] or 5))
     margin_usdt = float(settings["AUTO_TRADE_MARGIN_USDT"] or 50)
     max_daily_trades = int(float(settings["AUTO_TRADE_MAX_DAILY_TRADES"] or 10))
     max_daily_loss_usdt = float(settings["AUTO_TRADE_MAX_DAILY_LOSS_USDT"] or 100)
+    risk_filter_enabled = str(settings.get("AUTO_TRADE_RISK_FILTER_ENABLED", "true")).lower() not in {"0", "false", "no", "off", ""}
+    stale_minutes = float(settings.get("AUTO_TRADE_STALE_MINUTES") or 45)
     api_key = settings["BINGX_API_KEY"]
     api_secret = settings["BINGX_API_SECRET"]
 
@@ -1788,6 +1964,21 @@ def _execute_auto_trade(user_id: int, side: str, rows: Dict[str, list], settings
     if entry_price is None or entry_price <= 0:
         _auto_trade_log(user_id, side, "skipped_bad_entry_price", symbol=symbol, dry_run=dry_run, detail=f"entry_price={entries[0]!r}")
         return
+
+    # 실제 사고 사례 기반 안전장치: 신호가 켜져 있어도 (1) 이미 오래 지속된
+    # 신호이거나 (2) 상위 시간봉(15m·1h)이 이미 반대 방향으로 확실히 꺾였거나
+    # (3) 체결강도가 반대 방향으로 약하면, 신규 진입을 건너뜁니다. E-RANG
+    # 신호 자체를 바꾸는 게 아니라 - 이 진입 실행 단계에서만 추가로 거르는
+    # 안전 계층입니다.
+    if risk_filter_enabled:
+        risk = assess_entry_risk(side, minutes_since_start, (binance_json or {}).get("indicators") or {}, stale_minutes=stale_minutes)
+        if risk["flags"]:
+            _auto_trade_log(
+                user_id, side, "skipped_risk_filter", symbol=symbol, entry_price=entry_price, dry_run=dry_run,
+                detail=f"위험 신호 감지: {', '.join(risk['flags'])} (경과 {minutes_since_start}분)" if minutes_since_start is not None
+                       else f"위험 신호 감지: {', '.join(risk['flags'])}",
+            )
+            return
 
     has_position = _has_open_position(symbol, side, api_key, api_secret)
     if has_position is None or has_position:
@@ -1874,6 +2065,8 @@ def _execute_auto_trade(user_id: int, side: str, rows: Dict[str, list], settings
 
 def _maybe_auto_trade_for_user(
     user_id: int, parsed: Dict[str, Any], long_active: bool, short_active: bool, current_price_raw: Optional[str],
+    binance_json: Optional[Dict[str, Any]] = None,
+    minutes_since_long: Optional[float] = None, minutes_since_short: Optional[float] = None,
 ) -> None:
     """Real entries happen when price actually approaches the 1st-stage
     (25%) E-RANG entry level, NOT the instant the signal turns ON - the
@@ -1894,6 +2087,7 @@ def _maybe_auto_trade_for_user(
         return
     rows = _row_map_from_parsed(parsed)
     state = _get_auto_trade_state(user_id)
+    minutes_since = {"long": minutes_since_long, "short": minutes_since_short}
     for side, active, state_key in (("long", long_active, "long_near_entry"), ("short", short_active, "short_near_entry")):
         if not active:
             with _state_lock:
@@ -1909,12 +2103,16 @@ def _maybe_auto_trade_for_user(
             state[state_key] = is_near
         if is_near and not was_near:
             try:
-                _execute_auto_trade(user_id, side, rows, settings)
+                _execute_auto_trade(user_id, side, rows, settings, binance_json or {}, minutes_since[side])
             except Exception as exc:
                 log("AUTO_TRADE_ERROR", f"unhandled error executing {side.upper()} auto-trade for user {user_id}: {type(exc).__name__}: {exc}")
 
 
-def _maybe_auto_trade_all_users(parsed: Dict[str, Any], long_active: bool, short_active: bool, current_price_raw: Optional[str]) -> None:
+def _maybe_auto_trade_all_users(
+    parsed: Dict[str, Any], long_active: bool, short_active: bool, current_price_raw: Optional[str],
+    binance_json: Optional[Dict[str, Any]] = None,
+    minutes_since_long: Optional[float] = None, minutes_since_short: Optional[float] = None,
+) -> None:
     """Runs the auto-trade check for every registered user - each trades (or
     doesn't) independently based on their own settings."""
     try:
@@ -1924,7 +2122,10 @@ def _maybe_auto_trade_all_users(parsed: Dict[str, Any], long_active: bool, short
         return
     for user_id in user_ids:
         try:
-            _maybe_auto_trade_for_user(user_id, parsed, long_active, short_active, current_price_raw)
+            _maybe_auto_trade_for_user(
+                user_id, parsed, long_active, short_active, current_price_raw,
+                binance_json, minutes_since_long, minutes_since_short,
+            )
         except Exception as exc:
             log("AUTO_TRADE_ERROR", f"unhandled error for user {user_id}: {type(exc).__name__}: {exc}")
 
@@ -2231,14 +2432,25 @@ def collect_once() -> Dict[str, Any]:
             except Exception as exc:
                 log("TELEGRAM_ERROR", f"notify failed for user {uid}: {type(exc).__name__}: {exc}")
             try:
+                observed_at_iso = observed_at.isoformat()
+                minutes_since_long = _minutes_since(streak["long_start"], observed_at_iso)
+                minutes_since_short = _minutes_since(streak["short_start"], observed_at_iso)
                 _maybe_notify_entry_proximity(
                     uid, usettings["TELEGRAM_BOT_TOKEN"], usettings["TELEGRAM_CHAT_ID"], usettings["DASHBOARD_URL"],
-                    parsed, current_price_raw,
+                    parsed, current_price_raw, binance_json,
+                    minutes_since_long if long_sig.get("active") else None,
+                    minutes_since_short if short_sig.get("active") else None,
                 )
             except Exception as exc:
                 log("TELEGRAM_ERROR", f"entry-proximity notify failed for user {uid}: {type(exc).__name__}: {exc}")
         try:
-            _maybe_auto_trade_all_users(parsed, bool(long_sig.get("active")), bool(short_sig.get("active")), current_price_raw)
+            observed_at_iso = observed_at.isoformat()
+            minutes_since_long = _minutes_since(streak["long_start"], observed_at_iso)
+            minutes_since_short = _minutes_since(streak["short_start"], observed_at_iso)
+            _maybe_auto_trade_all_users(
+                parsed, bool(long_sig.get("active")), bool(short_sig.get("active")), current_price_raw,
+                binance_json, minutes_since_long, minutes_since_short,
+            )
         except Exception as exc:
             log("AUTO_TRADE_ERROR", f"auto-trade check failed: {type(exc).__name__}: {exc}")
     except Exception as exc:
@@ -2429,6 +2641,8 @@ def row_to_dict(row: Any) -> Dict[str, Any]:
         "error": row[21],
         "parsed": json.loads(row[22]) if row[22] else {},
         "binance": json.loads(row[23]) if row[23] else {},
+        "long_start": row[24] if len(row) > 24 else None,
+        "short_start": row[25] if len(row) > 25 else None,
     }
 
 
@@ -2449,6 +2663,16 @@ def api_status() -> Response:
         live_binance = dict(live_binance_state)
         telegram = dict(_get_telegram_state(user_id))
     bitget = _public_bitget_state(get_bitget_state_for_user(user_id))
+    latest = summary.get("latest") or {}
+    entry_risk = {"long": None, "short": None}
+    if latest:
+        b = (live_binance.get("snapshot") or {}) if live_binance.get("snapshot") else latest.get("binance") or {}
+        indicators = b.get("indicators") or {}
+        observed_at_iso = latest.get("observed_at")
+        if latest.get("long_signal"):
+            entry_risk["long"] = assess_entry_risk("long", _minutes_since(latest.get("long_start"), observed_at_iso), indicators)
+        if latest.get("short_signal"):
+            entry_risk["short"] = assess_entry_risk("short", _minutes_since(latest.get("short_start"), observed_at_iso), indicators)
     return jsonify(
         {
             "service": "coin-monitor",
@@ -2461,6 +2685,7 @@ def api_status() -> Response:
             "telegram": telegram,
             "bitget": bitget,
             "db": summary,
+            "entry_risk": entry_risk,
         }
     )
 
@@ -3323,6 +3548,13 @@ input,select{font-family:'JetBrains Mono',monospace}
 #lwChartBox{border:1px solid var(--line);box-shadow:0 0 0 1px rgba(34,227,255,.06),0 0 30px rgba(34,227,255,.06) inset}
 .ovBtn.active{background:var(--blue);color:#031018;box-shadow:0 0 12px rgba(34,227,255,.4)}
 .ivBtn.active{background:var(--green);color:#031018;box-shadow:0 0 12px rgba(57,255,160,.4)}
+.gradeBadge{display:inline-flex;align-items:center;gap:5px;font-family:'Rajdhani',sans-serif;font-weight:800;font-size:13px;padding:3px 10px;border-radius:6px;margin-right:6px}
+.gradeBadge.gradeA{background:rgba(57,255,160,.15);color:var(--green);border:1px solid rgba(57,255,160,.4)}
+.gradeBadge.gradeB{background:rgba(34,227,255,.15);color:var(--blue);border:1px solid rgba(34,227,255,.4)}
+.gradeBadge.gradeC{background:rgba(255,225,77,.15);color:var(--yellow);border:1px solid rgba(255,225,77,.4)}
+.gradeBadge.gradeD{background:rgba(255,47,110,.15);color:var(--red);border:1px solid rgba(255,47,110,.4)}
+.riskChip{display:inline-flex;align-items:center;font-size:11px;padding:2px 8px;border-radius:5px;margin:2px 4px 2px 0;background:rgba(255,47,110,.12);color:#ffb3c4;border:1px solid rgba(255,47,110,.3)}
+.ageChip{display:inline-flex;font-size:11px;padding:2px 8px;border-radius:5px;margin:2px 4px 2px 0;background:rgba(94,132,163,.15);color:var(--muted)}
 #lwOscBox{border:1px solid var(--line);border-radius:8px}
 .newsTicker{position:relative}
 .newsTicker:hover .newsTrack{animation-play-state:paused}
@@ -3380,7 +3612,7 @@ input,select{font-family:'JetBrains Mono',monospace}
 <div id="lwClickInfo" class="hint" style="margin-top:8px">캔들을 클릭하면 그 시점 정보가 여기에 표시됩니다.</div>
 </div>
 <div class="card s6">
-<div class="hero" style="margin-bottom:20px"><div><div class="label">현재 판정</div><div id="heroSignal" class="heroSignal wait">WAIT</div></div><div><div id="signalBits" class="big" style="font-size:15px">LONG OFF / SHORT OFF</div><div class="muted">색상 신호를 기준으로 판정합니다.</div></div></div>
+<div class="hero" style="margin-bottom:20px"><div><div class="label">현재 판정</div><div id="heroSignal" class="heroSignal wait">WAIT</div></div><div><div id="signalBits" class="big" style="font-size:15px">LONG OFF / SHORT OFF</div><div class="muted">색상 신호를 기준으로 판정합니다.</div><div id="entryRisk" style="margin-top:6px"></div></div></div>
 <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;background:rgba(10,20,36,.7);border:1px solid var(--line);border-radius:12px;margin-bottom:20px"><span class="label">BTCUSDT 현재가</span><div style="text-align:right"><div id="price" class="big" style="margin-top:0">-</div><div id="priceDelta" class="muted" style="font-size:12px">Binance 실시간</div></div></div>
 <h2>진입가 <span class="muted">(현재 화면 기준)</span></h2><div class="tablewrap"><table><thead><tr><th>구분</th><th>진입 1<br>(25%)</th><th>진입 2<br>(40%)</th><th>진입 3<br>(60%)</th><th>진입 4<br>(100%)</th><th>진입 5<br>(예비)</th></tr></thead><tbody id="erangRows"></tbody></table></div>
 </div>
@@ -3503,6 +3735,22 @@ function renderIndicators(){
     let display=(val==null)?'-':(typeof val==='boolean')?(val?'예':'아니오'):(typeof val==='string')?val:n(val);
     return `<tr><td>${name}</td><td>${display}</td><td class="${clsStatus(stTxt)}">${stTxt}</td></tr>`;
   }).join('');
+}
+function renderEntryRisk(entryRisk, sig){
+  let box=$('entryRisk');
+  let risk=null;
+  if(sig==='LONG')risk=entryRisk?.long;
+  else if(sig==='SHORT')risk=entryRisk?.short;
+  else if(sig==='BOTH')risk=entryRisk?.long||entryRisk?.short; // rare/edge case, show whichever exists
+  if(!risk){box.innerHTML='';return}
+  let ageTxt=Number.isFinite(risk.minutes_since_start)?`${Math.round(risk.minutes_since_start)}분째 지속`:'';
+  let gradeTxt=risk.grade?`${risk.grade}등급 (${risk.score_pct}%)`:'';
+  let chips=(risk.flags||[]).map(f=>{
+    let label={stale:'⏱ 오래된 신호',higher_tf_conflict:'⚠ 상위시간봉 역행',order_flow_weak:'⚠ 체결강도 약함'}[f]||f;
+    return `<span class="riskChip">${esc(label)}</span>`;
+  }).join('');
+  box.innerHTML=(risk.grade?`<span class="gradeBadge grade${risk.grade}">${esc(gradeTxt)}</span>`:'')+
+    (ageTxt?`<span class="ageChip">${esc(ageTxt)}</span>`:'')+chips;
 }
 function renderEvidence(){
   let active=latest.short_signal?'SHORT':latest.long_signal?'LONG':'WAIT';
@@ -3673,7 +3921,7 @@ function narrativeFor(ind){
 }
 function renderEventDetail(r){if(!r)return;let sig=r.short_signal&&!r.long_signal?'SHORT':r.long_signal&&!r.short_signal?'LONG':r.short_signal&&r.long_signal?'BOTH':'WAIT';let cards=['1m','5m','15m','1h'].map(tf=>{let i=eventTF(r,tf),m=i.macd||{},b=i.bollinger20||{},reasons=narrativeFor(i);return `<div class="analysisBox"><h3>${tf} <span class="${sig==='SHORT'?'short':sig==='LONG'?'long':'wait'}">${sig}</span></h3><div class="chips"><span class="chip">RSI ${n(i.rsi14)}</span><span class="chip">EMA20 ${n(i.ema20)}</span><span class="chip">EMA50 ${n(i.ema50)}</span><span class="chip">EMA200 ${n(i.ema200)}</span><span class="chip">MACD Hist ${n(m.histogram)}</span><span class="chip">ATR ${n(i.atr14)}</span><span class="chip">BB 상 ${n(b.upper)}</span><span class="chip">BB 중 ${n(b.middle)}</span><span class="chip">BB 하 ${n(b.lower)}</span></div>${reasons.length?`<ul class="reasonList">${reasons.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:''}</div>`}).join('');let erangReasons=[r.long_signal?sigReason(r,'long'):'',r.short_signal?sigReason(r,'short'):''].filter(Boolean);let erangBlock=(r.long_signal||r.short_signal)?`<div class="reasonSummary"><b>실제 판정 근거 (원본 신호)</b>${r.long_signal?`<div class="reasonMini long"><b>LONG</b> ${esc(sigReason(r,'long'))}</div>`:''}${r.short_signal?`<div class="reasonMini short"><b>SHORT</b> ${esc(sigReason(r,'short'))}</div>`:''}</div>`:'';$('eventDetail').innerHTML=`<div style="margin-bottom:12px"><strong>ID ${r.id} · ${kst(r.observed_at)} · BTC ${n(r.current_price||r.current_price_raw)}</strong> · Funding ${r.binance?.premium_index?.lastFundingRate??'-'} · OI ${n(r.binance?.open_interest?.openInterest)}</div>${erangBlock}<div class="hint" style="margin:10px 0">※ 아래는 이 시점의 Binance 보조지표 상태를 정리한 참고용 관측입니다. 실제 ON 판정은 위 원본 신호 기준이며, 아래 지표 조합이 ON의 확정 원인이라는 뜻은 아닙니다.</div><div class="analysisGrid">${cards}</div>`}
 function renderAnalysis(a){let sm=a?.summary||{};$('analysisSummary').innerHTML=['LONG','SHORT'].map(side=>{let g=sm[side]||{},t=g.timeframes?.['15m']||{};return `<div class="analysisBox"><h3 class="${side==='LONG'?'long':'short'}">${side} ON · ${g.count||0}건</h3><div class="chips"><span class="chip">15m 평균 RSI ${n(t.avg_rsi14)}</span><span class="chip">15m 평균 MACD Hist ${n(t.avg_macd_histogram)}</span><span class="chip">MACD Hist 양수 ${t.macd_hist_positive_pct??'-'}%</span><span class="chip">현재가 &gt; EMA20 ${t.price_above_ema20_pct??'-'}%</span><span class="chip">평균 ATR ${n(t.avg_atr14)}</span><span class="chip">평균 Funding ${n(g.avg_funding_rate)}</span></div><div class="hint" style="margin-top:10px">1m/5m/15m/1h 상세는 ON 발생 행을 클릭해서 확인</div></div>`}).join('')}
-async function refresh(){try{let [sr,hr,ar]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/history?limit=80',{cache:'no-store'}),fetch('/api/signal-analysis?limit=200',{cache:'no-store'})]),s=await sr.json(),h=await hr.json(),a=await ar.json(),db=s.db||{};renderAnalysis(a);latest=db.latest||{};let sig=latest.short_signal&&!latest.long_signal?'SHORT':latest.long_signal&&!latest.short_signal?'LONG':latest.short_signal&&latest.long_signal?'BOTH':'WAIT';$('heroSignal').textContent=sig;$('heroSignal').className='heroSignal '+(sig==='SHORT'?'short':sig==='LONG'?'long':'wait');$('signalBits').textContent=`LONG ${latest.long_signal?'ON':'OFF'} / SHORT ${latest.short_signal?'ON':'OFF'}`;let lp=s.live_price||{},livePriceNum=Number(lp.price);tickLwChart(livePriceNum);$('price').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?n(livePriceNum):n(latest.current_price||latest.current_price_raw);$('priceDelta').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?('Binance 실시간 · '+kst(lp.updated_at)):'실시간가 대기중';$('lastTop').textContent='마지막 수집: '+kst(latest.observed_at);renderErang(latest.parsed||{},livePriceNum);let lb=s.live_binance?.snapshot||{};liveBinance=Object.keys(lb).length?lb:(latest.binance||{});let b=liveBinance;$('bLast').textContent=n(b.ticker_24h?.lastPrice);$('funding').textContent=b.premium_index?.lastFundingRate??'-';$('oi').textContent=n(b.open_interest?.openInterest);$('vol24').textContent=n(b.ticker_24h?.volume);$('bUpdate').textContent='업데이트: '+kst(s.live_binance?.updated_at||latest.observed_at);renderIndicators();renderEvidence();renderBitget(s.bitget);$('history').innerHTML=(h.items||[]).map((r,idx)=>{let i=eventTF(r,'15m'),mh=i.macd?.histogram,rel=Number(i.close)>Number(i.ema20)?'상회':Number(i.close)<Number(i.ema20)?'하회':'-';return `<tr class="clickrow" data-idx="${idx}"><td>${r.id}</td><td>${kst(r.observed_at)}</td><td>${n(r.current_price||r.current_price_raw)}</td><td class="${r.long_signal?'long':''}">${r.long_signal?'ON':'OFF'}</td><td class="${r.short_signal?'short':''}">${r.short_signal?'ON':'OFF'}</td><td class="profitCell">${expectedProfitCell(r)}</td><td class="reasonCell">${historyReasonCell(r)}</td><td>${n(i.rsi14)}</td><td class="${Number(mh)>=0?'statusUp':'statusDown'}">${n(mh)}</td><td>${rel}</td><td>${r.http_status||'-'}</td></tr>`}).join('');document.querySelectorAll('.clickrow').forEach(tr=>tr.onclick=()=>renderEventDetail((h.items||[])[Number(tr.dataset.idx)]));let firstOn=(h.items||[]).find(r=>r.long_signal||r.short_signal);if(firstOn)renderEventDetail(firstOn);$('live').textContent='● 실시간 동기화 중';$('live').className='live';lastSyncAt=Date.now();$('lastSync').textContent='방금 갱신'}catch(e){$('live').textContent='● UI 오류 (재시도 중)';$('live').className='short'}}
+async function refresh(){try{let [sr,hr,ar]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/history?limit=80',{cache:'no-store'}),fetch('/api/signal-analysis?limit=200',{cache:'no-store'})]),s=await sr.json(),h=await hr.json(),a=await ar.json(),db=s.db||{};renderAnalysis(a);latest=db.latest||{};let sig=latest.short_signal&&!latest.long_signal?'SHORT':latest.long_signal&&!latest.short_signal?'LONG':latest.short_signal&&latest.long_signal?'BOTH':'WAIT';$('heroSignal').textContent=sig;$('heroSignal').className='heroSignal '+(sig==='SHORT'?'short':sig==='LONG'?'long':'wait');$('signalBits').textContent=`LONG ${latest.long_signal?'ON':'OFF'} / SHORT ${latest.short_signal?'ON':'OFF'}`;renderEntryRisk(s.entry_risk,sig);let lp=s.live_price||{},livePriceNum=Number(lp.price);tickLwChart(livePriceNum);$('price').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?n(livePriceNum):n(latest.current_price||latest.current_price_raw);$('priceDelta').textContent=Number.isFinite(livePriceNum)&&livePriceNum>0?('Binance 실시간 · '+kst(lp.updated_at)):'실시간가 대기중';$('lastTop').textContent='마지막 수집: '+kst(latest.observed_at);renderErang(latest.parsed||{},livePriceNum);let lb=s.live_binance?.snapshot||{};liveBinance=Object.keys(lb).length?lb:(latest.binance||{});let b=liveBinance;$('bLast').textContent=n(b.ticker_24h?.lastPrice);$('funding').textContent=b.premium_index?.lastFundingRate??'-';$('oi').textContent=n(b.open_interest?.openInterest);$('vol24').textContent=n(b.ticker_24h?.volume);$('bUpdate').textContent='업데이트: '+kst(s.live_binance?.updated_at||latest.observed_at);renderIndicators();renderEvidence();renderBitget(s.bitget);$('history').innerHTML=(h.items||[]).map((r,idx)=>{let i=eventTF(r,'15m'),mh=i.macd?.histogram,rel=Number(i.close)>Number(i.ema20)?'상회':Number(i.close)<Number(i.ema20)?'하회':'-';return `<tr class="clickrow" data-idx="${idx}"><td>${r.id}</td><td>${kst(r.observed_at)}</td><td>${n(r.current_price||r.current_price_raw)}</td><td class="${r.long_signal?'long':''}">${r.long_signal?'ON':'OFF'}</td><td class="${r.short_signal?'short':''}">${r.short_signal?'ON':'OFF'}</td><td class="profitCell">${expectedProfitCell(r)}</td><td class="reasonCell">${historyReasonCell(r)}</td><td>${n(i.rsi14)}</td><td class="${Number(mh)>=0?'statusUp':'statusDown'}">${n(mh)}</td><td>${rel}</td><td>${r.http_status||'-'}</td></tr>`}).join('');document.querySelectorAll('.clickrow').forEach(tr=>tr.onclick=()=>renderEventDetail((h.items||[])[Number(tr.dataset.idx)]));let firstOn=(h.items||[]).find(r=>r.long_signal||r.short_signal);if(firstOn)renderEventDetail(firstOn);$('live').textContent='● 실시간 동기화 중';$('live').className='live';lastSyncAt=Date.now();$('lastSync').textContent='방금 갱신'}catch(e){$('live').textContent='● UI 오류 (재시도 중)';$('live').className='short'}}
 document.querySelectorAll('.tab').forEach(x=>x.onclick=()=>{document.querySelectorAll('.tab').forEach(y=>y.classList.remove('active'));x.classList.add('active');activeTF=x.dataset.tf;renderIndicators()});$('collect').onclick=async()=>{await fetch('/api/collect-now',{method:'POST',cache:'no-store'});refresh()};
 $('telegramTest').onclick=async()=>{let b=$('telegramTest'),orig=b.textContent;b.disabled=true;b.textContent='발송 중...';try{let r=await fetch('/api/telegram-test',{method:'POST',cache:'no-store'});let j=await r.json();alert(j.ok?('✅ 텔레그램 발송 완료'+(j.previewed_side?` (미리보기: ${j.previewed_side.toUpperCase()})`:' (신호 없음, 안내 메시지)')):('❌ 발송 실패: '+(j.error||'알 수 없는 오류')))}catch(e){alert('❌ 요청 실패: '+e)}finally{b.disabled=false;b.textContent=orig}};
 let historyOpen=false;

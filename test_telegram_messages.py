@@ -113,5 +113,56 @@ class EntryProximityAlertTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
 
 
+class EntryProximityRiskWarningTests(unittest.TestCase):
+    """The '진입 임박' alert is exactly the moment a person is likely to
+    act, so it's where the risk-grade warning (from the real incident)
+    gets attached."""
+    TEST_USER_ID = 999003
+
+    def setUp(self):
+        self.orig_send = main.send_telegram_message
+        self.sent = []
+        main.send_telegram_message = lambda msg, bot_token, chat_id, user_id=None: self.sent.append(msg)
+        main.telegram_states.pop(self.TEST_USER_ID, None)
+
+    def tearDown(self):
+        main.send_telegram_message = self.orig_send
+        main.telegram_states.pop(self.TEST_USER_ID, None)
+
+    def test_risky_context_adds_warning_to_message(self):
+        binance_json = {"indicators": {
+            "15m": {"supertrend": {"direction": "down"}, "taker_flow": {"taker_buy_ratio": 0.30}},
+            "1h": {"supertrend": {"direction": "down"}},
+        }}
+        main._maybe_notify_entry_proximity(
+            self.TEST_USER_ID, "fake-token", "fake-chat", "", _sample_parsed(), "100050",
+            binance_json=binance_json, minutes_since_long=210.83,
+        )
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("주의", self.sent[0])
+        self.assertIn("오래된 신호", self.sent[0])
+        self.assertIn("상위시간봉 역행", self.sent[0])
+        self.assertIn("체결강도 약함", self.sent[0])
+
+    def test_clean_context_has_no_warning_in_message(self):
+        binance_json = {"indicators": {
+            "15m": {"supertrend": {"direction": "up"}, "taker_flow": {"taker_buy_ratio": 0.65}},
+            "1h": {"supertrend": {"direction": "up"}},
+        }}
+        main._maybe_notify_entry_proximity(
+            self.TEST_USER_ID, "fake-token", "fake-chat", "", _sample_parsed(), "100050",
+            binance_json=binance_json, minutes_since_long=5.0,
+        )
+        self.assertEqual(len(self.sent), 1)
+        self.assertNotIn("주의", self.sent[0])
+
+    def test_no_binance_context_sends_plain_message_without_error(self):
+        main._maybe_notify_entry_proximity(
+            self.TEST_USER_ID, "fake-token", "fake-chat", "", _sample_parsed(), "100050",
+        )
+        self.assertEqual(len(self.sent), 1)
+        self.assertNotIn("주의", self.sent[0])
+
+
 if __name__ == "__main__":
     unittest.main()
