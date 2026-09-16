@@ -1,0 +1,80 @@
+name: Daily CSV Data Export
+
+# 매일 자동으로 "새로 쌓인 데이터만" Railway 서버에서 받아와서
+# data/coin_observations.csv 에 이어붙이고 커밋합니다.
+#
+# 준비물 (저장소 Settings → Secrets and variables → Actions → New repository secret):
+#   COIN_MONITOR_URL   예: https://coin-monitor-production.up.railway.app
+#   EXPORT_API_TOKEN   앱의 /settings 페이지 "자동 데이터 백업" 섹션에서 복사한 토큰
+#
+# 실제 로그인 비밀번호는 절대 여기 안 들어갑니다 - 이 용도로만 쓰는 별도
+# 읽기전용 토큰입니다.
+
+on:
+  schedule:
+    - cron: "0 15 * * *"  # 매일 UTC 15:00 = KST 00:00 (자정)
+  workflow_dispatch: {}     # 필요하면 Actions 탭에서 수동 실행도 가능
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read last exported id
+        id: last_id
+        run: |
+          mkdir -p data
+          if [ -f data/last_id.txt ]; then
+            echo "id=$(cat data/last_id.txt)" >> "$GITHUB_OUTPUT"
+          else
+            echo "id=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch new rows only (since last exported id)
+        env:
+          COIN_MONITOR_URL: ${{ secrets.COIN_MONITOR_URL }}
+          EXPORT_API_TOKEN: ${{ secrets.EXPORT_API_TOKEN }}
+          SINCE_ID: ${{ steps.last_id.outputs.id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COIN_MONITOR_URL}" ] || [ -z "${EXPORT_API_TOKEN}" ]; then
+            echo "COIN_MONITOR_URL / EXPORT_API_TOKEN secret이 설정 안 되어 있습니다. 저장소 Settings에서 등록해주세요."
+            exit 1
+          fi
+          curl -sf "${COIN_MONITOR_URL}/export.csv?token=${EXPORT_API_TOKEN}&since_id=${SINCE_ID}" -o /tmp/new_data.csv
+          echo "다운로드된 줄 수: $(wc -l < /tmp/new_data.csv)"
+
+      - name: Append to the running combined CSV
+        run: |
+          set -euo pipefail
+          if [ ! -s data/coin_observations.csv ]; then
+            cp /tmp/new_data.csv data/coin_observations.csv
+          else
+            # 새로 받은 파일의 헤더(1번째 줄)는 건너뛰고 데이터 행만 이어붙임
+            tail -n +2 /tmp/new_data.csv >> data/coin_observations.csv
+          fi
+
+      - name: Update last exported id
+        run: |
+          set -euo pipefail
+          NEW_MAX_ID=$(tail -n +2 data/coin_observations.csv | tail -1 | cut -d',' -f1)
+          if [ -n "${NEW_MAX_ID}" ]; then
+            echo "${NEW_MAX_ID}" > data/last_id.txt
+          fi
+
+      - name: Commit and push if anything changed
+        run: |
+          set -euo pipefail
+          git config user.name "coin-monitor-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/coin_observations.csv data/last_id.txt
+          if git diff --staged --quiet; then
+            echo "새 데이터 없음 - 커밋 스킵"
+          else
+            git commit -m "chore: daily data export $(date -u +%Y-%m-%d)"
+            git push
+          fi
