@@ -211,5 +211,68 @@ class DetectTodayRiskTests(unittest.TestCase):
         self.assertEqual(risks, [])
 
 
+class TranslateToKoreanTests(unittest.TestCase):
+    def setUp(self):
+        news_feed._translation_cache.clear()
+
+    def test_already_korean_text_is_not_translated(self):
+        with patch("news_feed.requests.get") as mock_get:
+            result = news_feed.translate_to_korean("비트코인 급등, 7만달러 돌파")
+        mock_get.assert_not_called()
+        self.assertEqual(result, "비트코인 급등, 7만달러 돌파")
+
+    def test_english_text_gets_translated(self):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [[["비트코인이 급등했다", "Bitcoin surged", None, None, 1]]]
+        mock_resp.raise_for_status = MagicMock()
+        with patch("news_feed.requests.get", return_value=mock_resp) as mock_get:
+            result = news_feed.translate_to_korean("Bitcoin surged")
+        mock_get.assert_called_once()
+        self.assertEqual(result, "비트코인이 급등했다")
+
+    def test_translation_is_cached(self):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [[["번역됨", "text", None, None, 1]]]
+        mock_resp.raise_for_status = MagicMock()
+        with patch("news_feed.requests.get", return_value=mock_resp) as mock_get:
+            news_feed.translate_to_korean("Some headline")
+            news_feed.translate_to_korean("Some headline")
+        mock_get.assert_called_once()  # 두 번째 호출은 캐시에서 바로 반환
+
+    def test_translation_failure_falls_back_to_original(self):
+        with patch("news_feed.requests.get", side_effect=ConnectionError("blocked")):
+            result = news_feed.translate_to_korean("Senate rejects CLARITY Act")
+        self.assertEqual(result, "Senate rejects CLARITY Act")
+
+    def test_empty_text_returns_as_is(self):
+        self.assertEqual(news_feed.translate_to_korean(""), "")
+
+
+class DetectTodayRiskTranslationTests(unittest.TestCase):
+    """detect_today_risk()가 실제로 번역을 거쳐서 결과를 내놓는지 (기존
+    DetectTodayRiskTests는 한글 제목만 썼어서 번역 경로를 안 지나갔음)."""
+
+    def test_english_news_title_is_translated_in_output(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        news_items = [{"title": "Senate rejects CLARITY Act in surprise vote", "published_at": now.isoformat(), "source": "CoinDesk"}]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [[["상원, 깜짝 표결로 클래리티법 부결", "x", None, None, 1]]]
+        mock_resp.raise_for_status = MagicMock()
+        with patch("news_feed.requests.get", return_value=mock_resp):
+            risks = news_feed.detect_today_risk(news_items, [])
+        self.assertEqual(len(risks), 1)
+        self.assertEqual(risks[0]["title"], "상원, 깜짝 표결로 클래리티법 부결")
+
+    def test_korean_news_title_is_left_untouched(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        news_items = [{"title": "美 상원, 클래리티법 부결...비트코인 하락", "published_at": now.isoformat(), "source": "TokenPost"}]
+        with patch("news_feed.requests.get") as mock_get:
+            risks = news_feed.detect_today_risk(news_items, [])
+        mock_get.assert_not_called()
+        self.assertEqual(risks[0]["title"], "美 상원, 클래리티법 부결...비트코인 하락")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -157,6 +157,45 @@ LEGISLATION_KEYWORDS = [
 ]
 
 
+_translation_cache: Dict[str, str] = {}
+TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
+_HANGUL_RE = None  # set below, avoids importing re at module top just for this
+
+
+def _looks_korean_already(text: str) -> bool:
+    import re
+    global _HANGUL_RE
+    if _HANGUL_RE is None:
+        _HANGUL_RE = re.compile(r"[\uac00-\ud7a3]")
+    hangul_count = len(_HANGUL_RE.findall(text))
+    return hangul_count >= max(3, len(text) // 6)  # 짧은 영단어 하나 섞인 한글기사는 오탐 안 하게 여유를 둠
+
+
+def translate_to_korean(text: str) -> str:
+    """제목이 이미 한글(TokenPost 등 국내 매체)이면 그대로 두고, 영어(CoinDesk/
+    CoinTelegraph 등)면 번역합니다. API 키가 필요 없는 구글 번역 비공식
+    엔드포인트를 씁니다 - 실패해도(네트워크 문제 등) 원문을 그대로 반환해서
+    "오늘은 위험한 날" 배너 자체가 깨지지 않게 합니다. 같은 제목을 반복해서
+    다시 번역하지 않도록 캐싱합니다."""
+    if not text or _looks_korean_already(text):
+        return text
+    if text in _translation_cache:
+        return _translation_cache[text]
+    try:
+        resp = requests.get(TRANSLATE_URL, params={
+            "client": "gtx", "sl": "auto", "tl": "ko", "dt": "t", "q": text,
+        }, timeout=6)
+        resp.raise_for_status()
+        data = resp.json()
+        translated = "".join(seg[0] for seg in data[0] if seg and seg[0])
+        if translated:
+            _translation_cache[text] = translated
+            return translated
+    except Exception:
+        pass
+    return text  # 번역 실패 시 원문 그대로 (배너가 비거나 에러 나는 것보다 나음)
+
+
 def detect_today_risk(news_items: List[Dict[str, Any]], calendar_items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """오늘(KST 기준) 발생하는 위험 요소 목록을 반환합니다. 각 항목은
     {"type": "calendar"|"news", "title": ..., "detail": ...} 형태."""
@@ -170,7 +209,7 @@ def detect_today_risk(news_items: List[Dict[str, Any]], calendar_items: List[Dic
             continue
         if ev_dt.astimezone(KST).date() == today_kst:
             time_str = ev_dt.astimezone(KST).strftime("%H:%M")
-            risks.append({"type": "calendar", "title": ev.get("title", ""), "detail": f"{time_str} KST"})
+            risks.append({"type": "calendar", "title": translate_to_korean(ev.get("title", "")), "detail": f"{time_str} KST"})
 
     for item in news_items or []:
         title = item.get("title") or ""
@@ -184,6 +223,6 @@ def detect_today_risk(news_items: List[Dict[str, Any]], calendar_items: List[Dic
         if pub_dt.astimezone(KST).date() != today_kst:
             continue
         if any(kw in title.lower() for kw in LEGISLATION_KEYWORDS):
-            risks.append({"type": "news", "title": title, "detail": item.get("source", "")})
+            risks.append({"type": "news", "title": translate_to_korean(title), "detail": item.get("source", "")})
 
     return risks

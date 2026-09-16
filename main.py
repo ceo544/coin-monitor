@@ -3718,23 +3718,25 @@ input,select{font-family:'JetBrains Mono',monospace}
 .newsTicker:hover .newsTrack{animation-play-state:paused}
 @keyframes ticker-scroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
 .newsTicker{-webkit-mask-image:linear-gradient(to right,transparent,#000 48px,#000 calc(100% - 48px),transparent);mask-image:linear-gradient(to right,transparent,#000 48px,#000 calc(100% - 48px),transparent)}
-.newsItem{display:inline-flex;align-items:center;gap:10px;padding:0 34px;color:var(--text);text-decoration:none;font-size:13.5px;border-right:1px solid var(--line)}
+.newsListBox{max-height:104px;overflow-y:auto;display:flex;flex-direction:column;gap:2px}
+.newsRow{display:flex;align-items:center;gap:10px;padding:6px 4px;color:var(--text);text-decoration:none;font-size:13px;border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.newsRow:last-child{border-bottom:none}
+.newsRow:hover{color:var(--blue);background:rgba(34,227,255,.05)}
+.newsRow.calItem{background:rgba(255,225,77,.06)}
 .coinItem{display:inline-flex;align-items:center;gap:10px;padding:0 34px;text-decoration:none;font-size:14px;border-right:1px solid var(--line);font-family:'JetBrains Mono',monospace}
 .coinItem b{font-family:'Rajdhani',sans-serif;color:var(--text);font-weight:700;font-size:15px;min-width:38px;display:inline-block}
 .coinItem .chgPct{font-weight:700;padding:1px 7px;border-radius:5px;font-size:12.5px}
 .coinItem .chgPct.statusUp{background:rgba(57,255,160,.12)}
 .coinItem .chgPct.statusDown{background:rgba(255,47,110,.12)}
-.newsItem:hover{color:var(--blue)}
-.newsSrc{font-family:'Rajdhani',sans-serif;font-weight:700;font-size:10.5px;letter-spacing:.4px;color:var(--blue);background:rgba(34,227,255,.1);border:1px solid rgba(34,227,255,.3);border-radius:4px;padding:1px 6px}
-.newsItem.calItem{background:rgba(255,225,77,.06)}
-.newsItem.calItem .newsSrc{color:var(--yellow);background:rgba(255,225,77,.12);border-color:rgba(255,225,77,.4)}
+.newsSrc{font-family:'Rajdhani',sans-serif;font-weight:700;font-size:10.5px;letter-spacing:.4px;color:var(--blue);background:rgba(34,227,255,.1);border:1px solid rgba(34,227,255,.3);border-radius:4px;padding:1px 6px;flex-shrink:0}
+.newsRow.calItem .newsSrc{color:var(--yellow);background:rgba(255,225,77,.12);border-color:rgba(255,225,77,.4)}
 ::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}::-webkit-scrollbar-thumb:hover{background:var(--blue)}
 </style>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head><body><div class="wrap">
 <div class="top"><div class="topTitle"><h1>🪙 뿌꾸의 코인세상</h1></div><div class="actions"><a class="btn" href="/export.csv">CSV 다운로드</a><button id="collect" class="btn">강제 수집</button><button id="telegramTest" class="btn">텔레그램 현재상태 발송</button><a class="btn" href="/settings">설정</a><a class="btn" href="/logout">로그아웃</a><span id="live" class="live">● 정상 수집 중</span><span id="lastSync" class="muted"></span><span id="lastTop" class="muted"></span></div></div>
-<div class="card s12 newsTicker" id="newsTickerCard" style="padding:10px 0;overflow:hidden;display:none;margin-bottom:14px">
-  <div class="newsTrack" id="newsTrack" style="display:inline-flex;white-space:nowrap;animation:ticker-scroll linear infinite"></div>
+<div class="card s12" id="newsTickerCard" style="padding:10px 14px;display:none;margin-bottom:14px">
+  <div id="newsTrack" class="newsListBox"></div>
 </div>
 <div class="card s12 newsTicker" id="coinTickerCard" style="padding:10px 0;overflow:hidden;display:none;margin-bottom:16px">
   <div class="newsTrack" id="coinTrack" style="display:inline-flex;white-space:nowrap;animation:ticker-scroll linear infinite"></div>
@@ -3750,11 +3752,11 @@ input,select{font-family:'JetBrains Mono',monospace}
   <button type="button" class="btn ivBtn" data-iv="4h" style="padding:5px 10px;font-size:11px">4시간</button>
 </div>
 <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-  <button type="button" class="btn ovBtn" data-ov="ema" style="padding:5px 10px;font-size:11px">EMA</button>
-  <button type="button" class="btn ovBtn" data-ov="bb" style="padding:5px 10px;font-size:11px">볼린저밴드</button>
-  <button type="button" class="btn ovBtn" data-ov="vwap" style="padding:5px 10px;font-size:11px">VWAP</button>
-  <button type="button" class="btn ovBtn" data-ov="ichimoku" style="padding:5px 10px;font-size:11px">일목구름</button>
-  <button type="button" class="btn ovBtn" data-ov="supertrend" style="padding:5px 10px;font-size:11px">Supertrend</button>
+  <button type="button" class="btn ovBtn active" data-ov="ema" style="padding:5px 10px;font-size:11px">EMA</button>
+  <button type="button" class="btn ovBtn active" data-ov="bb" style="padding:5px 10px;font-size:11px">볼린저밴드</button>
+  <button type="button" class="btn ovBtn active" data-ov="vwap" style="padding:5px 10px;font-size:11px">VWAP</button>
+  <button type="button" class="btn ovBtn active" data-ov="ichimoku" style="padding:5px 10px;font-size:11px">일목구름</button>
+  <button type="button" class="btn ovBtn active" data-ov="supertrend" style="padding:5px 10px;font-size:11px">Supertrend</button>
   <span style="width:1px;background:var(--line);margin:2px 4px"></span>
   <select id="oscPick" class="btn" style="padding:5px 10px;font-size:11px;cursor:pointer">
     <option value="">보조지표 없음</option>
@@ -4145,13 +4147,30 @@ async function refreshLwChart(){
     redrawActiveOverlays();
     if(lwOscKind)drawOscillator(lwOscKind,klines);
   }
-  let markerObjs=markers.map(m=>({
-    time:Math.floor(new Date(m.time).getTime()/1000)+9*3600,
+  // 짧은 시간 안에 같은 방향(LONG/LONG/LONG처럼) 신호가 몇 번이고 다시
+  // 켜졌다 꺼졌다 하면 화살표가 겹쳐서 라벨이 다 겹쳐 보이는 문제가 있어서,
+  // 같은 방향으로 가까운 시간(현재 봉 간격의 3배 이내)에 몰린 마커는
+  // 하나로 묶어서 "LONG x3"처럼 개수만 표시합니다.
+  let groupWindow=(LW_INTERVAL_SECONDS[lwChartInterval]||900)*3;
+  let raw=markers.map(m=>({time:Math.floor(new Date(m.time).getTime()/1000)+9*3600,side:m.side}))
+    .sort((a,b)=>a.time-b.time);
+  let grouped=[];
+  for(let m of raw){
+    let last=grouped[grouped.length-1];
+    if(last&&last.side===m.side&&(m.time-last.time)<=groupWindow){
+      last.time=m.time;  // 그룹의 대표 시각을 가장 최근 것으로 갱신
+      last.count++;
+    } else {
+      grouped.push({time:m.time,side:m.side,count:1});
+    }
+  }
+  let markerObjs=grouped.map(m=>({
+    time:m.time,
     position:m.side==='long'?'belowBar':'aboveBar',
     color:m.side==='long'?'#39ffa0':'#ff2f6e',
     shape:m.side==='long'?'arrowUp':'arrowDown',
-    text:m.side==='long'?'LONG':'SHORT',
-  })).sort((a,b)=>a.time-b.time);
+    text:(m.side==='long'?'LONG':'SHORT')+(m.count>1?` x${m.count}`:''),
+  }));
   lwCandleSeries.setMarkers(markerObjs);
 }
 function tickLwChart(livePrice){
@@ -4317,7 +4336,7 @@ function calcSupertrend(klines,period,mult){
   return trend;
 }
 // --- Overlay (drawn on main price chart, same scale) management ---
-let lwOverlaySeries={}, lwActiveOverlays=new Set(), lwKlinesCache=[];
+let lwOverlaySeries={}, lwActiveOverlays=new Set(['ema','bb','vwap','ichimoku','supertrend']), lwKlinesCache=[];
 function seriesOf(name){let s=lwOverlaySeries[name];return s?(Array.isArray(s)?s:[s]):[];}
 function clearOverlay(name){seriesOf(name).forEach(s=>{try{lwChart.removeSeries(s)}catch(e){}});delete lwOverlaySeries[name];}
 function toPoints(klines,arr){return klines.map((c,i)=>arr[i]!=null?{time:c.time,value:arr[i]}:null).filter(Boolean);}
@@ -4476,16 +4495,14 @@ async function refreshNews(){
     let card=$('newsTickerCard'),track=$('newsTrack');
     if(!items.length){card.style.display='none';return}
     card.style.display='block';
-    // Duplicated once so the marquee loop is seamless (scrolls exactly
-    // -50% of the doubled track, landing back on an identical frame).
-    let html=items.map(it=>{
+    // 세로 스크롤 목록 - 한 번에 3줄 정도만 보이고, 마우스 휠/터치로 위아래
+    // 스크롤해서 나머지를 볼 수 있음 (예전의 가로 흐르는 슬라이드 방식 대신).
+    track.innerHTML=items.map(it=>{
       if(it.is_calendar){
-        return `<span class="newsItem calItem"><span class="newsSrc">📅 일정</span>${calendarEventLabel(it)}</span>`;
+        return `<div class="newsRow calItem"><span class="newsSrc">📅 일정</span><span>${calendarEventLabel(it)}</span></div>`;
       }
-      return `<a class="newsItem" href="${esc(it.link)}" target="_blank" rel="noopener"><span class="newsSrc">${esc(it.source)}</span>${esc(it.title)}</a>`;
+      return `<a class="newsRow" href="${esc(it.link)}" target="_blank" rel="noopener"><span class="newsSrc">${esc(it.source)}</span><span>${esc(it.title)}</span></a>`;
     }).join('');
-    track.innerHTML=html+html;
-    setTickerSpeed(track,45);
   }catch(e){/* ticker is non-critical; fail silently */}
 }
 async function refreshCoinTicker(){
