@@ -43,6 +43,51 @@ class SimplifiedSignalMessageTests(unittest.TestCase):
         self.assertIn("신호해제", msg)
         self.assertNotIn("진입가", msg)
 
+    def test_clean_signal_without_risk_context_has_no_grade_block(self):
+        # No binance_snapshot/minutes_since_start given at all - should not
+        # crash and should not add an empty/misleading risk block.
+        msg = main._build_signal_message("long", True, _sample_parsed(), "100200", "#44C27B", {})
+        self.assertNotIn("진입 품질", msg)
+
+
+class SignalMessageRiskWarningTests(unittest.TestCase):
+    """The exact real-world scenario the risk grade was built from: a
+    person should see 'D등급 · 456분째 지속 · ⏱ 오래된 신호 · ⚠ 상위시간봉
+    역행 · ⚠ 체결강도 약함' directly in the signal-ON alert, matching what
+    the dashboard shows."""
+
+    def _risky_snapshot(self):
+        return {"indicators": {
+            "15m": {"supertrend": {"direction": "down"}, "taker_flow": {"taker_buy_ratio": 0.30}},
+            "1h": {"supertrend": {"direction": "down"}},
+        }}
+
+    def test_risky_context_shows_grade_age_and_all_warnings(self):
+        msg = main._build_signal_message(
+            "long", True, _sample_parsed(), "77149.3", "#44C27B",
+            self._risky_snapshot(), minutes_since_start=456.3,
+        )
+        self.assertIn("진입 품질", msg)
+        self.assertIn("D등급", msg)
+        self.assertIn("456분째 지속", msg)
+        self.assertIn("⏱ 오래된 신호", msg)
+        self.assertIn("⚠ 상위시간봉 역행", msg)
+        self.assertIn("⚠ 체결강도 약함", msg)
+
+    def test_fresh_clean_signal_shows_grade_without_warnings(self):
+        clean = {"indicators": {
+            "15m": {"supertrend": {"direction": "up"}, "taker_flow": {"taker_buy_ratio": 0.65}},
+            "1h": {"supertrend": {"direction": "up"}},
+        }}
+        msg = main._build_signal_message(
+            "long", True, _sample_parsed(), "100200", "#44C27B", clean, minutes_since_start=2.0,
+        )
+        self.assertIn("진입 품질", msg)
+        self.assertIn("2분째 지속", msg)
+        self.assertNotIn("오래된 신호", msg)
+        self.assertNotIn("상위시간봉 역행", msg)
+        self.assertNotIn("체결강도 약함", msg)
+
 
 class EntryProximityAlertTests(unittest.TestCase):
     TEST_USER_ID = 999001
