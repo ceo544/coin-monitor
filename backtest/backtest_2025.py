@@ -19,11 +19,22 @@
 출력:
     backtest_result.csv   - 매 1시간 봉마다 LONG/SHORT 등급 + 이후 수익률
     backtest_summary.txt  - 등급별 집계 (평균수익률, 승률, 표본수)
+
+------------------------------------------------------------------------------
+데이터 출처 안내 (v2): 바이낸스 실거래 API(api.binance.com / fapi.binance.com)는
+미국 리전에서 호출하면 파생상품 관련 규제 때문에 HTTP 451로 차단됩니다 -
+GitHub Actions의 기본 러너가 미국 데이터센터에 있어서 실제로 이 문제가
+발생했습니다. 그래서 이 스크립트는 대신 data.binance.vision (바이낸스가
+공개 배포하는 과거 시세 아카이브 - 실거래 API가 아니라 그냥 정적 파일
+다운로드라 지역 규제 차단 대상이 아닙니다)에서 월별 zip을 받아옵니다.
+------------------------------------------------------------------------------
 """
 from __future__ import annotations
 
 import argparse
+import io
 import time
+import zipfile
 from datetime import datetime, timezone
 
 import numpy as np
@@ -31,37 +42,71 @@ import pandas as pd
 import requests
 
 SYMBOL = "BTCUSDT"
-SPOT_URL = "https://api.binance.com/api/v3/klines"
-FUTURES_URL = "https://fapi.binance.com/fapi/v1/klines"
+ARCHIVE_BASE = "https://data.binance.vision/data"
 
 
 # ---------------------------------------------------------------------------
 # 1. 데이터 수집 (look-ahead bias 없음 - 매 시점 그때까지의 캔들만 사용)
+#
+# data.binance.vision의 월별 klines zip을 하나씩 받아서 이어붙입니다. 실거래
+# API처럼 지역 차단이 없는 정적 파일 아카이브라 GitHub Actions에서도 정상
+# 동작합니다. 각 zip 안에는 헤더가 있는 버전/없는 버전이 섞여 있을 수 있어
+# 방어적으로 둘 다 처리합니다.
 # ---------------------------------------------------------------------------
+KLINE_COLS = ["open_time", "open", "high", "low", "close", "volume", "close_time",
+              "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"]
+
+
+def _month_range(start_ms: int, end_ms: int):
+    start = pd.Timestamp(start_ms, unit="ms", tz="UTC").replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = pd.Timestamp(end_ms, unit="ms", tz="UTC")
+    cur = start
+    while cur < end:
+        yield cur.year, cur.month
+        cur = (cur + pd.DateOffset(months=1)).replace(day=1)
+
+
+def _fetch_month_csv(interval: str, year: int, month: int, market: str) -> pd.DataFrame:
+    market_path = "spot" if market == "spot" else "futures/um"
+    fname = f"{SYMBOL}-{interval}-{year}-{month:02d}"
+    url = f"{ARCHIVE_BASE}/{market_path}/monthly/klines/{SYMBOL}/{interval}/{fname}.zip"
+    resp = requests.get(url, timeout=30)
+    if resp.status_code == 404:
+        return pd.DataFrame(columns=KLINE_COLS)  # 아직 해당 월 데이터가 아카이브에 없음 (너무 최근 달 등)
+    resp.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        csv_name = [n for n in zf.namelist() if n.endswith(".csv")][0]
+        with zf.open(csv_name) as f:
+            raw = pd.read_csv(f, header=None)
+    # 헤더 행이 포함된 최신 포맷 zip은 첫 행의 첫 값이 숫자가 아니므로 걸러냄
+    if not str(raw.iloc[0, 0]).strip().lstrip("-").isdigit():
+        raw = raw.iloc[1:].reset_index(drop=True)
+    raw.columns = KLINE_COLS[: raw.shape[1]]
+    return raw
+
+
 def fetch_klines(interval: str, start_ms: int, end_ms: int, market: str = "spot") -> pd.DataFrame:
-    url = SPOT_URL if market == "spot" else FUTURES_URL
-    all_rows = []
-    cur = start_ms
-    while cur < end_ms:
-        resp = requests.get(url, params={
-            "symbol": SYMBOL, "interval": interval, "startTime": cur, "endTime": end_ms, "limit": 1000,
-        }, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        if not data:
-            break
-        all_rows.extend(data)
-        cur = data[-1][0] + 1
-        if len(data) < 1000:
-            break
-        time.sleep(0.25)  # 바이낸스 rate limit 여유
-    cols = ["open_time", "open", "high", "low", "close", "volume", "close_time",
-            "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"]
-    df = pd.DataFrame(all_rows, columns=cols)
+    frames = []
+    for year, month in _month_range(start_ms, end_ms):
+        try:
+            month_df = _fetch_month_csv(interval, year, month, market)
+        except Exception as exc:
+            print(f"  경고: {year}-{month:02d} {interval} 데이터 다운로드 실패 ({exc}) - 건너뜀")
+            continue
+        if not month_df.empty:
+            frames.append(month_df)
+        time.sleep(0.2)  # 아카이브 서버 여유
+    if not frames:
+        return pd.DataFrame(columns=KLINE_COLS + ["taker_buy_ratio"])
+    df = pd.concat(frames, ignore_index=True)
     for c in ("open", "high", "low", "close", "volume", "taker_buy_base"):
-        df[c] = df[c].astype(float)
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    # open_time은 파일 버전에 따라 ms 또는 us(마이크로초) 단위가 섞여 있어 자릿수로 구분
+    open_time_num = pd.to_numeric(df["open_time"], errors="coerce")
+    unit = "us" if open_time_num.dropna().astype("int64").astype(str).str.len().median() >= 16 else "ms"
+    df["open_time"] = pd.to_datetime(open_time_num, unit=unit, utc=True)
     df["taker_buy_ratio"] = np.where(df["volume"] > 0, df["taker_buy_base"] / df["volume"], np.nan)
+    df = df.dropna(subset=["open_time", "close"])
     df = df.drop_duplicates(subset="open_time").sort_values("open_time").reset_index(drop=True)
     return df
 
