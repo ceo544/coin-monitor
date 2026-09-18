@@ -870,7 +870,7 @@ USER_SETTINGS_SCHEMA = [
     ("AUTO_TRADE_MARGIN_USDT", "1회 진입 마진 (USDT)", "number", "50", False),
     ("AUTO_TRADE_MAX_DAILY_TRADES", "일일 최대 진입 횟수", "number", "10", False),
     ("AUTO_TRADE_MAX_DAILY_LOSS_USDT", "일일 최대 손실 한도 (USDT, 초과시 자동정지)", "number", "100", False),
-    ("AUTO_TRADE_RISK_FILTER_ENABLED", "진입 위험 필터 사용 (오래된 신호·상위시간봉 역행·체결강도 약화 시 자동매매 진입 차단)", "checkbox", "true", False),
+    ("AUTO_TRADE_RISK_FILTER_ENABLED", "진입 위험 필터 사용 (오래된 신호·상위시간봉 역행·체결강도 약화 시 자동매매 진입 차단) - ⚠️ 2025년 백테스트+실데이터 검증 결과 이 등급이 방향을 못 맞추거나 오히려 반대로 나오는 경우가 있어, 기본값을 꺼둠으로 변경했습니다. 실거래 필터로 켜기 전에 README의 백테스트 결과를 꼭 확인하세요.", "checkbox", "false", False),
     ("AUTO_TRADE_STALE_MINUTES", "신호 '오래됨' 기준 (분, 이보다 오래 지속된 신호는 위험 신호로 표시)", "number", "45", False),
     ("BINGX_API_KEY", "BingX API Key", "text", "", True),
     ("BINGX_API_SECRET", "BingX API Secret", "password", "", True),
@@ -1735,7 +1735,7 @@ def _build_signal_message(
     if risk.get("grade") or risk.get("minutes_since_start") is not None or risk["flags"]:
         lines.append("")
         badge = f"{risk['grade']}등급 ({risk['score_pct']}%)" if risk.get("grade") else "등급 산정 불가 (지표 데이터 부족)"
-        lines.append(f"📊 <b>진입 품질: {badge}</b>")
+        lines.append(f"📊 <b>진입 품질: {badge}</b> <i>(미검증·참고용)</i>")
         if risk.get("minutes_since_start") is not None:
             lines.append(f"⏱ {risk['minutes_since_start']:.0f}분째 지속")
         flag_labels = {"stale": "⏱ 오래된 신호", "higher_tf_conflict": "⚠ 상위시간봉 역행", "order_flow_weak": "⚠ 체결강도 약함"}
@@ -2018,7 +2018,7 @@ def _execute_auto_trade(
     margin_usdt = float(settings["AUTO_TRADE_MARGIN_USDT"] or 50)
     max_daily_trades = int(float(settings["AUTO_TRADE_MAX_DAILY_TRADES"] or 10))
     max_daily_loss_usdt = float(settings["AUTO_TRADE_MAX_DAILY_LOSS_USDT"] or 100)
-    risk_filter_enabled = str(settings.get("AUTO_TRADE_RISK_FILTER_ENABLED", "true")).lower() not in {"0", "false", "no", "off", ""}
+    risk_filter_enabled = str(settings.get("AUTO_TRADE_RISK_FILTER_ENABLED", "false")).lower() not in {"0", "false", "no", "off", ""}
     stale_minutes = float(settings.get("AUTO_TRADE_STALE_MINUTES") or 45)
     api_key = settings["BINGX_API_KEY"]
     api_secret = settings["BINGX_API_SECRET"]
@@ -3943,7 +3943,12 @@ function renderEntryRisk(entryRisk, sig){
     let label={stale:'⏱ 오래된 신호',higher_tf_conflict:'⚠ 상위시간봉 역행',order_flow_weak:'⚠ 체결강도 약함'}[f]||f;
     return `<span class="riskChip">${esc(label)}</span>`;
   }).join('');
-  box.innerHTML=(risk.grade?`<span class="gradeBadge grade${risk.grade}">${esc(gradeTxt)}</span>`:'')+
+  // 2025년 백테스트 + 실데이터 검증 결과 이 등급이 방향 예측력이 없거나
+  // 오히려 반대로 나오는 경향이 확인됐습니다 (README 참고) - 그래서 등급
+  // 배지 자체에 "미검증" 표시를 항상 같이 보여줍니다. 등급을 없애지 않은
+  // 이유는 지표 정합성 자체는 여전히 참고할 정보라서인데, 신뢰할 수 있는
+  // 매매 신호로 오해하지 않도록 하기 위함입니다.
+  box.innerHTML=(risk.grade?`<span class="gradeBadge grade${risk.grade}">${esc(gradeTxt)}</span><span class="muted" style="font-size:10.5px">(미검증·참고용)</span>`:'')+
     (ageTxt?`<span class="ageChip">${esc(ageTxt)}</span>`:'')+chips;
 }
 function renderEvidence(){

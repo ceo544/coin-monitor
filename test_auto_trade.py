@@ -304,6 +304,25 @@ class RiskFilterGateTests(AutoTradeTestBase):
             cur.execute("SELECT action FROM auto_trades WHERE user_id = ? ORDER BY id DESC LIMIT 1", (TEST_USER_ID,))
             self.assertEqual(cur.fetchone()[0], "order_placed")
 
+    def test_filter_is_off_by_default_when_setting_not_provided(self):
+        # 2025년 백테스트 + 실데이터 검증 결과 이 등급/플래그가 방향을
+        # 못 맞추거나 오히려 반대로 나오는 경향이 확인돼서, 명시적으로
+        # 켜지 않은 이상 기본값은 꺼짐이어야 합니다 (설정 스키마 기본값도
+        # 이 코드 레벨 fallback도 둘 다 "false"로 일치해야 함).
+        settings_without_filter_key = _test_settings()
+        settings_without_filter_key.pop("AUTO_TRADE_RISK_FILTER_ENABLED", None)
+        with patch("main._has_open_position", return_value=False), \
+             patch("main.bingx_client.set_leverage"), \
+             patch("main.bingx_client.create_order", return_value={"orderId": "1"}):
+            main._execute_auto_trade(
+                TEST_USER_ID, "long", main._row_map_from_parsed(_parsed_with_entries()),
+                {**settings_without_filter_key, "AUTO_TRADE_DRY_RUN": "false"},
+                binance_json=self._risky_binance_json(), minutes_since_start=210.83,
+            )
+        with main.db_cursor() as (conn, cur):
+            cur.execute("SELECT action FROM auto_trades WHERE user_id = ? ORDER BY id DESC LIMIT 1", (TEST_USER_ID,))
+            self.assertEqual(cur.fetchone()[0], "order_placed")
+
     def test_no_binance_context_does_not_block_trade(self):
         # Defensive: if binance_json wasn't available for some reason, the
         # gate should fail open (no flags) rather than block everything.

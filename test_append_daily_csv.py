@@ -61,7 +61,7 @@ class ChunkAppendTests(unittest.TestCase):
             self.assertEqual(script.count_data_rows(changed[0]), 5)
             self.assertEqual(script.count_data_rows(changed[1]), 3)
         finally:
-            script.CHUNK_MAX_ROWS = 5000
+            script.CHUNK_MAX_ROWS = 1200
 
     def test_appending_to_existing_partially_filled_chunk(self):
         script.CHUNK_MAX_ROWS = 5
@@ -71,7 +71,7 @@ class ChunkAppendTests(unittest.TestCase):
             self.assertEqual(changed, [os.path.join(self.tmpdir, "coin_observations_part001.csv")])
             self.assertEqual(script.count_data_rows(changed[0]), 5)
         finally:
-            script.CHUNK_MAX_ROWS = 5000
+            script.CHUNK_MAX_ROWS = 1200
 
     def test_new_chunk_started_when_previous_exactly_full(self):
         script.CHUNK_MAX_ROWS = 3
@@ -80,7 +80,7 @@ class ChunkAppendTests(unittest.TestCase):
             changed = script.append_in_chunks(self.tmpdir, self.header, [["4", "d"]])
             self.assertTrue(changed[0].endswith("part002.csv"))
         finally:
-            script.CHUNK_MAX_ROWS = 5000
+            script.CHUNK_MAX_ROWS = 1200
 
     def test_no_new_rows_returns_no_changes(self):
         changed = script.append_in_chunks(self.tmpdir, self.header, [])
@@ -97,7 +97,7 @@ class ChunkAppendTests(unittest.TestCase):
                         [os.path.join(self.tmpdir, n) for n in script.find_chunk_files(self.tmpdir)])
             self.assertEqual(total, 250)
         finally:
-            script.CHUNK_MAX_ROWS = 5000
+            script.CHUNK_MAX_ROWS = 1200
 
 
 class FetchPageTests(unittest.TestCase):
@@ -199,7 +199,7 @@ class MainIntegrationTests(unittest.TestCase):
             chunks = script.find_chunk_files(self.tmpdir)
             self.assertEqual(script.count_data_rows(os.path.join(self.tmpdir, chunks[0])), 3)
         finally:
-            script.PAGE_SIZE = 2000
+            script.PAGE_SIZE = 1200
 
     def test_last_id_updated_after_each_page_not_just_at_the_end(self):
         # 중간에 실패해도 이미 받은 페이지는 안 날아가야 함 - 페이지마다
@@ -217,7 +217,7 @@ class MainIntegrationTests(unittest.TestCase):
             # 첫 페이지까지는 이미 저장되어 있어야 함
             self.assertEqual(script.read_last_id(self.tmpdir), 2)
         finally:
-            script.PAGE_SIZE = 2000
+            script.PAGE_SIZE = 1200
 
 
 if __name__ == "__main__":
