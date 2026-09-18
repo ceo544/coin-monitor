@@ -3572,9 +3572,18 @@ def export_csv() -> Response:
     # 커밋하기엔 100MB 제한을 넘습니다. 두 컬럼의 내용은 이미 나머지
     # 컬럼들(CSV_ENTRY_COLUMNS/CSV_MARKET_COLUMNS/CSV_INDICATOR_COLUMNS 등)로
     # 전부 펼쳐져 있으니, 슬림 모드에서 빼도 분석에 쓸 정보가 사라지지 않습니다.
+    #
+    # 스트리밍 + limit(선택): 처음 한 번에 몇 년치를 통째로 만들려고 하면
+    # 컬럼이 1,391개나 되는 구조상 응답을 메모리에 다 올리는 동안 서버가
+    # 죽을 수 있습니다(실제로 502 Bad Gateway 발생) - 그래서 (1) 행을 한
+    # 번에 메모리에 안 모으고 하나씩 만들어서 바로 내려보내고(제너레이터
+    # 스트리밍), (2) limit 파라미터로 한 번 호출에 가져올 행 수를 제한할 수
+    # 있게 했습니다. 매일 자동 백업 스크립트는 이 limit으로 여러 번 나눠
+    # 받아갑니다.
     slim = request.args.get("slim", "0") in {"1", "true", "yes"}
-    out = io.StringIO()
-    writer = csv.writer(out)
+    since_id = request.args.get("since_id", type=int)
+    limit = request.args.get("limit", type=int)
+
     header = [
         "id", "observed_at", "observed_at_kst", "http_status", "success", "current_price", "current_price_raw",
         "long_signal", "short_signal", "long_start", "long_end", "short_start", "short_end",
@@ -3602,66 +3611,66 @@ def export_csv() -> Response:
     ]
     if not slim:
         header += ["parsed_json", "binance_json"]
-    writer.writerow(header)
-    since_id = request.args.get("since_id", type=int)
-    with db_cursor() as (conn, cur):
+
+    def generate():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(header)
+        yield buf.getvalue()
+
+        query = """
+            SELECT id, observed_at, observed_at_kst, http_status, success, current_price, current_price_raw,
+                   long_signal, short_signal, long_start, long_end, short_start, short_end,
+                   long_color, short_color, entry_message,
+                   long_matched_selector, long_matched_declaration, long_ancestor_classes,
+                   long_label_classes, long_own_inline_background,
+                   short_matched_selector, short_matched_declaration, short_ancestor_classes,
+                   short_label_classes, short_own_inline_background,
+                   content_sha256, error, parsed_json, binance_json
+            FROM observations
+        """
+        params: tuple = ()
         if since_id:
-            cur.execute(
-                """
-                SELECT id, observed_at, observed_at_kst, http_status, success, current_price, current_price_raw,
-                       long_signal, short_signal, long_start, long_end, short_start, short_end,
-                       long_color, short_color, entry_message,
-                       long_matched_selector, long_matched_declaration, long_ancestor_classes,
-                       long_label_classes, long_own_inline_background,
-                       short_matched_selector, short_matched_declaration, short_ancestor_classes,
-                       short_label_classes, short_own_inline_background,
-                       content_sha256, error, parsed_json, binance_json
-                FROM observations WHERE id > ? ORDER BY id ASC
-                """,
-                (since_id,),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT id, observed_at, observed_at_kst, http_status, success, current_price, current_price_raw,
-                       long_signal, short_signal, long_start, long_end, short_start, short_end,
-                       long_color, short_color, entry_message,
-                       long_matched_selector, long_matched_declaration, long_ancestor_classes,
-                       long_label_classes, long_own_inline_background,
-                       short_matched_selector, short_matched_declaration, short_ancestor_classes,
-                       short_label_classes, short_own_inline_background,
-                       content_sha256, error, parsed_json, binance_json
-                FROM observations ORDER BY id ASC
-                """
-            )
-        for row in cur:
-            (rid, observed_at, observed_at_kst, http_status, success, current_price, current_price_raw,
-             long_signal, short_signal, long_start, long_end, short_start, short_end,
-             long_color, short_color, entry_message,
-             long_sel, long_decl, long_anc, long_lbl, long_bg,
-             short_sel, short_decl, short_anc, short_lbl, short_bg,
-             sha, error, parsed_json_text, binance_json_text) = row
-            entries = _flatten_entries_for_csv(parsed_json_text)
-            market = _flatten_binance_for_csv(binance_json_text)
-            dq_score, dq_missing = _data_quality(binance_json_text)
-            data_row = [
-                rid, observed_at, observed_at_kst, http_status, success, current_price, current_price_raw,
-                long_signal, short_signal, long_start, long_end, short_start, short_end,
-                _minutes_since(long_start, observed_at), _minutes_since(short_start, observed_at),
-                long_color, short_color, entry_message,
-                long_sel, long_decl, long_anc, long_lbl, long_bg,
-                short_sel, short_decl, short_anc, short_lbl, short_bg,
-                *[entries.get(c) for c in CSV_ENTRY_COLUMNS],
-                *[market.get(c) for c in CSV_MARKET_COLUMNS],
-                *[market.get(c) for c in CSV_INDICATOR_COLUMNS],
-                dq_score, dq_missing,
-                sha, error,
-            ]
-            if not slim:
-                data_row += [parsed_json_text or "{}", binance_json_text or "{}"]
-            writer.writerow(data_row)
+            query += " WHERE id > ?"
+            params = (since_id,)
+        query += " ORDER BY id ASC"
+        if limit:
+            query += " LIMIT ?"
+            params = params + (limit,)
+
+        with db_cursor() as (conn, cur):
+            cur.execute(query, params)
+            for row in cur:
+                (rid, observed_at, observed_at_kst, http_status, success, current_price, current_price_raw,
+                 long_signal, short_signal, long_start, long_end, short_start, short_end,
+                 long_color, short_color, entry_message,
+                 long_sel, long_decl, long_anc, long_lbl, long_bg,
+                 short_sel, short_decl, short_anc, short_lbl, short_bg,
+                 sha, error, parsed_json_text, binance_json_text) = row
+                entries = _flatten_entries_for_csv(parsed_json_text)
+                market = _flatten_binance_for_csv(binance_json_text)
+                dq_score, dq_missing = _data_quality(binance_json_text)
+                data_row = [
+                    rid, observed_at, observed_at_kst, http_status, success, current_price, current_price_raw,
+                    long_signal, short_signal, long_start, long_end, short_start, short_end,
+                    _minutes_since(long_start, observed_at), _minutes_since(short_start, observed_at),
+                    long_color, short_color, entry_message,
+                    long_sel, long_decl, long_anc, long_lbl, long_bg,
+                    short_sel, short_decl, short_anc, short_lbl, short_bg,
+                    *[entries.get(c) for c in CSV_ENTRY_COLUMNS],
+                    *[market.get(c) for c in CSV_MARKET_COLUMNS],
+                    *[market.get(c) for c in CSV_INDICATOR_COLUMNS],
+                    dq_score, dq_missing,
+                    sha, error,
+                ]
+                if not slim:
+                    data_row += [parsed_json_text or "{}", binance_json_text or "{}"]
+                out = io.StringIO()
+                csv.writer(out).writerow(data_row)
+                yield out.getvalue()
+
     return Response(
-        out.getvalue(),
+        generate(),
         mimetype="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=coin_observations.csv"},
     )

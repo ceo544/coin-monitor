@@ -54,11 +54,16 @@ def count_data_rows(path: str) -> int:
         return max(0, sum(1 for _ in f) - 1)
 
 
-def fetch_new_rows(url: str, token: str, since_id: int) -> tuple:
-    """(header, rows) 반환 - rows는 각 행이 문자열 리스트."""
+PAGE_SIZE = 2000  # 한 번의 HTTP 요청으로 가져올 최대 행 수 - 서버가 응답을
+                   # 만드는 동안 메모리 부담이 커지거나 요청이 너무 오래
+                   # 걸려서 502가 나는 걸 막기 위해 작게 나눠서 여러 번 받음
+
+
+def fetch_page(url: str, token: str, since_id: int, limit: int = PAGE_SIZE) -> tuple:
+    """(header, rows) 반환 - 한 페이지(최대 limit행)만. rows는 각 행이 문자열 리스트."""
     resp = requests.get(
         f"{url.rstrip('/')}/export.csv",
-        params={"token": token, "since_id": since_id, "slim": "1"},
+        params={"token": token, "since_id": since_id, "slim": "1", "limit": limit},
         timeout=120,
     )
     resp.raise_for_status()
@@ -115,22 +120,38 @@ def main() -> int:
     ap.add_argument("--data-dir", default="data")
     args = ap.parse_args()
 
-    last_id = read_last_id(args.data_dir)
-    print(f"마지막으로 받은 id: {last_id}")
+    cursor = read_last_id(args.data_dir)
+    print(f"마지막으로 받은 id: {cursor}")
 
-    header, rows = fetch_new_rows(args.url, args.token, last_id)
-    if not rows:
+    total_rows = 0
+    all_changed: set = set()
+    page_num = 0
+    while True:
+        page_num += 1
+        header, rows = fetch_page(args.url, args.token, cursor)
+        if not rows:
+            break
+        print(f"페이지 {page_num}: {len(rows)}행 받음 (since_id={cursor})")
+
+        changed_files = append_in_chunks(args.data_dir, header, rows)
+        all_changed.update(changed_files)
+        total_rows += len(rows)
+
+        cursor = int(rows[-1][0])
+        write_last_id(args.data_dir, cursor)  # 페이지마다 즉시 갱신 - 중간에
+        # 실패해도 이미 받은 페이지만큼은 다시 안 받아도 됨
+
+        if len(rows) < PAGE_SIZE:
+            break  # 서버가 이보다 적게 줬다는 건 다 받았다는 뜻
+
+    if total_rows == 0:
         print("새로 쌓인 데이터 없음 - 스킵")
         return 0
-    print(f"새로 받은 행 수: {len(rows)}")
 
-    changed_files = append_in_chunks(args.data_dir, header, rows)
-    for path in changed_files:
+    print(f"총 새로 받은 행 수: {total_rows}")
+    for path in sorted(all_changed):
         print(f"업데이트됨: {path} ({count_data_rows(path)}행)")
-
-    new_last_id = int(rows[-1][0])
-    write_last_id(args.data_dir, new_last_id)
-    print(f"last_id.txt 갱신: {new_last_id}")
+    print(f"last_id.txt 최종 갱신: {cursor}")
     return 0
 
 

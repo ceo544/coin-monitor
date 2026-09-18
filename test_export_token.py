@@ -86,6 +86,31 @@ class IncrementalExportTests(unittest.TestCase):
         self.assertEqual(len(full), 4)         # header + 3 rows
         self.assertEqual(len(incremental), 3)  # header + 2 rows (id[1], id[2])
 
+    def test_limit_caps_number_of_rows_returned(self):
+        [main.collect_once()["id"] for _ in range(5)]
+        token = main.get_or_create_export_token()
+        with main.app.test_client() as c:
+            resp = c.get(f"/export.csv?token={token}&limit=2")
+        rows = resp.data.decode("utf-8").strip().split("\n")
+        self.assertEqual(len(rows), 3)  # header + 2 rows only
+
+    def test_limit_combined_with_since_id_pages_through_all_data(self):
+        ids = [main.collect_once()["id"] for _ in range(5)]
+        token = main.get_or_create_export_token()
+        collected_ids = []
+        cursor = 0
+        with main.app.test_client() as c:
+            for _ in range(10):  # safety cap on loop iterations
+                resp = c.get(f"/export.csv?token={token}&since_id={cursor}&limit=2")
+                rows = resp.data.decode("utf-8").strip().split("\n")[1:]
+                if not rows or rows == [""]:
+                    break
+                for row in rows:
+                    rid = int(row.split(",")[0])
+                    collected_ids.append(rid)
+                    cursor = max(cursor, rid)
+        self.assertEqual(sorted(collected_ids), sorted(ids))
+
     def test_since_id_at_the_latest_id_returns_only_header(self):
         ids = [main.collect_once()["id"] for _ in range(2)]
         token = main.get_or_create_export_token()

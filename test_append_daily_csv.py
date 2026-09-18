@@ -100,27 +100,36 @@ class ChunkAppendTests(unittest.TestCase):
             script.CHUNK_MAX_ROWS = 5000
 
 
-class FetchNewRowsTests(unittest.TestCase):
+class FetchPageTests(unittest.TestCase):
     def test_parses_header_and_rows(self):
         mock_resp = MagicMock()
         mock_resp.text = _csv_response_text(["id", "price"], [[1, 100], [2, 101]])
         mock_resp.raise_for_status = MagicMock()
         with patch("append_daily_csv.requests.get", return_value=mock_resp) as mock_get:
-            header, rows = script.fetch_new_rows("https://example.com", "tok", 0)
+            header, rows = script.fetch_page("https://example.com", "tok", 0)
         self.assertEqual(header, ["id", "price"])
         self.assertEqual(rows, [["1", "100"], ["2", "101"]])
         called_params = mock_get.call_args.kwargs["params"]
         self.assertEqual(called_params["slim"], "1")
         self.assertEqual(called_params["since_id"], 0)
+        self.assertEqual(called_params["limit"], script.PAGE_SIZE)
 
     def test_empty_response_returns_empty(self):
         mock_resp = MagicMock()
         mock_resp.text = ""
         mock_resp.raise_for_status = MagicMock()
         with patch("append_daily_csv.requests.get", return_value=mock_resp):
-            header, rows = script.fetch_new_rows("https://example.com", "tok", 0)
+            header, rows = script.fetch_page("https://example.com", "tok", 0)
         self.assertEqual(header, [])
         self.assertEqual(rows, [])
+
+    def test_custom_limit_is_passed_through(self):
+        mock_resp = MagicMock()
+        mock_resp.text = _csv_response_text(["id"], [[1]])
+        mock_resp.raise_for_status = MagicMock()
+        with patch("append_daily_csv.requests.get", return_value=mock_resp) as mock_get:
+            script.fetch_page("https://example.com", "tok", 5, limit=10)
+        self.assertEqual(mock_get.call_args.kwargs["params"]["limit"], 10)
 
 
 class MainIntegrationTests(unittest.TestCase):
@@ -170,6 +179,45 @@ class MainIntegrationTests(unittest.TestCase):
             rc = script.main()
         self.assertEqual(rc, 0)
         self.assertEqual(script.find_chunk_files(self.tmpdir), [])
+
+    def test_pages_through_multiple_requests_when_more_data_than_page_size(self):
+        # PAGE_SIZE 낮춰서, 실제로 여러 페이지에 걸쳐 루프를 도는지 확인.
+        script.PAGE_SIZE = 2
+        try:
+            page1 = MagicMock()
+            page1.text = _csv_response_text(["id", "price"], [[1, 100], [2, 101]])  # 꽉 채워진 페이지 -> 다음 페이지 있음
+            page1.raise_for_status = MagicMock()
+            page2 = MagicMock()
+            page2.text = _csv_response_text(["id", "price"], [[3, 102]])  # PAGE_SIZE보다 적음 -> 마지막 페이지
+            page2.raise_for_status = MagicMock()
+            with patch("append_daily_csv.requests.get", side_effect=[page1, page2]) as mock_get, \
+                 patch("sys.argv", ["prog", "--url", "https://example.com", "--token", "tok", "--data-dir", self.tmpdir]):
+                rc = script.main()
+            self.assertEqual(rc, 0)
+            self.assertEqual(mock_get.call_count, 2)
+            self.assertEqual(script.read_last_id(self.tmpdir), 3)
+            chunks = script.find_chunk_files(self.tmpdir)
+            self.assertEqual(script.count_data_rows(os.path.join(self.tmpdir, chunks[0])), 3)
+        finally:
+            script.PAGE_SIZE = 2000
+
+    def test_last_id_updated_after_each_page_not_just_at_the_end(self):
+        # 중간에 실패해도 이미 받은 페이지는 안 날아가야 함 - 페이지마다
+        # last_id.txt가 즉시 갱신되는지 확인.
+        script.PAGE_SIZE = 2
+        try:
+            page1 = MagicMock()
+            page1.text = _csv_response_text(["id", "price"], [[1, 100], [2, 101]])
+            page1.raise_for_status = MagicMock()
+            page2_fails = ConnectionError("network blip")
+            with patch("append_daily_csv.requests.get", side_effect=[page1, page2_fails]), \
+                 patch("sys.argv", ["prog", "--url", "https://example.com", "--token", "tok", "--data-dir", self.tmpdir]):
+                with self.assertRaises(ConnectionError):
+                    script.main()
+            # 첫 페이지까지는 이미 저장되어 있어야 함
+            self.assertEqual(script.read_last_id(self.tmpdir), 2)
+        finally:
+            script.PAGE_SIZE = 2000
 
 
 if __name__ == "__main__":
