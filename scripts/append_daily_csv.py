@@ -21,7 +21,10 @@ import sys
 
 import requests
 
-CHUNK_MAX_ROWS = 5000  # 여유를 두고 100MB 한도보다 훨씬 작게 (컬럼이 더 늘어날 걸 감안)
+CHUNK_MAX_ROWS = 1200  # 실측: 5000행이 최대 108MB까지 나옴(컬럼당 실제 값이
+                        # 다 채워진 운영 데이터 기준 행당 최대 ~21.6KB) - 여유
+                        # 있게 1,200행으로 낮춰서 파일당 대략 26MB 안팎, 100MB
+                        # 한도에 4배 가까운 여유를 둠
 
 
 def read_last_id(data_dir: str) -> int:
@@ -54,7 +57,7 @@ def count_data_rows(path: str) -> int:
         return max(0, sum(1 for _ in f) - 1)
 
 
-PAGE_SIZE = 2000  # 한 번의 HTTP 요청으로 가져올 최대 행 수 - 서버가 응답을
+PAGE_SIZE = 1200  # 한 번의 HTTP 요청으로 가져올 최대 행 수 - 서버가 응답을
                    # 만드는 동안 메모리 부담이 커지거나 요청이 너무 오래
                    # 걸려서 502가 나는 걸 막기 위해 작게 나눠서 여러 번 받음
 
