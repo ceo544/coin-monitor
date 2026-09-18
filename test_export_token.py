@@ -95,5 +95,58 @@ class IncrementalExportTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)  # header only, nothing newer
 
 
+class SlimExportTests(unittest.TestCase):
+    """slim=1은 용량을 대부분 차지하는 parsed_json/binance_json 원본 컬럼을
+    빼서, GitHub의 100MB 파일 제한에 걸리지 않게 하기 위한 모드입니다."""
+
+    def setUp(self):
+        main.init_db()
+        main.ENABLE_BINANCE = False
+        main.fetch_target = lambda: (200, _sample_html())
+        with main.db_cursor() as (conn, cur):
+            cur.execute("DELETE FROM observations")
+
+    def test_slim_mode_excludes_raw_json_columns(self):
+        main.collect_once()
+        token = main.get_or_create_export_token()
+        with main.app.test_client() as c:
+            full_header = c.get(f"/export.csv?token={token}").data.decode("utf-8").split("\n")[0]
+            slim_header = c.get(f"/export.csv?token={token}&slim=1").data.decode("utf-8").split("\n")[0]
+        self.assertIn("parsed_json", full_header)
+        self.assertIn("binance_json", full_header)
+        self.assertNotIn("parsed_json", slim_header)
+        self.assertNotIn("binance_json", slim_header)
+
+    def test_slim_mode_keeps_all_flattened_indicator_columns(self):
+        main.collect_once()
+        token = main.get_or_create_export_token()
+        with main.app.test_client() as c:
+            slim_header = c.get(f"/export.csv?token={token}&slim=1").data.decode("utf-8").split("\n")[0]
+        for col in ("long_signal", "short_signal", "current_price", "data_quality_score"):
+            self.assertIn(col, slim_header)
+
+    def test_slim_mode_is_dramatically_smaller(self):
+        main.ENABLE_BINANCE = True
+        main.collect_binance_snapshot = lambda: {
+            "indicators": {tf: {"rsi14": 55.0, "macd": {"macd": 1, "signal": 1, "histogram": 0}} for tf in ("1m", "5m", "15m", "1h", "4h")},
+        }
+        main.collect_once()
+        token = main.get_or_create_export_token()
+        with main.app.test_client() as c:
+            full_size = len(c.get(f"/export.csv?token={token}").data)
+            slim_size = len(c.get(f"/export.csv?token={token}&slim=1").data)
+        self.assertLess(slim_size, full_size)
+
+    def test_slim_query_param_variants_all_work(self):
+        main.collect_once()
+        token = main.get_or_create_export_token()
+        with main.app.test_client() as c:
+            for val in ("1", "true", "yes"):
+                header = c.get(f"/export.csv?token={token}&slim={val}").data.decode("utf-8").split("\n")[0]
+                self.assertNotIn("parsed_json", header)
+            header_off = c.get(f"/export.csv?token={token}&slim=0").data.decode("utf-8").split("\n")[0]
+            self.assertIn("parsed_json", header_off)
+
+
 if __name__ == "__main__":
     unittest.main()

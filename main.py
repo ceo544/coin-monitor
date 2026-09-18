@@ -3567,9 +3567,15 @@ def _minutes_since(start_iso: Optional[str], observed_at_iso: Optional[str]) -> 
 
 @app.get("/export.csv")
 def export_csv() -> Response:
+    # slim=1: parsed_json/binance_json 원본 통짜 JSON 컬럼 2개를 뺍니다 -
+    # 이 두 컬럼이 파일 용량을 대부분 차지해서(실측 749MB), GitHub 저장소에
+    # 커밋하기엔 100MB 제한을 넘습니다. 두 컬럼의 내용은 이미 나머지
+    # 컬럼들(CSV_ENTRY_COLUMNS/CSV_MARKET_COLUMNS/CSV_INDICATOR_COLUMNS 등)로
+    # 전부 펼쳐져 있으니, 슬림 모드에서 빼도 분석에 쓸 정보가 사라지지 않습니다.
+    slim = request.args.get("slim", "0") in {"1", "true", "yes"}
     out = io.StringIO()
     writer = csv.writer(out)
-    writer.writerow([
+    header = [
         "id", "observed_at", "observed_at_kst", "http_status", "success", "current_price", "current_price_raw",
         "long_signal", "short_signal", "long_start", "long_end", "short_start", "short_end",
         "minutes_since_long_start", "minutes_since_short_start",
@@ -3592,8 +3598,11 @@ def export_csv() -> Response:
         # for each of 1m/5m/15m/1h/4h, one column per (interval, field) pair.
         *CSV_INDICATOR_COLUMNS,
         "data_quality_score", "missing_fields_count",
-        "content_sha256", "error", "parsed_json", "binance_json",
-    ])
+        "content_sha256", "error",
+    ]
+    if not slim:
+        header += ["parsed_json", "binance_json"]
+    writer.writerow(header)
     since_id = request.args.get("since_id", type=int)
     with db_cursor() as (conn, cur):
         if since_id:
@@ -3635,7 +3644,7 @@ def export_csv() -> Response:
             entries = _flatten_entries_for_csv(parsed_json_text)
             market = _flatten_binance_for_csv(binance_json_text)
             dq_score, dq_missing = _data_quality(binance_json_text)
-            writer.writerow([
+            data_row = [
                 rid, observed_at, observed_at_kst, http_status, success, current_price, current_price_raw,
                 long_signal, short_signal, long_start, long_end, short_start, short_end,
                 _minutes_since(long_start, observed_at), _minutes_since(short_start, observed_at),
@@ -3647,9 +3656,10 @@ def export_csv() -> Response:
                 *[market.get(c) for c in CSV_INDICATOR_COLUMNS],
                 dq_score, dq_missing,
                 sha, error,
-                parsed_json_text or "{}",
-                binance_json_text or "{}",
-            ])
+            ]
+            if not slim:
+                data_row += [parsed_json_text or "{}", binance_json_text or "{}"]
+            writer.writerow(data_row)
     return Response(
         out.getvalue(),
         mimetype="text/csv; charset=utf-8",
